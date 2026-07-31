@@ -23,6 +23,9 @@ this source getting leaked is unfortunate, but development isn't stopping.
 join the discord:
 https://discord.gg/velokitty
 
+velocity reborn:
+https://discord.gg/sZ5NeJk8sb
+
 ---
 
 thanks for everything. see you in velocity reborn.
