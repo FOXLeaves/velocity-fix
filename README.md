@@ -8,9 +8,13 @@ cs2 hasnt gotten such a big source leak yet
 
 ## faq
 
-**q:** can you help me with building/resourcer?
+**q:** can you help me with building?
 
 **a:** no. it's outdated. update/fix it yourself.
+
+**q:** wheres resourcer?
+
+**a:** [here](https://github.com/wubly/velocity-resourcer)
 
 ---
 
