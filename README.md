@@ -1,8 +1,8 @@
 # velocity source
 
-thanks everyone.
+thanks everyone. it was a nice run :)
 
-it was a nice run :)
+cs2 hasnt gotten such a big source leak yet
 
 ---
 
@@ -29,3 +29,18 @@ https://discord.gg/sZ5NeJk8sb
 ---
 
 thanks for everything. see you in velocity reborn.
+
+
+--- 
+
+## donate:
+
+eth: `0x6aEe69Af07Ff81FB7a72B51a5187263BfF605694`  
+ltc: `LgCbtnDY35oHBivpmGfxeEBGH55ia9sT5m`  
+btc: `bc1q9jph99qj88q28992lnrn2ecg9kc94ls4k0zexf`  
+xrp: `r9GxXmMuS1orkTEjqB7qQttRfJXaaRCbTk`  
+sol: `9BTegZxUJVyyR7LSYKbZAesSFPvd196xn9YNwScDG7Xy`
+
+https://buymeacoffee.com/wubly
+
+i appreciate all donations :)
