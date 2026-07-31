@@ -1,8 +1,28 @@
-velocity source, thanks guy it was a nice run :)
+# velocity source
 
-faq:
+thanks everyone.
 
-dont ask me abotu resourcer,
-outdated, update stuff urself. 
+it was a nice run :)
 
-<img width="337" height="153" alt="decwrcwer" src="https://github.com/user-attachments/assets/9aa04f0b-7137-49a9-91fc-75650b23c507" />
+---
+
+## faq
+
+**q:** can you help me with building/resourcer?
+
+**a:** no. it's outdated. update/fix it yourself.
+
+---
+
+this is **not** the end of velocity.
+
+this source getting leaked is unfortunate, but development isn't stopping.
+
+**velocity reborn** is already in the works a full rewrite from scratch.
+
+join the discord:
+https://discord.gg/velokitty
+
+---
+
+thanks for everything. see you in velocity reborn.
