@@ -53,6 +53,11 @@ namespace random {
 		return normal_clamped( mean, stddev, 0.045f, 0.140f );
 	}
 
+	float human_gap( float min_gap, float max_gap )
+	{
+		return floating( min_gap, max_gap );
+	}
+
 	float subtick_fraction( )
 	{
 		return floating( 0.0f, std::nextafter( 1.0f, 0.0f ) );

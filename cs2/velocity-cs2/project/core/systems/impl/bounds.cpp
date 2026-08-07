@@ -17,7 +17,9 @@ namespace systems {
 			return {};
 		}
 
-		const auto origin = memory::read<math::vector3>( game_scene_node + SCHEMA( "CGameSceneNode", "m_vecOrigin"_hash ) );
+		// m_vecOrigin is a quantized network-origin type in current CS2 builds,
+		// not a plain vector3. Use the evaluated world-space origin instead.
+		const auto origin = memory::read<math::vector3>( game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
 		const auto mins = memory::read<math::vector3>( collision + SCHEMA( "CCollisionProperty", "m_vecMins"_hash ) ) + origin;
 		const auto maxs = memory::read<math::vector3>( collision + SCHEMA( "CCollisionProperty", "m_vecMaxs"_hash ) ) + origin;
 

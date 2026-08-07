@@ -28,6 +28,13 @@ namespace steam {
 		static int get_medium_friend_avatar( std::uint64_t steam_id );
 	};
 
+	class user
+	{
+	public:
+		static bool initialize( );
+		static std::uint64_t get_steam_id( );
+	};
+
 	class utils
 	{
 	public:

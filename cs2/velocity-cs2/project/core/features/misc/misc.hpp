@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <limits>
 
@@ -116,24 +116,6 @@ namespace features::misc {
 	class impacts
 	{
 	public:
-		enum class event_type : std::uint8_t
-		{
-			none,
-			hit,
-			kill,
-			miss,
-		};
-
-		struct recent_event
-		{
-			event_type type{};
-			std::string victim_name{};
-			int damage{};
-			int hitgroup{};
-			std::string miss_reason{};
-			float time{};
-		};
-
 		void on_render_early( xdraw::draw_list& draw_list );
 		void on_frame_stage_notify( );
 		void on_level_change( );
@@ -143,10 +125,34 @@ namespace features::misc {
 		void on_bullet_impact( std::uintptr_t event );
 		void on_base_fire_guns_get_inaccuracy( std::uintptr_t weapon, float inaccuracy );
 		void on_get_interpolated_shoot_position( std::uintptr_t weapon_services, float* out );
-		void on_boom( std::uintptr_t victim_pawn, int hitgroup, float damage, float hitchance, float inaccuracy, const math::vector3& aim_angle, const math::vector3& shoot_position, int tick, const std::array<systems::bones::data, 27>& skeleton, bool forced );
+		// Everything the impact/miss tracker needs to know about a shot the
+		// ragebot fired. Packed so the callback signature stays stable.
+		struct shot_parameters
+		{
+			std::uintptr_t victim_pawn{};
+			int hitgroup{};
+			float damage{};
+			float hitchance{};
+			float inaccuracy{};
+			float spread{};
+			math::vector3 aim_angle{};
+			math::vector3 aim_position{};
+			math::vector3 shoot_position{};
+			// Record tick and the local interpolated attack stamp: the true
+			// backtrack depth is stamp_tick - tick.
+			int tick{};
+			int stamp_tick{};
+			std::array<systems::bones::data, 27> skeleton{};
+			bool forced{};
+			bool extrapolated{};
+			bool seed_mode{};
+			// Double tap shot: an unconfirmed one is an "empty shot" (the
+			// server rejected the claim / no round left the barrel) and is
+			// logged as such instead of being silently dropped.
+			bool dt{};
+		};
 
-		[[nodiscard]] std::optional<recent_event> poll_event( );
-		[[nodiscard]] std::optional<recent_event> peek_event( ) const;
+		void on_boom( const shot_parameters& params );
 
 		[[nodiscard]] static std::vector<std::string> list_custom_sounds( );
 		[[nodiscard]] static std::string custom_sounds_directory_narrow( );
@@ -160,12 +166,18 @@ namespace features::misc {
 			float damage{};
 			float hitchance{};
 			float predicted_inaccuracy{};
+			float predicted_spread{};
 			float server_inaccuracy{};
 			math::vector3 aim_angle{};
+			math::vector3 aim_position{};
 			math::vector3 shoot_position{};
 			math::vector3 impact_position{};
 			float best_impact_dist_sq{ FLT_MAX };
 			int tick{};
+			// The local interpolated attack stamp; the true backtrack depth
+			// is stamp_tick - tick (both server-side frames, unlike the
+			// client current_tick which carries the ~24t time-base offset).
+			int stamp_tick{};
 			float time{};
 			float impact_time{};
 			std::array<systems::bones::data, 27> skeleton{};
@@ -176,6 +188,9 @@ namespace features::misc {
 			bool server_shoot_position_confirmed{};
 			math::vector3 target_velocity{};
 			bool forced{};
+			bool extrapolated{};
+			bool seed_mode{};
+			bool dt{};
 			std::uint32_t weapon_type{};
 		};
 
@@ -187,6 +202,9 @@ namespace features::misc {
 			int health{};
 			int hitgroup{};
 			int expected_hitgroup{};
+			int backtrack_ticks{};
+			math::vector3 aim_position{};
+			math::vector3 impact_position{};
 			bool was_aimbot{};
 			std::string mismatch_reason{};
 			std::uint32_t weapon_type{};
@@ -258,13 +276,16 @@ namespace features::misc {
 		std::vector<bullet_impact> m_bullet_impacts{};
 		mutable std::mutex m_mtx{};
 
+		// Last time an unconfirmed DT shot was logged - throttles the
+		// "server rejected" empty-shot entries that arrive on consecutive
+		// ticks while double tap is active.
+		float m_last_dt_empty_log{ 0.0f };
+
 		bool m_death_effect_loaded{};
 		bool m_bullet_impact_effect_loaded{};
 		bool m_bullet_tracers_loaded{};
 
 		float m_hit_effect_time{};
-
-		std::optional<recent_event> m_last_event{};
 
 		std::vector<math::vector3> m_buffered_impacts{};
 		math::vector3 m_buffered_eye_position{};
@@ -289,7 +310,6 @@ namespace features::misc {
 		void do_fov_change( std::uintptr_t view_setup, std::uintptr_t local_pawn ) const;
 		void do_aspect_ratio_change( std::uintptr_t view_setup );
 
-		float m_original_aspect_ratio{};
 		mutable float m_cached_fov_sensitivity{ -1.0f };
 		mutable bool m_cached_scoped{};
 		mutable float m_cached_target_fov{};
@@ -324,9 +344,30 @@ namespace features::misc {
 	{
 	public:
 		void on_present( );
+		void on_frame_stage_notify( );
+		void on_level_shutdown( );
+		void apply_scene_color( std::uintptr_t object ) const;
 
 	private:
-		int m_connected_frames{};
+		struct config_snapshot
+		{
+			bool enabled{};
+			std::uint32_t packed_color{};
+			float radius{ 300.0f };
+			float z_offset{ 2.0f };
+		};
+
+		void retire_entry( );
+
+		std::mutex m_mutex{};
+		config_snapshot m_config{};
+		std::atomic<std::uintptr_t> m_scene_object{};
+		std::atomic<std::uint32_t> m_packed_color{};
+		std::atomic<float> m_scene_color_scale{};
+		std::uintptr_t m_manager{};
+		std::uintptr_t m_entry{};
+		bool m_logged_submission{};
+		bool m_logged_scene{};
 	};
 
 	class other
@@ -340,15 +381,25 @@ namespace features::misc {
 		[[nodiscard]] bool is_alpha_changed( ) const { return this->m_is_alpha_changed; }
 
 		static inline std::string s_display_name{};
+		static inline bool s_name_change_pending{};
 
 	private:
 		void do_autobuy( ) const;
 		void do_player_alpha_changing( );
-		void do_name_changing( ) const;
+		void do_reveal_radar( ) const;
+		void do_name_changing( );
 		void do_viewmodel_adjust( );
-		void do_femboy_praise( ) const;
-
+		void do_auto_accept( );
+		[[nodiscard]] bool dispatch_auto_accept_ui( ) const;
 		bool m_is_alpha_changed{};
+		bool m_name_changer_active{};
+		bool m_auto_accept_done{};
+		int m_auto_accept_ui_frames{};
+		int m_auto_accept_attempts{};
+		std::uintptr_t m_name_changer_controller{};
+		std::uintptr_t m_auto_accept_set_ready{};
+		std::string m_original_name{};
+		std::string m_last_sent_name{};
 		float m_last_spawntime{};
 		float m_cached_vm_x{ std::numeric_limits<float>::quiet_NaN( ) };
 		float m_cached_vm_y{ std::numeric_limits<float>::quiet_NaN( ) };
@@ -456,19 +507,24 @@ namespace features::misc {
 		};
 
 		void try_initialize ();
-		void run_script (const std::string& script);
-		void send_player_weapons (std::uintptr_t controller);
-		void send_clear (std::uint64_t steamid);
+		[[nodiscard]] c_ui_panel* find_hud_panel () const;
+		[[nodiscard]] bool run_script (const std::string& script);
+		void send_player_weapons (
+			std::uintptr_t controller,
+			std::span<const systems::entities::cached> items);
+		[[nodiscard]] bool send_clear (std::uint64_t steamid);
 		void clear_all ();
 
 		bool                                                 m_script_injected {};
+		bool                                                 m_scoreboard_open {};
 		std::unordered_map<std::uint64_t, player_weapon_state> m_cache {};
 		int                                                  m_throttle {};
 		int                                                  m_init_throttle {};
 
-		// panorama handles — resolved once per level, cleared on level change
+		// The persistent HUD panel hosts scripts; the scoreboard itself is rebuilt
+		// whenever it is opened and is resolved from JavaScript at update time.
 		c_ui_engine* m_ui_engine {};
-		c_ui_panel* m_scoreboard_panel {};
+		c_ui_panel* m_script_panel {};
 	};
 
 } // namespace features::misc

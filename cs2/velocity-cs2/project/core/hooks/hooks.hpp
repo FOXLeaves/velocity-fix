@@ -22,26 +22,26 @@ namespace hooks {
 		static void __fastcall handle_view_angles( std::uintptr_t thisptr, int a2 );
 		static void __fastcall add_entity( std::uintptr_t thisptr, std::uintptr_t entity, std::uint32_t handle );
 		static void __fastcall remove_entity( std::uintptr_t thisptr, std::uintptr_t entity, std::uint32_t handle );
-		static std::uintptr_t __fastcall render_view( std::uintptr_t thisptr );
-		static void __fastcall draw_skybox_array( std::uintptr_t thisptr, std::uintptr_t a2, std::uintptr_t mesh_array, int mesh_count, int a5, std::uintptr_t a6, std::uintptr_t a7 );
+		static void __fastcall render_view( std::uintptr_t thisptr );
+		static void __fastcall draw_skybox_array( std::uintptr_t thisptr, std::uintptr_t a2, std::uintptr_t mesh_array, int mesh_count, int a5, std::uintptr_t a6, std::uintptr_t a7, std::uintptr_t a8 );
 		static std::uintptr_t __fastcall light_scene_object( std::uintptr_t thisptr, std::uintptr_t object, std::uintptr_t a3 );
 		static void __fastcall draw_scene_object_array( std::uintptr_t thisptr, std::uintptr_t a2, std::uintptr_t object_array );
 		static std::uintptr_t __fastcall draw_scene_object( std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t batch, int batch_count, int a5, std::uintptr_t a6, std::uintptr_t a7, std::uintptr_t a8 );
 		static bool __fastcall is_glowing( std::uintptr_t glow_property );
 		static void __fastcall get_glow_color( std::uintptr_t glow_property, float* color );
 		static void __fastcall generate_primitives( std::uintptr_t thisptr, std::uintptr_t scene_object, std::uintptr_t scene_view, std::uintptr_t primitive_buffer );
-		static std::uintptr_t __fastcall parse_report_hit( std::uintptr_t thisptr, std::uintptr_t a2, std::uintptr_t a3 );
-		static __m128* __fastcall get_scene_param( __m128i* scene_data, __m128* out_buffer, std::uint32_t hash, __m128* default_value );
+		static std::uintptr_t __fastcall parse_report_hit( std::uintptr_t thisptr, std::uint8_t deleting );
+		static std::uintptr_t __fastcall setup_fog( __m128i* output, int* mode );
 		static std::uintptr_t __fastcall set_shader_param( __m128i* map, std::uint32_t hash, __m128i* value );
+		static std::uintptr_t __fastcall set_postprocess_vec( __m128i* map, std::uint32_t hash, __m128i* value );
 		static void __fastcall override_view( std::uintptr_t thisptr, std::uintptr_t view_setup );
 		static void __fastcall update_fov_sensitivity( std::uintptr_t thisptr );
 		static void __fastcall render_scope( std::uintptr_t a1, std::uintptr_t a2 );
 		static bool __fastcall render_crosshair( std::uintptr_t a1 );
 		static float __fastcall prepare_scene_material( std::uintptr_t material, void* a2, float a3 );
 		static void __fastcall post_network_data_received( std::uintptr_t thisptr );
-		static bool __fastcall draw_overhead( std::uintptr_t pawn );
+		static bool __fastcall draw_overhead( std::uintptr_t pawn, std::uint32_t player_slot );
 		static std::uintptr_t __fastcall draw_legs( std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4, std::uintptr_t a5 );
-		static char __fastcall is_enemy_on_radar( std::uintptr_t a1, std::uintptr_t a2 );
 		static bool __fastcall get_transforms_for_hitbox_list( std::uintptr_t a1, std::uintptr_t a2, int* a3 );
 		static void __fastcall sort_primitives( std::uintptr_t thisptr, std::uintptr_t a2, std::uintptr_t a3, std::uint32_t a4 );
 		static float __fastcall get_inaccuracy( std::uintptr_t thisptr, float* a2, float* a3 );
@@ -50,12 +50,14 @@ namespace hooks {
 		static std::uintptr_t __fastcall level_shutdown( std::uintptr_t a1 );
 		static void __fastcall read_frame_input( std::uintptr_t a1, std::uint32_t a2 );
 		static void __fastcall process_input_event( std::uintptr_t thisptr, int slot, float frametime );
-		static std::uintptr_t __fastcall render_decals( std::uintptr_t a1, std::uintptr_t a2, bool a3, bool a4 );
+		static std::uintptr_t __fastcall render_decals( std::uintptr_t render_context, std::uintptr_t** render_view, bool pass_flag_a, bool pass_flag_b );
 		static void __fastcall render_smoke( std::uintptr_t a1, std::uintptr_t a2, int a3, int a4, std::uintptr_t a5, std::uintptr_t a6 );
 		static std::uintptr_t __fastcall render_smoke_map( std::uintptr_t thisptr, std::size_t size, std::uintptr_t* out_ptr );
 		static void __fastcall render_smoke_unmap( std::uintptr_t thisptr, std::uintptr_t ctx, std::size_t size );
 		static void __fastcall draw_flash_effect( std::uintptr_t a1, int a2, std::uintptr_t* a3, std::uintptr_t a4, __m128* a5 );
 		static char __fastcall set_info( std::uintptr_t rcx, std::uintptr_t a2 );
+		static void __fastcall match_found_handler( std::uintptr_t thisptr );
+		static std::uintptr_t __fastcall panorama_event( std::uintptr_t thisptr, const char* event_name, std::uintptr_t a3, float a4 );
 
 	private:
 		inline static hooking::jmp m_present{};
@@ -77,8 +79,9 @@ namespace hooks {
 		inline static hooking::jmp m_get_glow_color{};
 		inline static hooking::jmp m_generate_primitives{};
 		inline static hooking::jmp m_parse_report_hit{};
-		inline static hooking::jmp m_get_scene_param{};
+		inline static hooking::jmp m_setup_fog{};
 		inline static hooking::jmp m_set_shader_param{};
+		inline static hooking::jmp m_set_postprocess_vec{};
 		inline static hooking::jmp m_override_view{};
 		inline static hooking::jmp m_update_fov_sensitivity{};
 		inline static hooking::jmp m_render_scope{};
@@ -87,7 +90,6 @@ namespace hooks {
 		inline static hooking::jmp m_post_network_data_received{};
 		inline static hooking::jmp m_draw_overhead{};
 		inline static hooking::jmp m_draw_legs{};
-		inline static hooking::jmp m_is_enemy_on_radar{};
 		inline static hooking::jmp m_get_transforms_for_hitbox_list{};
 		inline static hooking::jmp m_sort_primitives{};
 		inline static hooking::jmp m_get_inaccuracy{};
@@ -102,6 +104,8 @@ namespace hooks {
 		inline static hooking::jmp m_render_smoke_unmap{};
 		inline static hooking::jmp m_draw_flash_effect{};
 		inline static hooking::jmp m_set_info{};
+		inline static hooking::jmp m_match_found_handler{};
+		inline static hooking::jmp m_panorama_event{};
 	};
 
 	class utility
@@ -118,24 +122,6 @@ namespace hooks {
 	private:
 		inline static hooking::jmp m_service_read{};
 		inline static hooking::jmp m_log_internal{};
-	};
-
-	class vac
-	{
-	public:
-		vac( ) = delete;
-
-		static bool initialize( );
-		static void shutdown( );
-
-		static std::uint8_t __fastcall analyze_pe_module( std::uintptr_t module_base, std::uintptr_t out_info, char calculate_hash );
-		static void __fastcall build_diagnostic_response( std::intptr_t request, DWORD thread_id );
-		static std::intptr_t __fastcall string_copy( void* dest, const void* src, std::uintptr_t size );
-
-	private:
-		inline static hooking::jmp m_analyze_pe_module{};
-		inline static hooking::jmp m_build_diagnostic_response{};
-		inline static hooking::jmp m_string_copy{};
 	};
 
 } // namespace hooks

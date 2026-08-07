@@ -96,7 +96,7 @@ namespace features::misc {
 		}
 
 		const auto now = std::chrono::steady_clock::now( );
-		const auto local_pawn_handle = memory::read<std::uint32_t>( local.controller + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+		const auto local_pawn_handle = memory::read<std::uint32_t>( local.controller + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 
 		if ( !local_pawn_handle )
 		{
@@ -229,7 +229,7 @@ namespace features::misc {
 				this->m_delayed_attack2 = !attacking && attacking2;
 			}
 
-			math::vector3 predicted_velocity{};
+			auto predicted_velocity = systems::g_prediction.pre( ).networked_velocity;
 			systems::g_prediction.simulate( cmd, local, [ & ]( ) { predicted_velocity = memory::read<math::vector3>( local.pawn + SCHEMA( "C_BaseEntity", "m_vecVelocity"_hash ) ); } );
 
 			const auto vel_contribution = predicted_velocity * k_velocity_inherit;
@@ -301,7 +301,7 @@ namespace features::misc {
 			}
 		}
 
-		auto angles = systems::g_view.angles( );
+		auto angles = systems::g_input.get_view_angles( );
 		math::helpers::normalize_angle( angles.x );
 		angles.x -= ( 90.0f - std::abs( angles.x ) ) * 10.0f / 90.0f;
 
@@ -618,7 +618,7 @@ namespace features::misc {
 		this->m_sv_gravity = CONVAR ("sv_gravity")->get<float>( );
 		this->m_molotov_max_slope_z = std::cos(CONVAR ("weapon_molotov_maxdetonateslope")->get<float>( ) * std::numbers::pi_v<float> / 180.0f );
 
-		const auto local_pawn_handle = memory::read<std::uint32_t>( local.controller + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+		const auto local_pawn_handle = memory::read<std::uint32_t>( local.controller + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 		const auto local_team = memory::read<std::int32_t>( local.pawn + SCHEMA( "C_BaseEntity", "m_iTeamNum"_hash ) );
 		const auto now = std::chrono::steady_clock::now( );
 		const auto projectiles = systems::g_entities.get_by_type( systems::entities::type::projectile );
@@ -850,7 +850,7 @@ namespace features::misc {
 			return;
 		}
 
-		math::vector3 predicted_velocity{};
+		auto predicted_velocity = systems::g_prediction.pre( ).networked_velocity;
 		systems::g_prediction.simulate( cmd, local, [ & ]( ) { predicted_velocity = memory::read<math::vector3>( local.pawn + SCHEMA( "C_BaseEntity", "m_vecVelocity"_hash ) ); } );
 
 		if ( predicted_velocity.length_sqr( ) < 1.0f )
@@ -961,7 +961,7 @@ namespace features::misc {
 				continue;
 			}
 
-			const auto pawn_handle = memory::read<std::uint32_t>( player.ptr + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+			const auto pawn_handle = memory::read<std::uint32_t>( player.ptr + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 			const auto pawn = systems::g_entities.lookup( pawn_handle );
 
 			if ( !pawn || pawn == local.pawn )

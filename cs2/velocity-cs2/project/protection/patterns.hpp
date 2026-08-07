@@ -1,14 +1,14 @@
 #ifndef PATTERNS_HPP
 #define PATTERNS_HPP
 
-namespace protection::addresses { struct address_t; }
+namespace protection::addresses { union address_t; }
 
 namespace patterns {
 
 	extern const ::protection::addresses::address_t& add_entity;
-	extern const ::protection::addresses::address_t& analyze_pe_module;
+	extern const ::protection::addresses::address_t& auto_accept_session;
 	extern const ::protection::addresses::address_t& base_fire_guns_get_inaccuracy;
-	extern const ::protection::addresses::address_t& build_diagnostic_response;
+	extern const ::protection::addresses::address_t& button_state_alloc;
 	extern const ::protection::addresses::address_t& cmd_interpreter;
 	extern const ::protection::addresses::address_t& create_move;
 	extern const ::protection::addresses::address_t& csgo_input;
@@ -18,6 +18,9 @@ namespace patterns {
 	extern const ::protection::addresses::address_t& draw_scene_object;
 	extern const ::protection::addresses::address_t& draw_scene_object_array;
 	extern const ::protection::addresses::address_t& draw_skybox_array;
+	extern const ::protection::addresses::address_t& dynamic_light_alloc;
+	extern const ::protection::addresses::address_t& dynamic_light_manager;
+	extern const ::protection::addresses::address_t& dynamic_light_time;
 	extern const ::protection::addresses::address_t& engine_client_cmd;
 	extern const ::protection::addresses::address_t& entity_list;
 	extern const ::protection::addresses::address_t& filesystem_close;
@@ -43,8 +46,8 @@ namespace patterns {
 	extern const ::protection::addresses::address_t& get_inaccuracy;
 	extern const ::protection::addresses::address_t& get_interp_amount;
 	extern const ::protection::addresses::address_t& get_interpolated_shoot_position;
+	extern const ::protection::addresses::address_t& get_spread;
 	extern const ::protection::addresses::address_t& get_net_channel;
-	extern const ::protection::addresses::address_t& get_scene_param;
 	extern const ::protection::addresses::address_t& get_tick_view_angles;
 	extern const ::protection::addresses::address_t& get_transforms_for_hitbox_list;
 	extern const ::protection::addresses::address_t& get_usercmd;
@@ -60,10 +63,10 @@ namespace patterns {
 	extern const ::protection::addresses::address_t& hud_weapon_selection_update;
 	extern const ::protection::addresses::address_t& init_particle_path_buffer;
 	extern const ::protection::addresses::address_t& init_particle_path_buffer_alt;
-	extern const ::protection::addresses::address_t& is_enemy_on_radar;
 	extern const ::protection::addresses::address_t& is_glowing;
 	extern const ::protection::addresses::address_t& item_system;
 	extern const ::protection::addresses::address_t& kv3_alloc;
+	extern const ::protection::addresses::address_t& kv3_destroy;
 	extern const ::protection::addresses::address_t& kv3_load;
 	extern const ::protection::addresses::address_t& level_initialization;
 	extern const ::protection::addresses::address_t& level_shutdown;
@@ -71,9 +74,10 @@ namespace patterns {
 	extern const ::protection::addresses::address_t& light_scene_object;
 	extern const ::protection::addresses::address_t& local_player_controller;
 	extern const ::protection::addresses::address_t& log_internal;
+	extern const ::protection::addresses::address_t& con_color_msg;
+	extern const ::protection::addresses::address_t& severity4_color;
 	extern const ::protection::addresses::address_t& material_create;
 	extern const ::protection::addresses::address_t& material_manager;
-	extern const ::protection::addresses::address_t& net_client;
 	extern const ::protection::addresses::address_t& override_view;
 	extern const ::protection::addresses::address_t& parse_report_hit;
 	extern const ::protection::addresses::address_t& particle_create_effect;
@@ -81,7 +85,7 @@ namespace patterns {
 	extern const ::protection::addresses::address_t& particle_manager;
 	extern const ::protection::addresses::address_t& particle_set_control_point;
 	extern const ::protection::addresses::address_t& particle_set_entity_binding;
-	extern const ::protection::addresses::address_t& particle_stop_effect;
+	extern const ::protection::addresses::address_t& particle_set_transform;
 	extern const ::protection::addresses::address_t& planted_c4;
 	extern const ::protection::addresses::address_t& post_network_data_received;
 	extern const ::protection::addresses::address_t& prediction_finish_move;
@@ -99,7 +103,7 @@ namespace patterns {
 	extern const ::protection::addresses::address_t& remove_entity;
 	extern const ::protection::addresses::address_t& render_crosshair;
 	extern const ::protection::addresses::address_t& render_decals;
-	extern const ::protection::addresses::address_t& render_game_system;
+	extern const ::protection::addresses::address_t& render_game_system_storage;
 	extern const ::protection::addresses::address_t& render_scope;
 	extern const ::protection::addresses::address_t& render_smoke;
 	extern const ::protection::addresses::address_t& render_view;
@@ -109,15 +113,17 @@ namespace patterns {
 	extern const ::protection::addresses::address_t& service_read;
 	extern const ::protection::addresses::address_t& set_info;
 	extern const ::protection::addresses::address_t& set_player_model;
+	extern const ::protection::addresses::address_t& set_postprocess_vec;
 	extern const ::protection::addresses::address_t& set_shader_param;
+	extern const ::protection::addresses::address_t& set_shader_param_i;
 	extern const ::protection::addresses::address_t& set_view_angles;
 	extern const ::protection::addresses::address_t& set_voice_data;
 	extern const ::protection::addresses::address_t& simulation_player;
 	extern const ::protection::addresses::address_t& sort_primitives;
+	extern const ::protection::addresses::address_t& setup_fog;
 	extern const ::protection::addresses::address_t& play_sound;
 	extern const ::protection::addresses::address_t& string_copy;
 	extern const ::protection::addresses::address_t& subtick_move_alloc;
-	extern const ::protection::addresses::address_t& swap_chain_storage;
 	extern const ::protection::addresses::address_t& trace_bullet;
 	extern const ::protection::addresses::address_t& trace_bullet_data_init;
 	extern const ::protection::addresses::address_t& trace_bullet_free;
@@ -142,6 +148,15 @@ namespace patterns {
 	extern const ::protection::addresses::address_t& weapon_update_composite_material;
 	extern const ::protection::addresses::address_t& weapon_update_mesh;
 	extern const ::protection::addresses::address_t& weapon_update_skin;
+	extern const ::protection::addresses::address_t& econ_item_view_set_attribute;
+	extern const ::protection::addresses::address_t& econ_item_view_remove_attribute;
+	extern const ::protection::addresses::address_t& econ_item_view_invalidate_description;
+	extern const ::protection::addresses::address_t& set_bodygroup;
+	extern const ::protection::addresses::address_t& set_player_ready;
+	// Auto-accept: match-found handler (immediate accept path).
+	extern const ::protection::addresses::address_t& match_found_handler;
+	// Auto-accept: panorama event dispatcher (delayed backup path).
+	extern const ::protection::addresses::address_t& panorama_event;
 
 } // namespace patterns
 

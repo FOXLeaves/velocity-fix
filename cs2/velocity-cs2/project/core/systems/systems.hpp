@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <utilities/proto/proto.hpp>
 #include <core/settings.hpp>
 
@@ -30,6 +31,7 @@ namespace systems {
 	private:
 		static inline std::array<std::uintptr_t, static_cast< std::size_t >( settings::esp::cham_ids::count )> m_loaded{};
 		static inline std::unordered_map<std::uint64_t, std::uintptr_t> m_map{};
+		static inline std::vector<cstypes::strong_handle> m_handles{};
 		static inline std::mutex m_mtx{};
 	};
 
@@ -266,12 +268,13 @@ namespace systems {
 		};
 
 		void capture_prestate( std::uintptr_t local_pawn, std::uintptr_t movement_services );
-		void simulate( input::usercmd* cmd, const systems::local::snapshot& local, const std::function<void( )>& fn );
+		bool simulate( input::usercmd* cmd, const systems::local::snapshot& local, const std::function<void( )>& fn );
 
 		[[nodiscard]] const state& pre( ) const { return this->m_prestate; }
 
 	private:
 		state m_prestate{};
+		std::mutex m_simulation_mtx{};
 	};
 
 	class view
@@ -285,24 +288,27 @@ namespace systems {
 		};
 
 		void update( std::uintptr_t view );
+		void update_matrix( );
 
 		[[nodiscard]] math::vector2 project( const math::vector3& world_pos );
 		[[nodiscard]] projection project_full( const math::vector3& world_pos ) const;
 		[[nodiscard]] bool projection_valid( const math::vector2& screen_pos ) { return screen_pos.x != this->k_invalid && screen_pos.y != this->k_invalid; }
 
-		[[nodiscard]] bool has_camera( ) const { return this->m_fov != this->k_invalid; }
+		[[nodiscard]] bool has_camera( ) const { return this->m_matrix_valid.load( std::memory_order_acquire ); }
 		[[nodiscard]] math::vector3 origin( ) const { return this->m_origin; }
 		[[nodiscard]] math::vector3 angles( ) const { return this->m_angles; }
 		[[nodiscard]] float fov( ) const { return this->m_fov; }
-		[[nodiscard]] const math::matrix4x4& matrix( ) const { return this->m_matrix; }
+		[[nodiscard]] math::matrix4x4 matrix( ) const;
 
 	private:
 		static constexpr auto k_invalid{ 0xdead };
 
 		math::matrix4x4 m_matrix{};
+		mutable std::mutex m_matrix_mtx{};
+		std::atomic<bool> m_matrix_valid{};
 		math::vector3 m_origin{};
 		math::vector3 m_angles{};
-		float m_fov{};
+		float m_fov{ k_invalid };
 	};
 
 	class bones
@@ -416,7 +422,7 @@ namespace systems {
 
 		struct trace_array_element
 		{
-			std::byte pad0[ 0x30 ];
+			std::byte pad0[ 0x38 ];
 		};
 
 		struct trace_data
@@ -431,11 +437,21 @@ namespace systems {
 			int num_hits;
 			int unknown5;
 			void* hit_array_pointer;
-			std::byte pad1[ 0xc8 ];
+			int hit_capacity{ 8 };
+			int hit_flags{ static_cast< int >( 0x80000000 ) };
+			std::byte hit_elements[ 0xc0 ];
 			math::vector3 start;
-			math::vector3 end;
-			std::byte pad2[ 0x50 ];
+			math::vector3 direction;
+			float fraction{ 1.0f };
+			bool unknown6;
+			std::byte pad1[ 0x4b ];
 		};
+
+		static_assert( offsetof( trace_data, elements ) == 0x18 );
+		static_assert( offsetof( trace_data, num_hits ) == 0x1c20 );
+		static_assert( offsetof( trace_data, hit_array_pointer ) == 0x1c28 );
+		static_assert( offsetof( trace_data, start ) == 0x1cf8 );
+		static_assert( sizeof( trace_data ) == 0x1d60 );
 
 		struct player_movement_filter
 		{
@@ -462,7 +478,7 @@ namespace systems {
 		[[nodiscard]] player_movement_filter make_player_movement_filter( std::uintptr_t entity, std::uintptr_t mask, std::uint8_t collision_group = 11 ) const;
 		[[nodiscard]] tracing::result trace_player_bbox( const math::vector3& start, const math::vector3& end, const bbox_collision& bbox, const player_movement_filter& filter, std::uintptr_t movement_services ) const;
 
-		void setup_trace( trace_data* trace_data, const math::vector3& start, const math::vector3& end, const filter& filter, int penetration_count, bool trace_world = false ) const;
+		void setup_trace( trace_data* trace_data, const math::vector3& start, const math::vector3& delta, const filter& filter, int penetration_count, bool trace_world = false ) const;
 		void init_result( result* trace_result ) const;
 		void finalize_trace( trace_data* trace_data, result* trace_result, float unknown_float, void* unknown ) const;
 	};
@@ -499,8 +515,8 @@ namespace systems {
 		[[nodiscard]] const icon* get( std::uint32_t schema_hash, float scale = 1.0f );
 
 	private:
-		bool load_vpk_directory( const std::string& path );
-		bool cache_svg_bytes( const std::string& vpk_path, const std::string& icon_name, std::uint32_t entry_offset, std::uint32_t entry_length );
+		bool load_vpk_directory( const std::filesystem::path& path );
+		bool cache_svg_bytes( const std::filesystem::path& vpk_path, const std::string& icon_name, std::uint32_t entry_offset, std::uint32_t entry_length );
 		std::vector<std::byte> decompile_vsvg( std::span<const std::byte> data ) const;
 
 		struct icon_key

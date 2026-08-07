@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <core/rendering/rendering.hpp>
 #include <core/settings.hpp>
@@ -100,6 +100,17 @@ namespace features::esp::player {
 			if ( cfg.m_info_flags.enabled.value )
 			{
 				this->add_flags( draw_list, bounds, info, cfg.m_info_flags, offsets );
+			}
+
+			// Ragebot diagnostics on the enemy body.
+			if ( settings::g_esp.m_player.m_backtrack_display.enabled.value )
+			{
+				this->add_backtrack_display( draw_list, info.pawn );
+			}
+
+			if ( settings::g_esp.m_player.m_extrapolation_display.enabled.value )
+			{
+				this->add_extrapolation_display( draw_list, info.pawn );
 			}
 		}
 	}
@@ -278,8 +289,8 @@ namespace features::esp::player {
 
 		if ( cfg.type == settings::esp::player::overlay::skeleton::mode::backtrack && local.is_alive )
 		{
-			const auto record = combat::g_shared.lc( ).get_oldest_was_valid( info.pawn );
-			if ( record && record->valid )
+			const auto record = combat::g_shared.lc( ).get_oldest_was_valid_visual( info.pawn );
+			if ( record )
 			{
 				if ( record->origin.distance( info.origin ) >= 0.25f )
 				{
@@ -784,30 +795,31 @@ namespace features::esp::player {
 		const auto sh = static_cast< float >( screen_h );
 		const auto center_x = sw * 0.5f;
 		const auto center_y = sh * 0.5f;
+		const auto head = info.bones[ cstypes::bone_ids::head ].position;
 
-		const auto proj = systems::g_view.project_full( info.bones[ cstypes::bone_ids::head ].position );
+		const auto proj = systems::g_view.project_full( head );
 
 		if ( proj.on_screen && proj.w > 0.0f )
 		{
 			return;
 		}
 
-		auto dx = proj.screen.x - center_x;
-		auto dy = proj.screen.y - center_y;
-
-		if ( proj.w <= 0.0f )
-		{
-			dx = -dx;
-			dy = -dy;
-		}
-
-		const auto len = std::sqrtf( dx * dx + dy * dy );
-		if ( len < 1.0f )
+		if ( !systems::g_frame_data.valid( ) )
 		{
 			return;
 		}
 
-		const auto angle = std::atan2f( dy, dx );
+		const auto to_target = info.origin - systems::g_frame_data.origin( );
+		if ( !std::isfinite( to_target.x ) || !std::isfinite( to_target.y ) || to_target.length_2d( ) < 1.0f )
+		{
+			return;
+		}
+
+		// Match the live input yaw and player origins used by the reference OOF implementation.
+		// The view system's cached origin/angles describe a different render structure.
+		const auto target_yaw = std::atan2f( to_target.y, to_target.x );
+		const auto view_yaw = math::helpers::deg_to_rad( systems::g_input.get_view_angles( ).y );
+		const auto angle = view_yaw - target_yaw - std::numbers::pi_v<float> *0.5f;
 		const auto rx = cfg.radius_x.value;
 		const auto ry = cfg.radius_y.value;
 
@@ -860,7 +872,7 @@ namespace features::esp::player {
 			return info;
 		}
 
-		const auto pawn_handle = memory::read<std::uint32_t>( info.controller + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+		const auto pawn_handle = memory::read<std::uint32_t>( info.controller + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 		if ( !pawn_handle )
 		{
 			return info;
@@ -887,10 +899,8 @@ namespace features::esp::player {
 			return info;
 		}
 
-		if ( memory::read<bool>( game_scene_node + SCHEMA( "CGameSceneNode", "m_bDormant"_hash ) ) )
-		{
-			return info;
-		}
+		// m_bDormant is ambiguous across the current schema scopes and can
+		// resolve to unrelated data. Keep the last known transform, as chams do.
 
 		const auto name_ptr = memory::read<std::uintptr_t>( info.controller + SCHEMA( "CCSPlayerController", "m_sSanitizedPlayerName"_hash ) );
 		if ( name_ptr )
@@ -952,6 +962,129 @@ namespace features::esp::player {
 		}
 
 		return info;
+	}
+
+	namespace {
+
+		// Glow-style skeleton chains reused by the backtrack / extrapolation
+		// phantom displays.
+		constexpr std::array<std::array<unsigned int, 7>, 5> k_phantom_chains
+		{
+			std::array{ cstypes::bone_ids::head, cstypes::bone_ids::neck, cstypes::bone_ids::spine_4, cstypes::bone_ids::spine_3, cstypes::bone_ids::spine_2, cstypes::bone_ids::spine_1, cstypes::bone_ids::pelvis },
+			std::array{ cstypes::bone_ids::left_hand, cstypes::bone_ids::left_elbow, cstypes::bone_ids::left_shoulder, cstypes::bone_ids::left_clavicle, cstypes::bone_ids::spine_4, ~0u, ~0u },
+			std::array{ cstypes::bone_ids::right_hand, cstypes::bone_ids::right_elbow, cstypes::bone_ids::right_shoulder, cstypes::bone_ids::right_clavicle, cstypes::bone_ids::spine_4, ~0u, ~0u },
+			std::array{ cstypes::bone_ids::left_foot, cstypes::bone_ids::left_knee, cstypes::bone_ids::left_hip, cstypes::bone_ids::pelvis, ~0u, ~0u, ~0u },
+			std::array{ cstypes::bone_ids::right_foot, cstypes::bone_ids::right_knee, cstypes::bone_ids::right_hip, cstypes::bone_ids::pelvis, ~0u, ~0u, ~0u },
+		};
+
+		// Draws a glowing phantom skeleton for a set of bone positions.
+		// A filled head disc plus thicker limb strokes reads as a glowing
+		// body silhouette instead of a stick figure.
+		void draw_phantom_skeleton( xdraw::draw_list& draw_list, const std::array<math::vector3, 27>& bones, const xdraw::color& color )
+		{
+			const auto glow = color.alpha( static_cast< std::uint8_t >( color.a * 0.25f ) );
+
+			if ( cstypes::bone_ids::head < 27 )
+			{
+				const auto& head_pos = bones[ cstypes::bone_ids::head ];
+				if ( head_pos.length_sqr( ) >= 1.0f )
+				{
+					const auto hs = systems::g_view.project( head_pos );
+					if ( systems::g_view.projection_valid( hs ) )
+					{
+						draw_list.circle_filled( hs.x, hs.y, 6.5f, glow );
+						draw_list.circle_filled( hs.x, hs.y, 3.5f, color );
+					}
+				}
+			}
+
+			for ( const auto& chain : k_phantom_chains )
+			{
+				math::vector2 prev{};
+				auto have_prev = false;
+
+				for ( const auto bone : chain )
+				{
+					if ( bone >= 27 )
+					{
+						break;
+					}
+
+					const auto& pos = bones[ bone ];
+					if ( pos.length_sqr( ) < 1.0f )
+					{
+						have_prev = false;
+						continue;
+					}
+
+					const auto s = systems::g_view.project( pos );
+					if ( !systems::g_view.projection_valid( s ) )
+					{
+						have_prev = false;
+						continue;
+					}
+
+					if ( have_prev )
+					{
+						draw_list.line( prev.x, prev.y, s.x, s.y, glow, 6.0f );
+						draw_list.line( prev.x, prev.y, s.x, s.y, color, 2.0f );
+					}
+
+					prev = s;
+					have_prev = true;
+				}
+			}
+		}
+
+	} // namespace
+
+	void overlay::add_backtrack_display( xdraw::draw_list& draw_list, std::uintptr_t pawn )
+	{
+		const auto& cfg = settings::g_esp.m_player.m_backtrack_display;
+		const auto points = features::combat::g_shared.lc( ).get_display_points( pawn );
+
+		// A target that never moved collapses to a single deduplicated
+		// record - nothing to show (the ghost would just sit on the player).
+		if ( points.size( ) < 2 )
+		{
+			return;
+		}
+
+		for ( const auto& pt : points )
+		{
+			if ( !pt.valid || pt.extrapolated )
+			{
+				continue;
+			}
+
+			draw_phantom_skeleton( draw_list, pt.bones, cfg.color.value );
+		}
+	}
+
+	void overlay::add_extrapolation_display( xdraw::draw_list& draw_list, std::uintptr_t pawn )
+	{
+		const auto& cfg = settings::g_esp.m_player.m_extrapolation_display;
+
+		// The extrapolated pose only exists in the per-tick candidate
+		// records (they are not part of the backtrack record list), so read
+		// them straight from the ragebot's gather pass.
+		const auto& records = features::combat::g_rage.extrapolated_records( );
+
+		for ( const auto& rec : records )
+		{
+			if ( rec.pawn != pawn || !rec.extrapolated )
+			{
+				continue;
+			}
+
+			std::array<math::vector3, 27> bones{};
+			for ( auto b = 0; b < 27 && b < rec.bone_count; ++b )
+			{
+				bones[ b ] = rec.bones[ b ].position;
+			}
+
+			draw_phantom_skeleton( draw_list, bones, cfg.color.value );
+		}
 	}
 
 } // namespace features::esp::player

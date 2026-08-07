@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <core/systems/systems.hpp>
 #include <core/features/features.hpp>
@@ -90,6 +90,54 @@ namespace features::movement {
 			return yaw;
 		}
 
+		// Corrected reference for unquantized servers: the ideal angle is
+		// derived from the capped wishspeed projection, and friction is
+		// carried through so the reference matches the simulation.
+		[[nodiscard]] float ref_ideal_angle_unq( float speed, float dt, float friction, float wishspeed, float air_accel, float air_max_wishspeed )
+		{
+			if ( speed < 1.0f )
+			{
+				return 90.0f;
+			}
+
+			const auto capped_wishspeed = std::fminf( wishspeed, air_max_wishspeed );
+			const auto accel_speed = wishspeed * air_accel * friction * dt;
+
+			const auto ideal_projection = std::fmaxf( capped_wishspeed - accel_speed, 0.0f );
+			const auto cos_theta = std::clamp( ideal_projection / speed, -1.0f, 1.0f );
+
+			return std::acosf( cos_theta ) * ( 180.0f / std::numbers::pi_v<float> );
+		}
+
+		[[nodiscard]] float ref_air_strafer_unq( float vel_x, float vel_y, float target_yaw, float dt, bool side_switch, float wishspeed, float air_accel, float air_max_wishspeed, float friction )
+		{
+			const auto speed = std::sqrtf( vel_x * vel_x + vel_y * vel_y );
+			const auto theta = ref_ideal_angle_unq( speed, dt, friction, wishspeed, air_accel, air_max_wishspeed );
+
+			if ( speed < 15.0f )
+			{
+				return target_yaw;
+			}
+
+			const auto vel_angle = std::atan2f( vel_y, vel_x ) * ( 180.0f / std::numbers::pi_v<float> );
+			auto vel_delta = target_yaw - vel_angle;
+			math::helpers::normalize_angle( vel_delta );
+
+			float result{};
+
+			if ( std::fabsf( vel_delta ) > 2.0f )
+			{
+				result = vel_angle + ( vel_delta > 0.0f ? theta : -theta );
+			}
+			else
+			{
+				result = vel_angle + ( side_switch ? theta : -theta );
+			}
+
+			math::helpers::normalize_angle( result );
+			return result;
+		}
+
 		void ref_air_accel_sim( float& vel_x, float& vel_y, float wishdir_yaw, float frame_time, float friction, float wishspeed, float air_accel, float air_max_wishspeed )
 		{
 			const auto yaw_rad = wishdir_yaw * ( std::numbers::pi_v<float> / 180.0f );
@@ -116,12 +164,9 @@ namespace features::movement {
 
 	[[nodiscard]] bool test_strafer::is_active( ) const
 	{
-		if ( !settings::g_movement.m_test_strafer.enabled.value )
-		{
-			return false;
-		}
-
-		return CONVAR ("sv_quantize_movement_input")->get<bool>( );
+		// Works with both quantization modes: subtick yaw deltas when the
+		// server quantizes movement input, direct view angles otherwise.
+		return settings::g_movement.m_test_strafer.enabled.value;
 	}
 
 	math::vector2 test_strafer::movement_from_buttons( std::uintptr_t pressed )
@@ -193,14 +238,103 @@ namespace features::movement {
 			return;
 		}
 
+		// TEMP TEST (gpt5.6): always run the subtick yaw path regardless of
+		// sv_quantize_movement_input to verify whether quantize 0 actually
+		// ignores subtick yaw deltas at all.
 		this->quantized_path( cmd );
+	}
+
+	// Unquantized servers (most community servers, sv_quantize_movement_input 0)
+	// ignore subtick yaw deltas. Steer by rotating the desired world direction
+	// into the command frame and writing the base move fields - the view (and
+	// anti-aim yaw) stays untouched.
+	void test_strafer::unquantized_path( systems::input::usercmd* cmd )
+	{
+		const auto current_buttons = cmd->buttons.value;
+		if ( current_buttons & static_cast< std::uintptr_t >( cstypes::command_buttons::in_sprint ) )
+		{
+			return;
+		}
+
+		const auto base = cmd->csgo_user_cmd.mutable_base( );
+		if ( !base || !base->viewangles( ) )
+		{
+			return;
+		}
+
+		this->check_button( current_buttons, cstypes::command_buttons::in_moveleft );
+		this->check_button( current_buttons, cstypes::command_buttons::in_moveright );
+		this->check_button( current_buttons, cstypes::command_buttons::in_forward );
+		this->check_button( current_buttons, cstypes::command_buttons::in_back );
+		this->m_last_buttons = current_buttons;
+
+		const auto player_move = movement_from_buttons( this->m_last_pressed );
+		if ( player_move.x == 0.0f && player_move.y == 0.0f )
+		{
+			return;
+		}
+
+		const auto& prestate = systems::g_prediction.pre( );
+		const auto velocity = prestate.networked_velocity;
+		const auto speed_2d = velocity.length_2d( );
+
+		if ( speed_2d < k_min_strafe_speed )
+		{
+			return;
+		}
+
+		const auto sv_airaccelerate = CONVAR ("sv_airaccelerate")->get<float>( );
+		const auto sv_maxspeed = CONVAR ("sv_maxspeed")->get<float>( );
+		const auto sv_air_max_wishspeed = CONVAR ("sv_air_max_wishspeed")->get<float>( );
+		auto surface_friction = prestate.surface_friction;
+		if ( !std::isfinite( surface_friction ) || surface_friction <= 0.0f )
+		{
+			surface_friction = 1.0f;
+		}
+
+		// Interpret WASD against the real view yaw.
+		const auto input_yaw = systems::g_input.get_view_angles( ).y;
+		const auto input_offset = std::atan2f( -player_move.y, player_move.x ) * ( 180.0f / std::numbers::pi_v<float> );
+
+		auto target_world_yaw = input_yaw + input_offset;
+		math::helpers::normalize_angle( target_world_yaw );
+
+		const auto entry_side = ( this->m_substep_counter % 2 ) == 0;
+		const auto wishdir_yaw = ref_air_strafer_unq( velocity.x, velocity.y, target_world_yaw, cstypes::tick_interval, entry_side, sv_maxspeed, sv_airaccelerate, sv_air_max_wishspeed, surface_friction );
+
+		// Use the final command yaw (keeps whatever anti-aim wrote).
+		const auto command_yaw = base->viewangles( )->y( );
+
+		auto delta = wishdir_yaw - command_yaw;
+		math::helpers::normalize_angle( delta );
+
+		// Unquantized servers clamp the move fields to [-1, 1]; keep the
+		// input fractional or the direction collapses toward 45 degrees.
+		const auto rad = delta * ( std::numbers::pi_v<float> / 180.0f );
+		auto forward_move = std::cosf( rad );
+		auto left_move = -std::sinf( rad );
+
+		const auto move_length = std::hypotf( forward_move, left_move );
+		if ( move_length > 1.0f )
+		{
+			forward_move /= move_length;
+			left_move /= move_length;
+		}
+
+		base->set_forwardmove( std::clamp( forward_move, -1.0f, 1.0f ) );
+		base->set_leftmove( std::clamp( left_move, -1.0f, 1.0f ) );
+
+		this->m_handled_this_tick = true;
+		++this->m_substep_counter;
 	}
 
 	bool test_strafer::apply_yaw_subtick( proto::base_usercmd_pb* base, float when, float yaw_delta ) const
 	{
 		math::helpers::normalize_angle( yaw_delta );
 
-		if ( std::fabsf( yaw_delta ) <= 0.01f )
+		// Only reject a truly zero spin; the side-step lock injects 0.005
+		// deg per step to keep the strafer active.
+		if ( std::fabsf( yaw_delta ) <= 0.001f )
 		{
 			return false;
 		}
@@ -250,7 +384,7 @@ namespace features::movement {
 		const auto& prestate = systems::g_prediction.pre( );
 		const auto velocity = prestate.networked_velocity;
 		const auto speed_2d = velocity.length_2d( );
-		const auto command_yaw = base->viewangles( )->y( );
+		const auto command_yaw = systems::g_input.get_view_angles( ).y;
 
 		const auto player_move = movement_from_buttons( this->m_last_pressed );
 		if ( player_move.x == 0.0f && player_move.y == 0.0f )
@@ -278,6 +412,28 @@ namespace features::movement {
 		auto target_yaw = command_yaw + base_yaw_offset;
 		math::helpers::normalize_angle( target_yaw );
 
+		// While a side-step is active the engine view must stay locked at
+		// the AA yaw: the AA-rotated input decomposes along it back to the
+		// user's world direction the whole way, whereas unwinding the view
+		// toward the strafe target only aligns part of the tick and the
+		// accel stalls. Back mode keeps the normal steering (works fine).
+		auto side_offset{ 0.0f };
+		if ( features::combat::g_misc.antiaim( ).antiaim_active( ) )
+		{
+			const auto aa_yaw = features::combat::g_misc.antiaim( ).get_modified_angles( ).y;
+			side_offset = aa_yaw - command_yaw;
+			math::helpers::normalize_angle( side_offset );
+			if ( side_offset > 90.0f )
+			{
+				side_offset -= 180.0f;
+			}
+			else if ( side_offset < -90.0f )
+			{
+				side_offset += 180.0f;
+			}
+		}
+		const auto side_locked = std::fabsf( side_offset ) > 30.0f;
+
 		const auto sub_frame = cstypes::tick_interval / static_cast< float >( k_max_subticks );
 		const auto when_step = ( 1.0f - start_when ) / static_cast< float >( k_max_subticks + 1 );
 
@@ -294,8 +450,16 @@ namespace features::movement {
 			auto target_view_yaw = wishdir_yaw - base_yaw_offset;
 			math::helpers::normalize_angle( target_view_yaw );
 
-			auto yaw_delta = target_view_yaw - acc_yaw;
-			math::helpers::normalize_angle( yaw_delta );
+			// Side-step: keep the view on the AA yaw (0.005 deg/step keeps
+			// the subtick step registering so the strafer stays active).
+			auto yaw_delta{ 0.005f };
+			if ( !side_locked )
+			{
+				yaw_delta = target_view_yaw - acc_yaw;
+				math::helpers::normalize_angle( yaw_delta );
+			}
+			acc_yaw += yaw_delta;
+			math::helpers::normalize_angle( acc_yaw );
 
 			const auto when_frac = start_when + static_cast< float >( i ) * when_step;
 
@@ -304,7 +468,6 @@ namespace features::movement {
 				break;
 			}
 
-			acc_yaw = target_view_yaw;
 			ref_air_accel_sim( sim_vx, sim_vy, wishdir_yaw, sub_frame, surface_friction, sv_maxspeed, sv_airaccelerate, sv_air_max_wishspeed );
 			++injected;
 		}

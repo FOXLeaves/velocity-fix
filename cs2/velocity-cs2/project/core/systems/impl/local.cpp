@@ -16,7 +16,7 @@ namespace systems {
 			return;
 		}
 
-		const auto pawn_handle = memory::read<std::uint32_t>( local_player_controller + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+		const auto pawn_handle = memory::read<std::uint32_t>( local_player_controller + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 		if ( !pawn_handle )
 		{
 			this->reset( );

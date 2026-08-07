@@ -48,6 +48,13 @@ namespace features::esp {
 				[[nodiscard]] float get_alpha (std::uintptr_t pawn) const;
 
 			private:
+				struct pending_entry {
+					std::array<systems::bones::data, 27> bones {};
+					int bone_count {};
+				};
+
+				// Scene objects must be created from the frame-stage callback, not CreateMove.
+				std::unordered_map<std::uintptr_t, pending_entry> m_pending {};
 				std::unordered_map<std::uintptr_t, backtrack::object> m_entries {};
 			};
 
@@ -131,8 +138,11 @@ namespace features::esp {
 			void add_ammo_bar( xdraw::draw_list& draw_list, const systems::bounds::data& bounds, const info& info, const settings::esp::player::overlay::ammo_bar& cfg, draw_offsets& offsets );
 			void add_name( xdraw::draw_list& draw_list, const systems::bounds::data& bounds, const info& info, const settings::esp::player::overlay::name& cfg, draw_offsets& offsets );
 			void add_weapon( xdraw::draw_list& draw_list, const systems::bounds::data& bounds, const info& info, const settings::esp::player::overlay::weapon& cfg, draw_offsets& offsets );
-			void add_flags( xdraw::draw_list& draw_list, const systems::bounds::data& bounds, const info& info, const settings::esp::player::overlay::info_flags& cfg, draw_offsets& offsets );
-			void add_oof_arrow( xdraw::draw_list& draw_list, const info& info, const settings::esp::player::overlay::oof_arrow& cfg );
+	void add_flags( xdraw::draw_list& draw_list, const systems::bounds::data& bounds, const info& info, const settings::esp::player::overlay::info_flags& cfg, draw_offsets& offsets );
+	void add_oof_arrow( xdraw::draw_list& draw_list, const info& info, const settings::esp::player::overlay::oof_arrow& cfg );
+	// Ragebot diagnostics rendered on the enemy body.
+	void add_backtrack_display( xdraw::draw_list& draw_list, std::uintptr_t pawn );
+	void add_extrapolation_display( xdraw::draw_list& draw_list, std::uintptr_t pawn );
 			[[nodiscard]] info get_info( const systems::entities::cached& player, const systems::local::snapshot& local );
 
 			struct animation_data

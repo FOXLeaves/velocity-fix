@@ -10,6 +10,9 @@ namespace random {
 	float normal_clamped( float mean, float stddev, float min, float max );
 
 	float hold_duration( float mean = 0.085f, float stddev = 0.012f );
+	// Human-like inter-click gap (time between releasing one shot and
+	// starting the next), used by the triggerbot constraint mode.
+	float human_gap( float min_gap = 0.10f, float max_gap = 0.22f );
 	float subtick_fraction( );
 
 	namespace engine {

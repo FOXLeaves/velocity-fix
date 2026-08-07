@@ -7,12 +7,25 @@
 #include "../world.hpp"
 
 namespace features::world {
+	namespace {
+		struct particle_transform {
+			float px{};
+			float py{};
+			float pz{};
+			float pw{};
+			float qx{};
+			float qy{};
+			float qz{};
+			float qw{ 1.0f };
+		};
+		static_assert (sizeof (particle_transform) == 0x20);
+	}
 
 	void weather::on_frame_stage_notify( )
 	{
 		if ( !settings::g_world.m_weather.enabled.value )
 		{
-			if ( this->m_effect_index != 0 )
+			if ( this->m_effect_index != invalid_effect_index )
 			{
 				this->release_particles( );
 			}
@@ -90,8 +103,8 @@ namespace features::world {
 
 		memory::call<void>(PATTERN (patterns::resource_system_load), addresses::globals::resource_system, &buffer, "" );
 
-		auto effect_index{ 0u };
-		memory::call<int*>(PATTERN (patterns::particle_create_effect), particle_manager, &effect_index, particle_path.c_str (), 2, 0ll, 0ll, 0ll, 0 );
+		auto effect_index{ invalid_effect_index };
+		memory::call<int*>(PATTERN (patterns::particle_create_effect), particle_manager, &effect_index, particle_path.c_str (), 8, 0ll, 0ll, 0ll, 0 );
 
 		this->m_effect_index = effect_index;
 		this->m_last_particle_type = static_cast< int >( settings::g_world.m_weather.type.value );
@@ -101,16 +114,16 @@ namespace features::world {
 	{
 		const auto current_type = static_cast< int >( settings::g_world.m_weather.type.value );
 
-		if ( this->m_effect_index != 0 && this->m_last_particle_type != current_type )
+		if ( this->m_effect_index != invalid_effect_index && this->m_last_particle_type != current_type )
 		{
 			this->release_particles( );
 		}
 
-		if ( this->m_effect_index == 0 )
+		if ( this->m_effect_index == invalid_effect_index )
 		{
 			this->create_particle( );
 
-			if ( this->m_effect_index == 0 )
+			if ( this->m_effect_index == invalid_effect_index )
 			{
 				return;
 			}
@@ -131,7 +144,47 @@ namespace features::world {
 		}
 
 		const auto origin = memory::read<math::vector3>( game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
-		memory::call<bool>(PATTERN (patterns::particle_set_control_point), particle_manager, this->m_effect_index, 0, &origin, 0 );
+		const auto& weather = settings::g_world.m_weather;
+		if ( weather.type.value == settings::world::weather::weather_type::rain && weather.wind.value )
+		{
+			const auto direction = weather.wind_direction.value * ( std::numbers::pi_v<float> / 180.0f );
+			const auto strength = std::clamp( weather.wind_strength.value / 5.0f, 0.0f, 1.0f );
+			const auto turbulence = std::clamp( weather.wind_turbulence.value / 5.0f, 0.0f, 1.0f );
+			float vx = strength * std::cos( direction );
+			float vy = strength * std::sin( direction );
+
+			if ( turbulence > 0.0f )
+			{
+				const auto time = static_cast<double>( GetTickCount64( ) ) * 0.0006;
+				const auto noise_x = static_cast<float>(
+					0.60 * std::sin( time * 0.90 + 0.3 ) +
+					0.30 * std::sin( time * 2.30 + 1.7 ) +
+					0.15 * std::sin( time * 5.10 + 4.2 ) );
+				const auto noise_y = static_cast<float>(
+					0.60 * std::sin( time * 1.10 + 2.0 ) +
+					0.30 * std::sin( time * 2.70 + 0.5 ) +
+					0.15 * std::sin( time * 4.60 + 3.1 ) );
+				vx += turbulence * 0.9f * noise_x;
+				vy += turbulence * 0.9f * noise_y;
+			}
+
+			const auto magnitude = std::min( std::sqrt( vx * vx + vy * vy ), 1.0f );
+			const auto tilt = magnitude * 80.0f * ( std::numbers::pi_v<float> / 180.0f );
+			const auto heading = vx != 0.0f || vy != 0.0f ? std::atan2( vy, vx ) : 0.0f;
+			const auto sine = std::sin( tilt * 0.5f );
+			const particle_transform transform{
+				origin.x, origin.y, origin.z, 0.0f,
+				std::sin( heading ) * sine,
+				-std::cos( heading ) * sine,
+				0.0f,
+				std::cos( tilt * 0.5f )
+			};
+			memory::call<bool>( PATTERN( patterns::particle_set_transform ), particle_manager, this->m_effect_index, 0, &transform, 0 );
+		}
+		else
+		{
+			memory::call<bool>( PATTERN( patterns::particle_set_control_point ), particle_manager, this->m_effect_index, 0, &origin, 0 );
+		}
 
 		const auto color = math::vector3{ static_cast< float >( settings::g_world.m_weather.color.value.r ), static_cast< float >( settings::g_world.m_weather.color.value.g ), static_cast< float >( settings::g_world.m_weather.color.value.b ) };
 		memory::call<bool>(PATTERN (patterns::particle_set_control_point), particle_manager, this->m_effect_index, 1, &color, 0 );
@@ -139,7 +192,7 @@ namespace features::world {
 
 	void weather::release_particles( )
 	{
-		if ( this->m_effect_index == 0 )
+		if ( this->m_effect_index == invalid_effect_index )
 		{
 			return;
 		}
@@ -148,10 +201,9 @@ namespace features::world {
 		if ( particle_manager )
 		{
 			memory::call<void>(PATTERN (patterns::particle_destroy_effect), particle_manager, this->m_effect_index, true, true );
-			memory::call<void>(PATTERN (patterns::particle_stop_effect), particle_manager, this->m_effect_index );
 		}
 
-		this->m_effect_index = 0;
+		this->m_effect_index = invalid_effect_index;
 		this->m_last_particle_type = -1;
 		this->m_particle_loaded = false;
 	}

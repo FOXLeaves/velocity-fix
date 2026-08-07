@@ -6,6 +6,34 @@
 #include <core/features/features.hpp>
 #include <protection/game_addresses.hpp>
 namespace features::misc {
+	namespace {
+
+		[[nodiscard]] std::string controller_name( std::uintptr_t controller )
+		{
+			if ( !controller )
+			{
+				return {};
+			}
+
+			const auto name_ptr = memory::safe_read<std::uintptr_t>(
+				controller + SCHEMA( "CCSPlayerController", "m_sSanitizedPlayerName"_hash ) ).value_or( 0 );
+			return memory::read_string( name_ptr, 127 );
+		}
+
+		void submit_name_change( const std::string& display_name )
+		{
+			if ( display_name.empty( ) )
+			{
+				return;
+			}
+
+			other::s_display_name = display_name;
+			other::s_name_change_pending = true;
+			memory::call<void>( PATTERN( patterns::engine_client_cmd ), addresses::globals::source2engine_to_client, 0, xs( "setinfo name x" ), 0x7ffef001 );
+			other::s_name_change_pending = false;
+		}
+
+	} // namespace
 
 	void other::on_round_start( )
 	{
@@ -26,9 +54,239 @@ namespace features::misc {
 	void other::on_frame_stage_notify( )
 	{
 		this->do_player_alpha_changing( );
+		this->do_reveal_radar( );
 		this->do_name_changing( );
 		this->do_viewmodel_adjust( );
-		this->do_femboy_praise( );
+		this->do_auto_accept( );
+	}
+
+	void other::do_auto_accept( )
+	{
+		if ( !settings::g_misc.auto_accept.value )
+		{
+			this->m_auto_accept_done = false;
+			this->m_auto_accept_ui_frames = 0;
+			return;
+		}
+
+		// Pointer slot to the matchmaking session object (rip-relative).
+		static const auto session_slot = PATTERN( patterns::auto_accept_session );
+		if ( !session_slot )
+		{
+			return;
+		}
+
+		if ( !this->m_auto_accept_set_ready )
+		{
+			this->m_auto_accept_set_ready = PATTERN( patterns::set_player_ready );
+			if ( !this->m_auto_accept_set_ready )
+			{
+				return;
+			}
+		}
+
+		const auto session = memory::safe_read<std::uintptr_t>( session_slot ).value_or( 0 );
+		if ( !session )
+		{
+			this->m_auto_accept_done = false;
+			this->m_auto_accept_ui_frames = 0;
+			return;
+		}
+
+		// Matchmaking session state. The current pattern matches the engine
+		// gate `cmp dword [session+0xA8], 3` (accept screen), while older
+		// builds used 1 - accept both so a depot change cannot silently
+		// disable the feature.
+		const auto state = memory::safe_read<std::uint32_t>( session + 0xA8 ).value_or( 0 );
+		const auto completed = memory::safe_read<std::uint8_t>( session + 0xA4 ).value_or( 0 );
+
+		// Accepted player count for the accept screen (best-effort: the
+		// session layout has no public layout, these offsets were probed
+		// from the accept dialog state; only shown when they look sane).
+		const auto accepted_now = memory::safe_read<std::int32_t>( session + 0xAC ).value_or( 0 );
+		const auto accepted_total = memory::safe_read<std::int32_t>( session + 0xB0 ).value_or( 0 );
+		const auto count_sane = accepted_total > 0 && accepted_total <= 20 && accepted_now >= 0 && accepted_now <= accepted_total;
+
+		if ( state == 0 )
+		{
+			this->m_auto_accept_done = false;
+			this->m_auto_accept_ui_frames = 0;
+			return;
+		}
+
+		// Throttled retry while the accept screen is up: the first call
+		// can land on a transient frame (UI not settled / session still
+		// transitioning), so keep trying every few frames until the screen
+		// goes away. Repeated "accept" calls on the screen are idempotent.
+		if ( ( state == 1 || state == 3 ) && completed == 1 )
+		{
+			this->m_auto_accept_attempts++;
+
+			const auto first_call = !this->m_auto_accept_done;
+
+			if ( first_call || ( this->m_auto_accept_attempts % 3 == 0 ) )
+			{
+				this->m_auto_accept_done = true;
+				memory::call<char>( this->m_auto_accept_set_ready, nullptr, "accept" );
+
+				if ( first_call && settings::g_misc.m_impacts.console_log.value )
+				{
+					if ( count_sane )
+					{
+						logging::console::print(
+							xs( "[auto-accept] 已自动接受匹配（{} / {} 人已接受）" ),
+							accepted_now,
+							accepted_total
+						);
+					}
+					else
+					{
+						logging::console::print( xs( "[auto-accept] 已自动接受匹配" ) );
+					}
+				}
+
+				if ( this->m_auto_accept_ui_frames == 0 )
+				{
+					this->m_auto_accept_ui_frames = 10;
+				}
+			}
+
+			if ( this->m_auto_accept_ui_frames > 0 )
+			{
+				--this->m_auto_accept_ui_frames;
+				if ( this->m_auto_accept_ui_frames == 0 )
+				{
+					this->dispatch_auto_accept_ui( );
+				}
+			}
+		}
+	}
+
+	bool other::dispatch_auto_accept_ui( ) const
+	{
+		// Same plumbing as scoreboard_weapons: resolve the CUIEngine context
+		// (works from the main menu where no HUD panel exists) and run a tiny
+		// Panorama snippet through vtable[77] to fire the assisted accept.
+		const auto panorama = reinterpret_cast<features::misc::c_panorama_ui_engine*>( addresses::globals::panorama );
+		if ( !panorama )
+		{
+			return false;
+		}
+
+		const auto cui_engine = panorama->get_ui_engine( );
+		if ( !cui_engine )
+		{
+			return false;
+		}
+
+		const auto engine = reinterpret_cast<std::uintptr_t>( cui_engine );
+		const auto max_entries = memory::safe_read<std::int32_t>( engine + 0x220 ).value_or( 0 );
+		const auto table_base = memory::safe_read<std::uintptr_t>( engine + 0x228 ).value_or( 0 );
+		if ( max_entries <= 0 || !table_base )
+		{
+			return false;
+		}
+
+		const auto client_base = addresses::modules::client;
+		const auto client_size = memory::get_module_size( client_base );
+
+		std::uintptr_t context{ 0 };
+		for ( auto i = 0; i < (std::min)( max_entries, 500 ); ++i )
+		{
+			const auto entry = table_base + static_cast< std::uintptr_t >( i ) * 32;
+			const auto marker = memory::safe_read<std::int32_t>( entry ).value_or( i );
+			if ( marker == i )
+			{
+				continue;
+			}
+
+			const auto candidate = memory::safe_read<std::uintptr_t>( entry + 16 ).value_or( 0 );
+			if ( !candidate )
+			{
+				continue;
+			}
+
+			const auto panel = memory::safe_read<std::uintptr_t>( candidate + 8 ).value_or( 0 );
+			if ( !panel )
+			{
+				continue;
+			}
+
+			const auto vtable = memory::safe_read<std::uintptr_t>( panel ).value_or( 0 );
+			if ( vtable >= client_base && vtable < client_base + client_size )
+			{
+				context = candidate;
+				break;
+			}
+		}
+
+		if ( !context )
+		{
+			return false;
+		}
+
+		const auto vtable = memory::safe_read<std::uintptr_t>( engine ).value_or( 0 );
+		if ( !vtable )
+		{
+			return false;
+		}
+
+		const auto run_script = memory::safe_read<std::uintptr_t>( vtable + 77 * sizeof( std::uintptr_t ) ).value_or( 0 );
+		if ( !run_script )
+		{
+			return false;
+		}
+
+		memory::call<std::int64_t>(
+			run_script,
+			engine,
+			context,
+			xs( "$.DispatchEvent('MatchAssistedAccept');" ),
+			xs( "auto_accept" ),
+			static_cast<std::int64_t>( 0 ) );
+
+		return true;
+	}
+
+	void other::do_reveal_radar( ) const
+	{
+		if ( !settings::g_misc.reveal_radar.value )
+		{
+			return;
+		}
+
+		const auto local = systems::g_local.get( );
+		if ( !local.is_valid( ) )
+		{
+			return;
+		}
+
+		const auto spotted_state_offset = SCHEMA( "C_CSPlayerPawn", "m_entitySpottedState"_hash );
+		const auto spotted_offset = SCHEMA( "EntitySpottedState_t", "m_bSpotted"_hash );
+
+		for ( const auto& player : systems::g_entities.get_by_type( systems::entities::type::player ) )
+		{
+			const auto controller = player.ptr;
+			if ( !controller || !memory::read<bool>( controller + SCHEMA( "CCSPlayerController", "m_bPawnIsAlive"_hash ) ) )
+			{
+				continue;
+			}
+
+			const auto pawn_handle = memory::read<std::uint32_t>( controller + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
+			const auto pawn = systems::g_entities.lookup( pawn_handle );
+			if ( !pawn || pawn == local.view_pawn( ) )
+			{
+				continue;
+			}
+
+			const auto team = memory::read<int>( pawn + SCHEMA( "C_BaseEntity", "m_iTeamNum"_hash ) );
+			if ( !local.is_this_other_team( team ) )
+			{
+				continue;
+			}
+
+			memory::write<bool>( pawn + spotted_state_offset + spotted_offset, true );
+		}
 	}
 
 	void other::do_autobuy( ) const
@@ -140,141 +398,93 @@ namespace features::misc {
 		}
 	}
 
-	void other::do_name_changing( ) const
+	void other::do_name_changing( )
 	{
-		if ( !settings::g_misc.m_name_changer.enabled.value )
+		const auto local = systems::g_local.get( );
+		const auto& cfg = settings::g_misc.m_name_changer;
+		const auto enabled = cfg.clantag.value || cfg.override_name.value;
+
+		if ( !enabled )
 		{
+			if ( this->m_name_changer_active && local.controller && !this->m_original_name.empty( ) )
+			{
+				submit_name_change( this->m_original_name );
+			}
+
+			this->m_name_changer_active = false;
+			this->m_name_changer_controller = 0;
+			this->m_original_name.clear( );
+			this->m_last_sent_name.clear( );
+			other::s_display_name.clear( );
 			return;
 		}
 
-		const auto local = systems::g_local.get( );
 		if ( !local.controller )
 		{
 			return;
 		}
 
-		/// @TODO: impl this properly, this is pure dogshit
+		if ( !this->m_name_changer_active )
+		{
+			this->m_original_name = controller_name( local.controller );
+			if ( this->m_original_name.empty( ) )
+			{
+				this->m_original_name = xs( "Player" );
+			}
 
-		//static std::string_view last_base_name{};
-		//static auto reveal_index{ 0ull };
-		//static auto forward{ true };
-		//static auto last_update_time{ 0.0f };
+			this->m_name_changer_active = true;
+			this->m_name_changer_controller = local.controller;
+			this->m_last_sent_name.clear( );
+		}
+		else if ( this->m_name_changer_controller != local.controller )
+		{
+			// Keep the captured real name across map loads, where the controller may be recreated.
+			this->m_name_changer_controller = local.controller;
+			this->m_last_sent_name.clear( );
+		}
 
-		//const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
-		//const auto current_time = memory::read<float>( global_vars + 0x30 );
+		const auto& configured_name = cfg.name.value;
+		const auto& base_name = cfg.override_name.value && !configured_name.empty( )
+			? configured_name
+			: this->m_original_name;
 
-		//if ( current_time < last_update_time )
-		//{
-		//	last_update_time = 0.0f;
-		//	reveal_index = 0;
-		//	forward = true;
-		//}
+		std::string display_name = base_name;
+		if ( cfg.clantag.value )
+		{
+			constexpr std::string_view tag{ "velocity" };
+			constexpr auto ticks_per_step{ 16 }; // 0.25 seconds at CS2's 64-tick interval.
+			constexpr auto phase_count{ static_cast<int>( tag.size( ) * 2 ) };
 
-		//if ( current_time - last_update_time < settings::g_misc.m_name_changer.speed.value )
-		//{
-		//	return;
-		//}
+			const auto global_vars = memory::safe_read<std::uintptr_t>( addresses::globals::global_vars ).value_or( 0 );
+			const auto current_tick = global_vars
+				? memory::safe_read<int>( global_vars + 0x44 ).value_or( 0 )
+				: 0;
+			auto phase = current_tick / ticks_per_step % phase_count;
+			if ( phase < 0 )
+			{
+				phase += phase_count;
+			}
 
-		//const auto& cfg = settings::g_misc.m_name_changer;
-		//const auto& base_name = cfg.text.value;
-		//const auto len = base_name.size( );
+			const auto reveal_index = phase <= static_cast<int>( tag.size( ) )
+				? phase
+				: phase_count - phase;
+			const auto visible_tag = tag.substr( 0, static_cast<std::size_t>( reveal_index ) );
+			if ( !visible_tag.empty( ) )
+			{
+				display_name.reserve( base_name.size( ) + visible_tag.size( ) + 3 );
+				display_name = "[";
+				display_name += visible_tag;
+				display_name += "] ";
+				display_name += base_name;
+			}
+		}
+		if ( display_name == this->m_last_sent_name )
+		{
+			return;
+		}
 
-		//if ( base_name != last_base_name )
-		//{
-		//	reveal_index = 0;
-		//	forward = true;
-		//	last_base_name = base_name;
-		//}
-
-		//const auto mode = cfg.mode.value;
-		//const auto animation = cfg.animation.value;
-
-		//std::string display;
-		//display.reserve( len + 32 );
-
-		//if ( animation == settings::misc::name_changer::animation_type::typewriter )
-		//{
-		//	if ( forward )
-		//	{
-		//		if ( ++reveal_index >= len )
-		//		{
-		//			reveal_index = len;
-		//			forward = false;
-		//		}
-		//	}
-		//	else
-		//	{
-		//		if ( reveal_index == 0 )
-		//		{
-		//			forward = true;
-		//			reveal_index = 1;
-		//		}
-		//		else
-		//		{
-		//			reveal_index--;
-		//		}
-		//	}
-
-		//	reveal_index = std::min( reveal_index, len );
-
-		//	if ( mode == settings::misc::name_changer::mode_type::clantag )
-		//	{
-		//		display = "[";
-		//		display.append( base_name, 0, reveal_index );
-		//		display += "] ";
-
-		//		const auto current_name = memory::read_string( local.controller + SCHEMA( "CBasePlayerController", "m_iszPlayerName"_hash ) );
-		//		if ( const auto pos = current_name.find( "] " ); pos != std::string::npos )
-		//		{
-		//			display.append( current_name, pos + 2 );
-		//		}
-		//		else
-		//		{
-		//			display += current_name;
-		//		}
-		//	}
-		//	else
-		//	{
-		//		display.append( base_name, 0, reveal_index );
-		//	}
-		//}
-		//else
-		//{
-		//	if ( mode == settings::misc::name_changer::mode_type::clantag )
-		//	{
-		//		display = "[" + base_name + "] ";
-
-		//		const auto current_name = memory::read_string( local.controller + SCHEMA( "CBasePlayerController", "m_iszPlayerName"_hash ) );
-		//		if ( const auto pos = current_name.find( "] " ); pos != std::string::npos )
-		//		{
-		//			display.append( current_name, pos + 2 );
-		//		}
-		//		else
-		//		{
-		//			display += current_name;
-		//		}
-		//	}
-		//	else
-		//	{
-		//		display = base_name;
-		//	}
-		//}
-
-		//other::s_display_name = display;
-
-		//static const auto name_cvar = addresses::globals::cvar->find ( "name"_hash );
-		//if ( name_cvar )
-		//{
-		//	const auto flags = memory::read<std::int32_t>( name_cvar + 0x10 );
-		//	if ( !( flags & 0x200 ) )
-		//	{
-		//		memory::write<std::int32_t>( name_cvar + 0x10, flags | 0x200 );
-		//	}
-		//}
-
-		//memory::call<void>(PATTERN (patterns::engine_client_cmd), addresses::globals::source2engine_to_client, 0, xs( "setinfo name x" ), 0x7ffef001 );
-
-		//last_update_time = current_time;
+		submit_name_change( display_name );
+		this->m_last_sent_name = std::move( display_name );
 	}
 
 	void other::do_kill_feed_preservation( )
@@ -291,143 +501,19 @@ namespace features::misc {
 			return;
 		}
 
-		memory::write<float> (hud_element + 0x5C, settings::g_misc.preserve_killfeed ? 1000.0f : 1.5f);
+		memory::write<float> (hud_element + 0x58, settings::g_misc.preserve_killfeed ? 1000.0f : 1.5f);
 
 		float spawntime = memory::read<float> (local.pawn + SCHEMA ("C_CSPlayerPawnBase", "m_flLastSpawnTimeIndex"_hash));
 		if ( m_last_spawntime != spawntime )
 		{
-			memory::call<void>(PATTERN (patterns::hud_death_notice_clear), hud_element - 0x20 );
+			const auto clear_death_notices = PATTERN (patterns::hud_death_notice_clear);
+			if ( clear_death_notices )
+			{
+				memory::call<void>( clear_death_notices, hud_element - 0x20 );
+			}
+
 			m_last_spawntime = spawntime;
 		}
-	}
-
-	void other::do_femboy_praise( ) const
-	{
-		if ( !settings::g_misc.get_praised_by_a_femboy_in_chat )
-		{
-			return;
-		}
-
-		const auto event = features::misc::g_impacts.poll_event( );
-		if ( !event )
-		{
-			return;
-		}
-
-		const auto hud_element = memory::call<std::uintptr_t>(PATTERN (patterns::find_hud_element), xs( "CCSGO_HudVoiceStatus" ) );
-		if ( !hud_element )
-		{
-			return;
-		}
-
-		const auto voice = hud_element - 32;
-
-		static constexpr const char* kill_msgs[ ]
-		{
-			"omg tapped! ur so good <3",
-			"heh nice kill cutie ;3",
-			"they got absolutely destroyed, wish you would destroy me like that..",
-			"aww nice shot, shoot inside me next >:3",
-			"gg ez ur literally so good <33",
-			"ur so hot omg",
-			"IM GONNA CUM UR SO GOOD",
-			"nyaa~ you just ended them so easily, be rough with me too pls <3",
-			"omggg ur so strong when u kill like that.. i need u to pin me rn >///<",
-			"ur kills are so clean, makes me wanna get on my knees for u ;3",
-			"ur making my bussy wet omg.."
-		};
-
-		static constexpr const char* hit_msgs[ ]
-		{
-			"ooo nice hit~ do it again >:3",
-			"hehe they felt that one, just like i feel u <3",
-			"ur aim makes me blush wtf",
-			"eep~ that hit was so good, hit me harder next time?~",
-			"you tagged them so well.. tag me like that too pls <3",
-			"hehe ur shots are making me squirm in my chair :3",
-			"mmm that was crispy, just like u cutie~"
-		};
-
-		static constexpr const char* miss_msgs[ ]
-		{
-			"its ok bb everyone misses sometimes <3",
-			"dw about it ur still amazing~",
-			"the bullets are just shy, like u :3",
-			"its fine love, ur still making my heart race either way <33",
-			"skill issue... jk jk ur doing great <33",
-			"missed shots only make ur next kills hotter, i believe in u!!",
-			"that was the cheat's fault not urs obviously"
-		};
-
-		static std::mt19937 rng {std::random_device{}()};
-		static size_t last_kill = SIZE_MAX;
-		static size_t last_hit = SIZE_MAX;
-		static size_t last_miss = SIZE_MAX;
-
-		auto pick_no_repeat = [&] (const auto& msgs, size_t& last_idx) -> const char* {
-			constexpr size_t n = std::extent_v<std::remove_reference_t<decltype(msgs)>>;
-			std::uniform_int_distribution<size_t> dist (0, n - 1);
-			size_t idx = dist (rng);
-			if (n > 1) {
-				while (idx == last_idx)
-					idx = dist (rng);
-			}
-			last_idx = idx;
-			return msgs [idx];
-		};
-
-		const char* msg{ nullptr };
-
-		switch (event->type) {
-			case impacts::event_type::kill:
-				msg = pick_no_repeat (kill_msgs, last_kill);
-				break;
-			case impacts::event_type::hit:
-				msg = pick_no_repeat (hit_msgs, last_hit);
-				break;
-			case impacts::event_type::miss:
-				msg = pick_no_repeat (miss_msgs, last_miss);
-				break;
-			default:
-				return;
-		}
-
-		static const auto label = [ ]( const char* text ) -> std::string
-			{
-				constexpr float sr = 0xFF, sg = 0xB6, sb = 0xC1;
-				constexpr float er = 0xAD, eg = 0xD8, eb = 0xE6;
-
-				const auto len = std::strlen( text );
-				if ( len == 0 )
-				{
-					return {};
-				}
-
-				std::string result{};
-				result.reserve( len * 40 );
-
-				for ( auto i = 0ull; i < len; ++i )
-				{
-					const auto t = len > 1 ? static_cast< float >( i ) / static_cast< float >( len - 1 ) : 0.0f;
-					const auto r = static_cast< std::uint8_t >( sr + ( er - sr ) * t );
-					const auto g = static_cast< std::uint8_t >( sg + ( eg - sg ) * t );
-					const auto b = static_cast< std::uint8_t >( sb + ( eb - sb ) * t );
-
-					char tag[ 48 ];
-					std::snprintf( tag, sizeof( tag ), "<font color='#%02X%02X%02X'>%c</font>", r, g, b, text[ i ] );
-
-					result += tag;
-				}
-
-				return result;
-			}( "velocity" );
-
-		char buf[ 1024 ];
-		std::snprintf( buf, sizeof( buf ), "%s <font color='#CCCCCC'>- %s</font>", label.c_str( ), msg );
-
-		std::uint8_t flags[ 2 ]{ 1, 0 };
-
-		memory::call<void>(PATTERN (patterns::set_voice_data), voice, buf, 0xFFFFFFFF, flags );
 	}
 
 	void other::do_viewmodel_adjust( )

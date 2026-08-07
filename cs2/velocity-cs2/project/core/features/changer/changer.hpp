@@ -1,4 +1,8 @@
-#pragma once
+﻿#pragma once
+
+#include <filesystem>
+#include <memory>
+#include <unordered_set>
 #include <core/systems/systems.hpp>
 
 namespace features::changer {
@@ -151,12 +155,25 @@ namespace features::changer {
 
 		std::unordered_map<std::string, vpk_file_entry> m_vpk_index{};
 		bool m_vpk_indexed{};
+		std::filesystem::path m_vpk_directory{};
 
 		std::unordered_map<std::string, std::unique_ptr<image_entry>> m_image_cache{};
 		std::mutex m_image_mutex{};
 
 		std::unordered_map<std::uint16_t, std::ifstream> m_archive_handles{};
 		std::mutex m_vpk_mutex{};
+	};
+
+	class custom_models
+	{
+	public:
+		void refresh( );
+
+		[[nodiscard]] const std::vector<std::string>& models( ) const { return this->m_models; }
+		[[nodiscard]] int find( const std::string& path ) const;
+
+	private:
+		std::vector<std::string> m_models{};
 	};
 
 	class agents
@@ -166,8 +183,10 @@ namespace features::changer {
 
 	private:
 		void cycle_weapon_owners( std::uintptr_t pawn );
+		void precache_model( const std::string& path );
 
 		std::string m_original_model{};
+		std::string m_applied_path{};
 		std::uintptr_t m_tracked_pawn{};
 		std::uintptr_t m_applied_handle{};
 		std::int16_t m_applied_def{};
@@ -179,6 +198,40 @@ namespace features::changer {
 	{
 	public:
 		void on_frame_stage_notify( );
+
+	private:
+		struct original_state
+		{
+			std::uint16_t def_index{};
+			std::uint64_t item_id{};
+			std::uint32_t id_high{};
+			std::uint32_t id_low{};
+			std::uint32_t account_id{};
+			bool restore_custom_material{};
+			bool initialized{};
+			bool disallow_soc{};
+			bool captured{};
+		};
+
+		struct attribute_state
+		{
+			float value{};
+			bool present{};
+		};
+
+		[[nodiscard]] bool capture_original( std::uintptr_t item_view );
+		[[nodiscard]] bool read_paint_attributes( std::uintptr_t item_view, std::array<attribute_state, 3>& attributes ) const;
+		[[nodiscard]] bool restore_paint_attributes( std::uintptr_t item_view ) const;
+		[[nodiscard]] bool paint_attributes_match( std::uintptr_t item_view, const settings::changer::applied_skin& skin ) const;
+		void apply( std::uintptr_t pawn, std::uintptr_t item_view, int team, const econ_item_system::item_def& def, const settings::changer::applied_skin& skin, std::uint32_t account_id );
+		void restore( std::uintptr_t pawn, std::uintptr_t item_view, int team );
+		void refresh( std::uintptr_t pawn, std::uintptr_t item_view, int team ) const;
+		void reset( );
+
+		original_state m_original{};
+		std::array<attribute_state, 3> m_original_attributes{};
+		std::uintptr_t m_tracked_pawn{};
+		bool m_overridden{};
 	};
 
 	class guns

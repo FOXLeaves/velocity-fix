@@ -1,6 +1,7 @@
 #include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
+#include <utilities/diag.hpp>
 #include <utilities/logging/logging.hpp>
 #include <protection/game_addresses.hpp>
 #include "../systems.hpp"
@@ -47,6 +48,7 @@ namespace systems {
 		};
 
 		// fix movement for ag2
+		diag::set_exception_phase( "input apply: subtick movement" );
 		if (!has_move_subticks (base)) {
 			if (const auto step = systems::g_input.acquire_subtick_step (base->mutable_subtick_moves ())) {
 
@@ -61,22 +63,63 @@ namespace systems {
 			}
 		}
 
-		base->mutable_buttons_pb( )->set_buttonstate1( this->m_current_cmd->buttons.value );
-		base->mutable_buttons_pb( )->set_buttonstate2( this->m_current_cmd->buttons.value_changed );
-		base->mutable_buttons_pb( )->set_buttonstate3( this->m_current_cmd->buttons.value_scroll );
+		diag::set_exception_phase( "input apply: buttons" );
+		auto buttons = const_cast<proto::in_button_state_pb*>( base->buttons_pb( ) );
+		if ( !buttons )
+		{
+			const auto raw_base =
+				reinterpret_cast<std::uintptr_t>( base ) - proto::message_impl_offset;
+			const auto arena_bits = memory::read<std::uintptr_t>( raw_base + 0x08 );
+			auto arena = arena_bits & ~0x3ull;
+			if ( arena_bits & 1 )
+			{
+				arena = memory::read<std::uintptr_t>( arena );
+			}
 
+			const auto raw_buttons =
+				memory::call<void*>( PATTERN( patterns::button_state_alloc ), arena );
+			if ( raw_buttons )
+			{
+				base->m_buttons_pb =
+					reinterpret_cast<proto::in_button_state_pb*>( raw_buttons );
+				buttons = proto::impl_ptr<proto::in_button_state_pb>( raw_buttons );
+			}
+		}
+
+		if ( buttons )
+		{
+			base->m_has_bits.set( 0x2u );
+			buttons->set_buttonstate1( this->m_current_cmd->buttons.value );
+			buttons->set_buttonstate2( this->m_current_cmd->buttons.value_changed );
+			buttons->set_buttonstate3( this->m_current_cmd->buttons.value_scroll );
+		}
+
+		diag::set_exception_phase( "input apply: crc" );
 		this->calculate_crc( base );
 	}
 
 	input::usercmd* input::get_current_cmd( std::uintptr_t local_controller ) const
 	{
-		const auto usercmd_base = memory::call<std::uintptr_t>(PATTERN (patterns::get_usercmd_base), local_controller );
+		const auto get_usercmd_base = PATTERN (patterns::get_usercmd_base);
+		const auto get_usercmd = PATTERN (patterns::get_usercmd);
+		if ( !get_usercmd_base || !get_usercmd )
+		{
+			return nullptr;
+		}
+
+		const auto usercmd_base = memory::call<std::uintptr_t>( get_usercmd_base, local_controller );
 		if ( !usercmd_base )
 		{
 			return nullptr;
 		}
 
-		return memory::call<usercmd*>(PATTERN (patterns::get_usercmd), local_controller, memory::read<int>( usercmd_base + 0x5910 ) );
+		const auto sequence = memory::safe_read<int>( usercmd_base + 0x5910 );
+		if ( !sequence )
+		{
+			return nullptr;
+		}
+
+		return memory::call<usercmd*>( get_usercmd, local_controller, *sequence );
 	}
 
 	proto::subtick_move_step* input::acquire_subtick_step( proto::repeated_ptr_field<proto::subtick_move_step>* subtick_moves ) const
@@ -86,6 +129,8 @@ namespace systems {
 			return nullptr;
 		}
 
+		proto::subtick_move_step* step{};
+
 		if ( subtick_moves->m_rep )
 		{
 			if ( subtick_moves->m_current_size < subtick_moves->m_rep->allocated_size )
@@ -94,24 +139,141 @@ namespace systems {
 				if ( element )
 				{
 					subtick_moves->m_current_size++;
-					return proto::impl_ptr<proto::subtick_move_step>( element );
+					step = proto::impl_ptr<proto::subtick_move_step>( element );
+
+					// Reuse the pooled slot without zeroing it (matches
+					// the engine's own pool behaviour - zeroing the
+					// cached size/has bits made the server parse the
+					// step differently and the input felt less smooth).
+					// Only the view deltas are cleared explicitly: a
+					// stale pitch/yaw delta on a jump/duck step would
+					// rotate the view mid-tick.
+					step->set_pitch_delta( 0.0f );
+					step->set_yaw_delta( 0.0f );
 				}
 			}
 		}
 
-		const auto move_step = memory::call<void*>(PATTERN (patterns::subtick_move_alloc), subtick_moves->m_arena );
-		if ( move_step )
+		if ( !step )
 		{
-			memory::call<std::uintptr_t>(PATTERN (patterns::utl_vector_push), reinterpret_cast< std::uintptr_t >( subtick_moves ), reinterpret_cast< std::uintptr_t >( move_step ) );
-			return proto::impl_ptr<proto::subtick_move_step>( move_step );
+			const auto move_step = memory::call<void*>(PATTERN (patterns::subtick_move_alloc), subtick_moves->m_arena );
+			if ( move_step )
+			{
+				memory::call<std::uintptr_t>(PATTERN (patterns::utl_vector_push), reinterpret_cast< std::uintptr_t >( subtick_moves ), reinterpret_cast< std::uintptr_t >( move_step ) );
+				step = proto::impl_ptr<proto::subtick_move_step>( move_step );
+				step->set_pitch_delta( 0.0f );
+				step->set_yaw_delta( 0.0f );
+			}
 		}
 
-		return nullptr;
+		if ( step )
+		{
+			// Invalidate the base command's serialization cache: protobuf
+			// uses the cached size to skip recomputation, and a stale
+			// cache would leave the freshly queued step out of the bytes
+			// the server parses - the input then feels rough/janky.
+			const auto base = reinterpret_cast< proto::base_usercmd_pb* >(
+				reinterpret_cast< std::uintptr_t >( subtick_moves ) - offsetof( proto::base_usercmd_pb, m_subtick_moves ) );
+			if ( base )
+			{
+				base->m_cached_size = 0;
+			}
+		}
+
+		return step;
 	}
 
 	math::vector3 input::get_view_angles( ) const
 	{
 		return *memory::call<math::vector3*>(PATTERN (patterns::get_view_angles), addresses::globals::csgo_input, 0 );
+	}
+
+	// CSGOInputHistoryEntryPB::New fingerprint (FVA-verified): prologue
+	// `48 89 5C 24 10 57 48 83` and `mov ecx, 0x78` at +0x14 (120-byte
+	// allocation). The E8-relative pattern can drift onto a different
+	// T::New after a depot update; calling the wrong allocator corrupts
+	// the protobuf Rep and crashes inside client.dll (FVA: REFUSE rather
+	// than risk it). POD-only so __try is legal.
+	[[nodiscard]] static bool history_alloc_fingerprint( std::uintptr_t candidate )
+	{
+		if ( !candidate )
+		{
+			return false;
+		}
+
+		constexpr std::uint8_t prologue[ 8 ] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83 };
+		constexpr std::uint8_t size_imm[ 5 ] = { 0xB9, 0x78, 0x00, 0x00, 0x00 };
+
+		__try
+		{
+			const auto* p = reinterpret_cast<const std::uint8_t*>( candidate );
+			for ( auto i = 0; i < 8; ++i )
+			{
+				if ( p[ i ] != prologue[ i ] )
+				{
+					return false;
+				}
+			}
+
+			for ( auto i = 0; i < 5; ++i )
+			{
+				if ( p[ 0x14 + i ] != size_imm[ i ] )
+				{
+					return false;
+				}
+			}
+
+			return true;
+		}
+		__except ( EXCEPTION_EXECUTE_HANDLER )
+		{
+			return false;
+		}
+	}
+
+	[[nodiscard]] static std::uintptr_t verified_history_alloc( )
+	{
+		static std::atomic<std::uintptr_t> cached{ 1 };
+
+		auto fn = cached.load( std::memory_order_acquire );
+		if ( fn != 1 )
+		{
+			return fn;
+		}
+
+		const auto candidate = PATTERN( patterns::history_field_alloc );
+		const auto verified = history_alloc_fingerprint( candidate ) ? candidate : std::uintptr_t{ 0 };
+		cached.store( verified, std::memory_order_release );
+		return verified;
+	}
+
+	// SEH guards live in their own POD-only functions: MSVC refuses __try
+	// in any function that also holds unwindable C++ locals.
+	[[nodiscard]] static void* call_history_alloc( std::uintptr_t fn, std::uintptr_t arena )
+	{
+		void* raw{ nullptr };
+		__try
+		{
+			raw = memory::call<void*>( fn, arena );
+		}
+		__except ( EXCEPTION_EXECUTE_HANDLER )
+		{
+			return nullptr;
+		}
+		return raw;
+	}
+
+	[[nodiscard]] static bool call_vector_push( std::uintptr_t fn, std::uintptr_t field, std::uintptr_t raw )
+	{
+		__try
+		{
+			memory::call<std::uintptr_t>( fn, field, raw );
+			return true;
+		}
+		__except ( EXCEPTION_EXECUTE_HANDLER )
+		{
+			return false;
+		}
 	}
 
 	proto::input_history_entry* input::push_input_history( usercmd* cmd, const input_history_params& params ) const
@@ -139,13 +301,56 @@ namespace systems {
 
 		if ( !entry )
 		{
-			auto raw = memory::call<void*>(PATTERN (patterns::history_field_alloc), history_field->m_arena );
-			if ( !raw )
+			// The engine arena field can carry a tag bit (FVA:
+			// `and rcx, ~3; test 1; mov rcx, [rcx]`). Handing the raw
+			// tagged value to the engine allocator made it dereference a
+			// bogus address inside client.dll (read of 0x10), crashing on
+			// the vac-bypass tick path. Untag first, then bail out if the
+			// arena still looks unusable - a skipped history entry is far
+			// safer than an engine-side fault.
+			const auto alloc = verified_history_alloc( );
+			if ( !alloc )
 			{
+				logging::console::print_severity( 2, xs( "[push] history entry allocator unresolved (fingerprint mismatch) - entry skipped" ) );
 				return nullptr;
 			}
 
-			memory::call<std::uintptr_t>(PATTERN (patterns::utl_vector_push), reinterpret_cast< std::uintptr_t >( history_field ), reinterpret_cast< std::uintptr_t >( raw ) );
+			const auto arena_raw = reinterpret_cast<std::uintptr_t>( history_field->m_arena );
+			auto arena = arena_raw & ~std::uintptr_t{ 3 };
+			if ( arena_raw & 1 )
+			{
+				const auto indirection = memory::safe_read<std::uintptr_t>( arena );
+				if ( !indirection )
+				{
+					logging::console::print_severity( 2, xs( "[push] arena indirection null (raw={:#x}) - entry skipped" ), arena_raw );
+					return nullptr;
+				}
+
+				arena = *indirection;
+			}
+
+			// A null arena is legal: protobuf's T::New(arena) falls back to
+			// the heap allocator when the arena is null - only tagged
+			// pointers (handled above) dereference garbage.
+			auto raw = call_history_alloc( alloc, arena );
+			if ( !raw )
+			{
+				logging::console::print_severity( 2, xs( "[push] engine allocator call failed - entry skipped" ) );
+				return nullptr;
+			}
+
+			const auto push_fn = PATTERN( patterns::utl_vector_push );
+			if ( !push_fn )
+			{
+				logging::console::print_severity( 2, xs( "[push] utl_vector_push pattern unresolved - entry skipped" ) );
+				return nullptr;
+			}
+
+			if ( !call_vector_push( push_fn, reinterpret_cast< std::uintptr_t >( history_field ), reinterpret_cast< std::uintptr_t >( raw ) ) )
+			{
+				logging::console::print_severity( 2, xs( "[push] vector push call faulted - entry skipped" ) );
+				return nullptr;
+			}
 
 			entry = proto::impl_ptr<proto::input_history_entry>( raw );
 		}
@@ -236,7 +441,13 @@ namespace systems {
 
 	void input::desubtick( usercmd* cmd ) const
 	{
-		cmd->csgo_user_cmd.mutable_base( )->mutable_subtick_moves( )->clear( );
+		if ( const auto base = cmd->csgo_user_cmd.mutable_base( ) )
+		{
+			if ( auto subtick_moves = base->mutable_subtick_moves( ) )
+			{
+				subtick_moves->clear( );
+			}
+		}
 	}
 
 	void input::set_weapon_select( usercmd* cmd, std::uintptr_t csgo_input ) const
@@ -272,7 +483,13 @@ namespace systems {
 
 	input::usercmd* input::get_command_by_sequence( std::uintptr_t local_controller, int sequence ) const
 	{
-		const auto usercmd_base = memory::call<std::uintptr_t>(PATTERN (patterns::get_usercmd_base), local_controller );
+		const auto get_usercmd_base = PATTERN (patterns::get_usercmd_base);
+		if ( !get_usercmd_base )
+		{
+			return nullptr;
+		}
+
+		const auto usercmd_base = memory::call<std::uintptr_t>( get_usercmd_base, local_controller );
 		if ( !usercmd_base )
 		{
 			return nullptr;
@@ -291,6 +508,15 @@ namespace systems {
 	{
 		if ( !base )
 		{
+			return false;
+		}
+
+		const auto string_copy = PATTERN( patterns::string_copy );
+		const auto serialize_move_crc = PATTERN( patterns::serialize_move_crc );
+		if ( !string_copy || !serialize_move_crc )
+		{
+			diag::write( diag::level::error, "input CRC helpers unavailable; capturing a pre-termination diagnostic dump" );
+			diag::capture_snapshot( "input CRC helpers unavailable" );
 			return false;
 		}
 
@@ -353,8 +579,8 @@ namespace systems {
 		}
 
 		std::uint8_t msg[ 0x18 ]{};
-		memory::call<void>(PATTERN (patterns::string_copy), reinterpret_cast< std::uintptr_t >( msg ), reinterpret_cast< std::uintptr_t >( buf ), total );
-		memory::call<void>( PATTERN (patterns::serialize_move_crc), &base->m_move_crc, reinterpret_cast< std::uintptr_t >( msg ), arena );
+		memory::call<void>( string_copy, reinterpret_cast< std::uintptr_t >( msg ), reinterpret_cast< std::uintptr_t >( buf ), total );
+		memory::call<void>( serialize_move_crc, &base->m_move_crc, reinterpret_cast< std::uintptr_t >( msg ), arena );
 
 		return true;
 	}

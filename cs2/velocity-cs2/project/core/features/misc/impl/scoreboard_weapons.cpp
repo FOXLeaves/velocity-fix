@@ -27,13 +27,28 @@ namespace features::misc {
 
 	SWeaponManager = (function () {
 
-		function getScoreboard() {
-			var root = $.GetContextPanel();
-			return root.FindChildTraverse("Scoreboard") || (root.id === "Scoreboard" ? root : null);
+		function isValid(panel) {
+			return panel && panel.IsValid();
 		}
 
-		function getRow(sb, xuid) {
-			return sb.FindChildTraverse("player-" + xuid) || sb.FindChildTraverse("id-" + xuid);
+		function getScoreboard() {
+			var root = $.GetContextPanel();
+			if (!isValid(root)) return null;
+			var scoreboard = root.id === "Scoreboard" ? root : root.FindChildTraverse("Scoreboard");
+			return isValid(scoreboard) ? scoreboard : null;
+		}
+
+		function getRow(sb, xuid, account_id) {
+			var keys = [xuid, account_id];
+			var prefixes = ["player-", "id-", "id-player-", "player_"];
+			for (var i = 0; i < keys.length; ++i) {
+				if (!keys[i]) continue;
+				for (var j = 0; j < prefixes.length; ++j) {
+					var row = sb.FindChildTraverse(prefixes[j] + keys[i]);
+					if (isValid(row)) return row;
+				}
+			}
+			return null;
 		}
 
 		function getSize(w) {
@@ -56,20 +71,19 @@ namespace features::misc {
 			if (t === 7)  return "16px";
 			if (t === 8)  return "22px";
 			if (t === 11) return p.indexOf("healthshot") !== -1 ? "18px" : "14px";
-			if (t === 0)  return "0px";
+			if (t === 0)  return "46px";
 			return "16px";
 		}
 
-		function createWeaponIcon(parent, w, active_path) {
+		function updateWeaponIcon(parent, w, active_path) {
 			var id   = "wep_" + w.path.replace(/[^a-zA-Z0-9]/g, "_");
-			var slot = $.CreatePanel("Panel", parent, id);
-			slot.style.height      = "fit-children";
-			slot.style.width       = "fit-children";
-			slot.style.verticalAlign = "center";
-			slot.style.margin      = "0px 1px";
+			var img  = parent.FindChildTraverse(id);
+			if (!isValid(img)) {
+				img = $.CreatePanel("Image", parent, id);
+			}
 
-			var img        = $.CreatePanel("Image", slot, "img");
 			img.style.verticalAlign = "center";
+			img.style.margin        = "0px 1px";
 			img.scaling    = "stretch-aspect-preserve";
 
 			var finalPath = w.path;
@@ -85,86 +99,80 @@ namespace features::misc {
 			var sz           = getSize(w);
 			img.style.height = "16px";
 			img.style.width  = sz;
-			slot.style.width = sz;
-			slot.style.opacity = (w.path === active_path) ? "1.0" : "0.35";
+			img.style.opacity = (w.path === active_path) ? "1.0" : "0.35";
+			img.style.visibility = "visible";
+		}
+
+		function updateNow(xuid, account_id, weapons, active_path) {
+			var sb = getScoreboard();
+			if (!sb) return;
+
+			var row = getRow(sb, xuid, account_id);
+			if (!row) return;
+
+			var nameIcons = row.FindChildTraverse("id-sb-name__nameicons");
+			if (!isValid(nameIcons)) return;
+
+			var containerId = "custom-weapons-container-" + xuid;
+			var container   = nameIcons.FindChildTraverse(containerId);
+
+			if (!weapons || weapons.length === 0) {
+				if (isValid(container)) container.style.visibility = "collapse";
+				return;
+			}
+
+			if (!isValid(container)) {
+				container = $.CreatePanel("Panel", nameIcons, containerId);
+				container.AddClass("custom-weapons-container");
+				container.style.flowChildren     = "right";
+				container.style.height           = "20px";
+				container.style.width            = "fit-children";
+				container.style.padding          = "1px 4px";
+				container.style.verticalAlign    = "center";
+				container.style.marginLeft       = "3px";
+				container.style.backgroundColor  = "rgba(0,0,0,0.35)";
+				container.style.borderRadius     = "3px";
+				container.style.border           = "1px solid rgba(255,255,255,0.18)";
+			}
+
+			// Scoreboard rows cache their paint commands. Keep panel identities stable:
+			// deleting children while Panorama is updating that cache can leave native
+			// panel references dangling until the next paint pass.
+			var children = container.Children();
+			for (var i = 0; i < children.length; ++i) {
+				if (isValid(children[i])) children[i].style.visibility = "collapse";
+			}
+
+			var primary = [], pistols = [], equip = [];
+			weapons.forEach(function (w) {
+				if (w.type === 2 || w.type === 3 || w.type === 4 || w.type === 5 || w.type === 6)
+					primary.push(w);
+				else if (w.type === 1)
+					pistols.push(w);
+				else
+					equip.push(w);
+			});
+
+			primary.concat(pistols).concat(equip).forEach(function (w) {
+				updateWeaponIcon(container, w, active_path);
+			});
+			container.style.visibility = "visible";
 		}
 
 		return {
-
-			update: function (xuid, weapons, active_path) {
-				var sb = getScoreboard();
-				if (!sb) return;
-
-				var row = getRow(sb, xuid);
-				if (!row) return;
-
-				var nameIcons = row.FindChildTraverse("id-sb-name__nameicons");
-				if (!nameIcons) return;
-
-				var containerId = "custom-weapons-container-" + xuid;
-				var container   = nameIcons.FindChildTraverse(containerId);
-
-				if (!weapons || weapons.length === 0) {
-					if (container) container.style.visibility = "collapse";
-					return;
-				}
-
-				if (!container) {
-					container = $.CreatePanel("Panel", nameIcons, containerId);
-					container.AddClass("custom-weapons-container");
-					container.style.flowChildren  = "none";
-					container.style.height        = "20px";
-					container.style.width         = "fit-children";
-					container.style.verticalAlign = "center";
-					container.style.marginLeft    = "3px";
-				}
-
-				container.style.visibility = "visible";
-				container.RemoveAndDeleteChildren();
-
-				var bg = $.CreatePanel("Panel", container, "box-bg-" + xuid);
-				bg.style.width           = "100%";
-				bg.style.height          = "100%";
-				bg.style.backgroundColor = "rgba(0,0,0,0.35)";
-				bg.style.borderRadius    = "3px";
-
-				var border = $.CreatePanel("Panel", container, "box-border-" + xuid);
-				border.style.width           = "100%";
-				border.style.height          = "100%";
-				border.style.backgroundColor = "rgba(0,0,0,0)";
-				border.style.borderRadius    = "3px";
-				border.style.border          = "1px solid rgba(255,255,255,0.18)";
-
-				var content = $.CreatePanel("Panel", container, "box-content-" + xuid);
-				content.style.flowChildren     = "right";
-				content.style.height           = "100%";
-				content.style.width            = "fit-children";
-				content.style.padding          = "0px 4px";
-				content.style.verticalAlign    = "center";
-				content.style.horizontalAlign  = "center";
-
-				var primary = [], pistols = [], equip = [];
-
-				weapons.forEach(function (w) {
-					if (w.type === 0) return;
-					if (w.type === 2 || w.type === 3 || w.type === 4 || w.type === 5 || w.type === 6)
-						primary.push(w);
-					else if (w.type === 1)
-						pistols.push(w);
-					else
-						equip.push(w);
-				});
-
-				primary.concat(pistols).concat(equip).forEach(function (w) {
-					createWeaponIcon(content, w, active_path);
-				});
+			update: function (xuid, account_id, weapons, active_path) {
+				// RunScript already enters this panel's V8 context. Scheduling each
+				// update additionally churns CUIEngine's native async-event queue.
+				updateNow(xuid, account_id, weapons, active_path);
 			},
 
 			clear: function () {
 				var sb = getScoreboard();
 				if (!sb) return;
 				var containers = sb.FindChildrenWithClassTraverse("custom-weapons-container");
-				for (var i = 0; i < containers.length; i++) containers[i].DeleteAsync(0);
+				for (var i = 0; i < containers.length; ++i) {
+					if (isValid(containers[i])) containers[i].style.visibility = "collapse";
+				}
 			}
 		};
 
@@ -172,23 +180,24 @@ namespace features::misc {
 
 	SClient.register_handler("updateWeapons", function (msg) {
 		if (msg && msg.content)
-			SWeaponManager.update(msg.content.xuid, msg.content.weapons, msg.content.active_path);
+			SWeaponManager.update(msg.content.xuid, msg.content.account_id, msg.content.weapons, msg.content.active_path);
 	});
 
 	SClient.register_handler("clearWeapons", function (msg) {
 		if (msg && msg.content)
-			SWeaponManager.update(msg.content.xuid, [], "");
+			SWeaponManager.update(msg.content.xuid, msg.content.account_id, [], "");
 	});
 
 })();
 )PANORAMA";
 
 	void c_ui_engine::run_script (c_ui_panel* panel, const char* script) {
+		static constexpr char origin_file[] = "";
 		memory::call_vfunc<void> (
 			reinterpret_cast<std::uintptr_t>(this), 77,
 			panel, script,
-			static_cast<const char*>(nullptr),
-			static_cast<std::uint64_t>(0));
+			origin_file,
+			static_cast<std::uint64_t>(1));
 	}
 
 	c_ui_engine* c_panorama_ui_engine::get_ui_engine () {
@@ -196,13 +205,31 @@ namespace features::misc {
 			reinterpret_cast<std::uintptr_t>(this), 13);
 	}
 
+	c_ui_panel* scoreboard_weapons::find_hud_panel () const {
+		if (!addresses::globals::hud)
+			return nullptr;
+
+		const auto hud = memory::safe_read<std::uintptr_t>(addresses::globals::hud).value_or(0);
+		if (!hud)
+			return nullptr;
+
+		const auto panel = memory::safe_read<c_ui_panel*>(hud + 0x8).value_or(nullptr);
+		if (!panel)
+			return nullptr;
+
+		const auto vtable = memory::safe_read<std::uintptr_t>(
+			reinterpret_cast<std::uintptr_t>(panel));
+		return vtable && *vtable ? panel : nullptr;
+	}
+
 	void scoreboard_weapons::on_level_change () {
 		m_script_injected = false;
 		m_cache.clear ();
+		m_scoreboard_open = false;
 		m_throttle = 0;
 		m_init_throttle = 0;
 		m_ui_engine = nullptr;
-		m_scoreboard_panel = nullptr;
+		m_script_panel = nullptr;
 
 		logging::console::print (xs ("[scoreboard_weapons] level change — state reset\n"));
 	}
@@ -213,6 +240,8 @@ namespace features::misc {
 				clear_all ();
 				m_script_injected = false;
 			}
+			m_scoreboard_open = false;
+			m_cache.clear();
 			return;
 		}
 
@@ -220,9 +249,40 @@ namespace features::misc {
 		if (!local.is_valid ())
 			return;
 
+		// Death / spectating guard: once the local pawn is dead the
+		// scoreboard panel tree is torn down/rebuilt and our cached panel
+		// pointer can dangle. Stop updating (and clear) until a fresh spawn.
+		if (local.pawn) {
+			const auto health = memory::safe_read<int> (
+				local.pawn + SCHEMA ("C_BaseEntity", "m_iHealth"_hash)).value_or(0);
+			if (health <= 0) {
+				if (m_scoreboard_open) {
+					clear_all ();
+					m_scoreboard_open = false;
+					m_cache.clear ();
+				}
+				return;
+			}
+		}
+
+		const auto scoreboard_open = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
+		if (!scoreboard_open) {
+			if (m_scoreboard_open && m_script_injected)
+				clear_all();
+			m_scoreboard_open = false;
+			return;
+		}
+
+		if (!m_scoreboard_open) {
+			m_scoreboard_open = true;
+			m_cache.clear();
+			m_throttle = 0;
+			try_initialize();
+		}
+
 		if (!m_script_injected) {
 			++m_init_throttle;
-			if (m_init_throttle % 120 == 0)
+			if (m_init_throttle % 30 == 0)
 				try_initialize ();
 
 			if (!m_script_injected)
@@ -230,15 +290,22 @@ namespace features::misc {
 		}
 
 		++m_throttle;
-		if (m_throttle % 5 != 0)
+		if (m_throttle % 8 != 0)
 			return;
+		if (m_throttle % 64 == 0)
+			m_cache.clear();
 
 		const auto players = systems::g_entities.get_by_type (systems::entities::type::player);
+		const auto items = systems::g_entities.get_by_type (systems::entities::type::item);
+		if (m_throttle == 8) {
+			logging::console::print (xs ("[scoreboard_weapons] scoreboard opened; players={} weapon_entities={}\n"),
+				players.size(), items.size());
+		}
 		for (const auto& player : players) {
-			if (!player.ptr || player.ptr == local.controller)
+			if (!player.ptr)
 				continue;
 
-			send_player_weapons (player.ptr);
+			send_player_weapons (player.ptr, items);
 		}
 	}
 
@@ -258,144 +325,149 @@ namespace features::misc {
 			return;
 		}
 
-		c_ui_panel* scoreboard = nullptr;
-
-		for (int i = 0; i < ui_engine->m_panel_count; i++) {
-			panel_data_t* panel_data = &ui_engine->m_panels_array [i];
-			if (!panel_data || !panel_data->m_panel)
-				continue;
-
-			c_ui_panel* panel = panel_data->m_panel;
-			if (!panel || !panel->m_panel_name)
-				continue;
-			const std::string name {panel->m_panel_name};
-
-			logging::console::print (xs ("[scoreboard_weapons] panel[{}] = '{}' ({:p})\n"),
-				i, name, static_cast<const void*> (panel));
-			if (fnv1a::runtime_hash (panel->m_panel_name) == fnv1a::runtime_hash ("Scoreboard")) {
-				scoreboard = panel;
-				break;
-			}
-		}
-
-
-		if (!scoreboard) {
-			logging::console::print (xs ("[scoreboard_weapons] Scoreboard panel not found (count=%d)\n"), ui_engine->m_panel_count);
+		const auto script_panel = find_hud_panel();
+		if (!script_panel) {
+			logging::console::print (xs ("[scoreboard_weapons] HUD script panel not ready\n"));
 			return;
 		}
 
 		m_ui_engine = ui_engine;
-		m_scoreboard_panel = scoreboard;
+		m_script_panel = script_panel;
 
-		logging::console::print (xs ("[scoreboard_weapons] injecting setup script (engine=%p panel=%p)\n"),
+		logging::console::print (xs ("[scoreboard_weapons] injecting HUD setup script (engine={:p} panel={:p})\n"),
 			static_cast<void*>(m_ui_engine),
-			static_cast<void*>(m_scoreboard_panel));
+			static_cast<void*>(m_script_panel));
 
-		run_script (k_setup_script);
-
-		m_script_injected = true;
-		logging::console::print (xs ("[scoreboard_weapons] setup script injected\n"));
+		if (run_script(k_setup_script)) {
+			m_script_injected = true;
+			logging::console::print (xs ("[scoreboard_weapons] setup script injected\n"));
+		}
 	}
 
-	void scoreboard_weapons::run_script (const std::string& script) {
-		if (!m_ui_engine || !m_scoreboard_panel)
-			return;
+	bool scoreboard_weapons::run_script (const std::string& script) {
+		if (!m_ui_engine || !m_script_panel)
+			return false;
 
-		m_ui_engine->run_script (m_scoreboard_panel, script.c_str ());
+		auto* panorama = reinterpret_cast<c_panorama_ui_engine*>(addresses::globals::panorama);
+		if (!panorama || panorama->get_ui_engine() != m_ui_engine ||
+			find_hud_panel() != m_script_panel) {
+			m_script_injected = false;
+			m_ui_engine = nullptr;
+			m_script_panel = nullptr;
+			m_cache.clear();
+			return false;
+		}
+
+		const auto engine = reinterpret_cast<std::uintptr_t>(m_ui_engine);
+		const auto vtable = memory::safe_read<std::uintptr_t>(engine);
+		const auto function = vtable ? memory::safe_read<std::uintptr_t>(
+			*vtable + 77 * sizeof(std::uintptr_t)) : std::nullopt;
+		const auto panorama_begin = addresses::modules::panorama;
+		const auto panorama_end = panorama_begin + memory::get_module_size(panorama_begin);
+		if (!function || *function < panorama_begin || *function >= panorama_end)
+			return false;
+
+		m_ui_engine->run_script (m_script_panel, script.c_str ());
+		return true;
 	}
 
-	void scoreboard_weapons::send_player_weapons (std::uintptr_t controller) {
+	void scoreboard_weapons::send_player_weapons (
+		std::uintptr_t controller,
+		std::span<const systems::entities::cached> items) {
 		if (!controller)
 			return;
 
-		const auto steamid = memory::read<std::uint64_t> (
-			controller + SCHEMA ("CCSPlayerController", "m_steamID"_hash));
-		if (!steamid)
+		constexpr std::uint64_t steam_id_base = 76561197960265728ull;
+		const auto steamid = memory::safe_read<std::uint64_t> (
+			controller + SCHEMA ("CBasePlayerController", "m_steamID"_hash)).value_or(0);
+		if (steamid < steam_id_base)
 			return;
 
-		const auto pawn_handle = memory::read<std::uint32_t> (
-			controller + SCHEMA ("CCSPlayerController", "m_hPlayerPawn"_hash));
+		const auto pawn_handle = memory::safe_read<std::uint32_t> (
+			controller + SCHEMA ("CBasePlayerController", "m_hPawn"_hash)).value_or(0);
 		if (!pawn_handle)
 			return;
 
 		const auto pawn = systems::g_entities.lookup (pawn_handle);
 
 		player_weapon_state state {};
+		const auto read_weapon = [] (std::uintptr_t weapon) -> std::optional<weapon_entry> {
+			if (!weapon)
+				return std::nullopt;
+
+			const auto vdata = memory::safe_read<std::uintptr_t> (
+				weapon + SCHEMA ("C_BaseEntity", "m_nSubclassID"_hash) + 0x8).value_or(0);
+			if (!vdata)
+				return std::nullopt;
+
+			const auto name_ptr = memory::safe_read<const char*> (
+				vdata + SCHEMA ("CCSWeaponBaseVData", "m_szName"_hash)).value_or(nullptr);
+			if (!name_ptr)
+				return std::nullopt;
+
+			std::string name {};
+			name.reserve(32);
+			for (std::size_t i = 0; i < 64; ++i) {
+				const auto character = memory::safe_read<char> (
+					reinterpret_cast<std::uintptr_t>(name_ptr) + i);
+				if (!character)
+					return std::nullopt;
+				if (*character == '\0')
+					break;
+				name.push_back(*character);
+			}
+
+			if (!name.starts_with(xs ("weapon_")))
+				return std::nullopt;
+			name.erase(0, 7);
+
+			const auto type = memory::safe_read<std::uint32_t> (
+				vdata + SCHEMA ("CCSWeaponBaseVData", "m_WeaponType"_hash));
+			if (!type)
+				return std::nullopt;
+
+			return weapon_entry {std::move(name), static_cast<int>(*type)};
+		};
 
 		if (pawn) {
-			const auto health = memory::read<int> (
-				pawn + SCHEMA ("C_BaseEntity", "m_iHealth"_hash));
+			const auto health = memory::safe_read<int> (
+				pawn + SCHEMA ("C_BaseEntity", "m_iHealth"_hash)).value_or(0);
 
 			if (health > 0) {
-				const auto weapon_services = memory::read<std::uintptr_t> (
-					pawn + SCHEMA ("C_BasePlayerPawn", "m_pWeaponServices"_hash));
+				const auto weapon_services = memory::safe_read<std::uintptr_t> (
+					pawn + SCHEMA ("C_BasePlayerPawn", "m_pWeaponServices"_hash)).value_or(0);
 
 				if (weapon_services) {
-					// active weapon name
-					const auto active_handle = memory::read<std::uint32_t> (
-						weapon_services + SCHEMA ("CPlayer_WeaponServices", "m_hActiveWeapon"_hash));
+					const auto active_handle = memory::safe_read<std::uint32_t> (
+						weapon_services + SCHEMA ("CPlayer_WeaponServices", "m_hActiveWeapon"_hash)).value_or(0);
 					const auto active_weapon = active_handle
 						? systems::g_entities.lookup (active_handle) : 0;
 
-					if (active_weapon) {
-						const auto vdata = memory::read<std::uintptr_t> (
-							active_weapon + SCHEMA ("C_BaseEntity", "m_nSubclassID"_hash) + 0x8);
-						if (vdata) {
-							const auto name_ptr = memory::read<const char*> (
-								vdata + SCHEMA ("CCSWeaponBaseVData", "m_szName"_hash));
-							if (name_ptr) {
-								auto name = memory::read_string (
-									reinterpret_cast<std::uintptr_t>(name_ptr), 64);
-								if (name.starts_with (xs ("weapon_")))
-									name.erase (0, 7);
-								state.active_name = std::move (name);
-							}
-						}
-					}
+					if (const auto active = read_weapon(active_weapon))
+						state.active_name = active->name;
+				}
 
-					// weapon list
-					const auto my_weapons_base = weapon_services + SCHEMA ("CPlayer_WeaponServices", "m_hMyWeapons"_hash);
-					const auto weapon_count = memory::read<int> (my_weapons_base);
-					const auto weapon_array_ptr = memory::read<std::uintptr_t> (my_weapons_base + 0x8);
+				// Enemy inventory handles are not reliably populated in m_hMyWeapons.
+				// Weapon entities and their networked owner handles are, so mirror the
+				// working scoreboard implementation and collect by owner instead.
+				for (const auto& item : items) {
+					if (!item.ptr)
+						continue;
 
-					if (weapon_array_ptr && weapon_count > 0) {
-						for (int j = 0; j < weapon_count && j < 16; ++j) {
-							const auto wep_handle = memory::read<std::uint32_t> (
-								weapon_array_ptr + j * sizeof (std::uint32_t));
-							if (!wep_handle)
-								continue;
+					const auto owner_handle = memory::safe_read<std::uint32_t> (
+						item.ptr + SCHEMA ("C_BaseEntity", "m_hOwnerEntity"_hash)).value_or(0);
+					if (!owner_handle || systems::g_entities.lookup(owner_handle) != pawn)
+						continue;
 
-							const auto weapon = systems::g_entities.lookup (wep_handle);
-							if (!weapon)
-								continue;
-
-							const auto vdata = memory::read<std::uintptr_t> (
-								weapon + SCHEMA ("C_BaseEntity", "m_nSubclassID"_hash) + 0x8);
-							if (!vdata)
-								continue;
-
-							const auto wep_name_ptr = memory::read<const char*> (
-								vdata + SCHEMA ("CCSWeaponBaseVData", "m_szName"_hash));
-							if (!wep_name_ptr)
-								continue;
-
-							auto wep_name = memory::read_string (
-								reinterpret_cast<std::uintptr_t>(wep_name_ptr), 64);
-							if (!wep_name.starts_with (xs ("weapon_")))
-								continue;
-							wep_name.erase (0, 7);
-
-							const auto wep_type = memory::read<std::uint32_t> (
-								vdata + SCHEMA ("CCSWeaponBaseVData", "m_WeaponType"_hash));
-
-							if (wep_type == 0)
-								continue;
-
-							state.weapons.push_back ({std::move (wep_name), static_cast<int>(wep_type)});
-						}
-					}
+					if (auto weapon = read_weapon(item.ptr))
+						state.weapons.emplace_back(std::move(*weapon));
 				}
 			}
+		}
+
+		if (m_throttle == 8) {
+			logging::console::print (xs ("[scoreboard_weapons] xuid={} collected_weapons={}\n"),
+				steamid, state.weapons.size());
 		}
 
 		// skip if nothing changed
@@ -403,10 +475,9 @@ namespace features::misc {
 		if (it != m_cache.end () && it->second == state)
 			return;
 
-		m_cache [steamid] = state;
-
 		if (state.weapons.empty ()) {
-			send_clear (steamid);
+			if (send_clear(steamid))
+				m_cache[steamid] = state;
 			return;
 		}
 
@@ -429,32 +500,36 @@ namespace features::misc {
 		}
 		weapons_json += "]";
 
+		const auto account_id = steamid - steam_id_base;
 		const auto script = std::format (
-			R"(if(typeof(SClient)!=='undefined'){{SClient.receive({{type:"updateWeapons",content:{{xuid:"{}",weapons:{},active_path:"{}"}}}});}})",
+			R"(if(typeof(SClient)!=='undefined'){{SClient.receive({{type:"updateWeapons",content:{{xuid:"{}",account_id:"{}",weapons:{},active_path:"{}"}}}});}})",
 			steamid,
+			account_id,
 			weapons_json,
 			state.active_name
 		);
 
-		run_script (script);
+		if (run_script(script))
+			m_cache[steamid] = std::move(state);
 	}
 
-	void scoreboard_weapons::send_clear (std::uint64_t steamid) {
+	bool scoreboard_weapons::send_clear (std::uint64_t steamid) {
+		constexpr std::uint64_t steam_id_base = 76561197960265728ull;
+		const auto account_id = steamid >= steam_id_base ? steamid - steam_id_base : steamid;
 		const auto script = std::format (
-			R"(if(typeof(SClient)!=='undefined'){{SClient.receive({{type:"clearWeapons",content:{{xuid:"{}"}}}});}})",
-			steamid
+			R"(if(typeof(SClient)!=='undefined'){{SClient.receive({{type:"clearWeapons",content:{{xuid:"{}",account_id:"{}"}}}});}})",
+			steamid,
+			account_id
 		);
 
-		run_script (script);
+		return run_script(script);
 	}
 
 	void scoreboard_weapons::clear_all () {
 		if (!m_script_injected)
 			return;
 
-		for (const auto& [steamid, _] : m_cache)
-			send_clear (steamid);
-
+		(void)run_script(R"(if(typeof(SWeaponManager)!=='undefined'){SWeaponManager.clear();})");
 		m_cache.clear ();
 	}
 

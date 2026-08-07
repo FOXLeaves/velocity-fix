@@ -1,4 +1,5 @@
 #include <pch/pch.hpp>
+#include <utilities/game_path.hpp>
 #include "../systems.hpp"
 
 namespace systems {
@@ -67,22 +68,8 @@ namespace systems {
 			this->m_hash_to_name[ hash ] = name;
 		}
 
-		static const char* search_paths[ ]
-		{
-			"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Counter-Strike Global Offensive\\game\\csgo\\pak01_dir.vpk",
-			"H:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\game\\csgo\\pak01_dir.vpk",
-			"E:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\game\\csgo\\pak01_dir.vpk"
-		};
-
-		for ( const auto& path : search_paths )
-		{
-			if ( this->load_vpk_directory( path ) )
-			{
-				return true;
-			}
-		}
-
-		return false;
+		const auto csgo_directory = game_path::csgo_directory( );
+		return csgo_directory && this->load_vpk_directory( *csgo_directory / L"pak01_dir.vpk" );
 	}
 
 	void icons::shutdown( )
@@ -133,7 +120,7 @@ namespace systems {
 		return this->get( name_it->second, scale );
 	}
 
-	bool icons::load_vpk_directory( const std::string& path )
+	bool icons::load_vpk_directory( const std::filesystem::path& path )
 	{
 		std::ifstream file( path, std::ios::binary );
 		if ( !file.is_open( ) )
@@ -178,7 +165,7 @@ namespace systems {
 		}
 
 		const auto tree_end = static_cast< std::streamoff >( sizeof( vpk_header ) ) + static_cast< std::streamoff >( header.tree_size );
-		const auto base_dir = path.substr( 0, path.find_last_of( "/\\" ) + 1 );
+		const auto base_dir = path.parent_path( );
 
 		std::unordered_set<std::string> targets;
 		for ( const auto& [hash, name] : this->m_hash_to_name )
@@ -238,10 +225,10 @@ namespace systems {
 						continue;
 					}
 
-					char archive_name[ 256 ];
-					std::snprintf( archive_name, sizeof( archive_name ), "%spak01_%03d.vpk", base_dir.c_str( ), entry.archive_index );
+					char archive_name[ 32 ];
+					std::snprintf( archive_name, sizeof( archive_name ), "pak01_%03d.vpk", entry.archive_index );
 
-					this->cache_svg_bytes( archive_name, filename, entry.entry_offset, entry.entry_length );
+					this->cache_svg_bytes( base_dir / archive_name, filename, entry.entry_offset, entry.entry_length );
 				}
 			}
 		}
@@ -249,7 +236,7 @@ namespace systems {
 		return !this->m_pending_svgs.empty( );
 	}
 
-	bool icons::cache_svg_bytes( const std::string& vpk_path, const std::string& icon_name, std::uint32_t entry_offset, std::uint32_t entry_length )
+	bool icons::cache_svg_bytes( const std::filesystem::path& vpk_path, const std::string& icon_name, std::uint32_t entry_offset, std::uint32_t entry_length )
 	{
 		std::ifstream archive( vpk_path, std::ios::binary );
 		if ( !archive.is_open( ) )

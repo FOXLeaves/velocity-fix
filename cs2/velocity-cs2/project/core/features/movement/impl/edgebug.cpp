@@ -4,6 +4,7 @@
 #include <core/settings.hpp>
 
 #include "../movement.hpp"
+#include "utils.hpp"
 #include <protection/game_addresses.hpp>
 
 namespace features::movement {
@@ -73,12 +74,10 @@ namespace features::movement {
 			return;
 		}
 
-		const auto move_type = memory::read<std::uint8_t>( local.pawn + SCHEMA( "C_BaseEntity", "m_nActualMoveType"_hash ) );
-		if ( move_type == cstypes::move_type::ladder || move_type == cstypes::move_type::noclip )
+		if ( utils::is_restricted_move_type( local.pawn ) )
 		{
 			return;
 		}
-
 		const auto& prestate = systems::g_prediction.pre( );
 		if ( prestate.flags & cstypes::entity_flags::on_ground )
 		{
@@ -106,38 +105,26 @@ namespace features::movement {
 
 		const auto duck_amount = memory::read<float>( movement_services + SCHEMA( "CCSPlayer_MovementServices", "m_flDuckAmount"_hash ) );
 		const auto holding_duck = ( cmd->buttons.value & cstypes::command_buttons::in_duck ) != 0;
-		const auto mins = memory::read<math::vector3>( local.pawn + SCHEMA( "C_BaseModelEntity", "m_Collision"_hash ) + SCHEMA( "CCollisionProperty", "m_vecMins"_hash ) );
-		auto maxs = memory::read<math::vector3>( local.pawn + SCHEMA( "C_BaseModelEntity", "m_Collision"_hash ) + SCHEMA( "CCollisionProperty", "m_vecMaxs"_hash ) );
+		auto hull = utils::player_hull( local.pawn );
 
 		auto trace_origin = prestate.networked_origin;
 		{
 			if ( holding_duck && duck_amount > 0.0f )
 			{
 				const auto standing_height{ 72.0f };
-				const auto duck_hull_diff = standing_height - maxs.z;
+				const auto duck_hull_diff = standing_height - hull.maxs.z;
 				trace_origin.z -= duck_hull_diff * 0.5f;
-				maxs.z = standing_height;
+				hull.maxs.z = standing_height;
 			}
 		}
 
-		auto trace_mask{ 0ull };
-		{
-			const auto pawn_ptr = memory::read<std::uintptr_t>( movement_services + 56 );
-			trace_mask = memory::read<std::uintptr_t>( pawn_ptr + 0xd48 );
-
-			if ( !pawn_ptr || ( memory::read<std::uint32_t>( pawn_ptr + 0x3f8 ) & 0x10 ) )
-			{
-				trace_mask |= 0x20;
-			}
-		}
-
-		const auto filter = systems::g_tracing.make_player_movement_filter( local.pawn, trace_mask, 11 );
+		const auto filter = utils::movement_filter( local.pawn, movement_services );
 		const auto sv_gravity = CONVAR ("sv_gravity")->get<float>( );
 		const auto sv_standable_normal = CONVAR ("sv_standable_normal")->get<float>( );
 		const auto gravity_scale = memory::read<float>( local.pawn + SCHEMA( "C_BaseEntity", "m_flGravityScale"_hash ) );
 
 		auto velocity = prestate.networked_velocity;
-		velocity.z -= ( gravity_scale * sv_gravity * cstypes::tick_interval ) * 0.5f;
+		velocity.z -= ( gravity_scale * sv_gravity * cstypes::tick_interval );
 
 		math::vector3 trace_start = trace_origin;
 		math::vector3 trace_end{};
@@ -148,7 +135,7 @@ namespace features::movement {
 
 		trace_end.z -= 2.0f;
 
-		const auto bbox = systems::tracing::bbox_collision{ mins, maxs };
+		const auto bbox = hull;
 		const auto result = systems::g_tracing.trace_player_bbox( trace_start, trace_end, bbox, filter, movement_services );
 		const auto valid_trace = ( result.fraction > 0.0f && result.fraction < 1.0f );
 
@@ -177,7 +164,7 @@ namespace features::movement {
 			perp_y = 0.0f;
 		}
 
-		const auto side_dist = std::max( 14.0f, std::max( std::fabsf( maxs.x ), std::fabsf( maxs.y ) ) * 1.25f );
+		const auto side_dist = std::max( 14.0f, std::max( std::fabsf( hull.maxs.x ), std::fabsf( hull.maxs.y ) ) * 1.25f );
 		const math::vector3 ground_ref{ result.position.x, result.position.y, trace_origin.z };
 
 		const auto left_ok = side_has_standable_ground( ground_ref, -perp_x * side_dist, -perp_y * side_dist, bbox, filter, movement_services, sv_standable_normal );

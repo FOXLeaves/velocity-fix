@@ -9,11 +9,13 @@ namespace features::world {
         void release( );
 
     private:
+        static constexpr std::uint32_t invalid_effect_index{ static_cast<std::uint32_t>( -1 ) };
+
         void create_particle( );
         void update_particles( );
         void release_particles( );
 
-        std::uint32_t m_effect_index{};
+        std::uint32_t m_effect_index{ invalid_effect_index };
         int m_last_particle_type{ -1 };
         float m_last_round_start_time{};
         bool m_particle_loaded{};
@@ -33,27 +35,35 @@ namespace features::world {
 
         void on_frame_stage_notify( );
         void on_draw_skybox_array_pre( std::uintptr_t mesh_array, int mesh_count );
-        void on_draw_skybox_array_post( std::uintptr_t mesh_array, int mesh_count );
+        void on_draw_skybox_array_post( );
         void on_light_scene_object_pre( std::uintptr_t object ) const;
         void on_light_scene_object_post( std::uintptr_t object ) const;
         void on_draw_scene_object_array( std::uintptr_t object_array ) const;
         void on_draw_scene_object( std::uintptr_t batch, int batch_count ) const;
-        void on_get_scene_param( __m128* out_buffer, std::uint32_t hash ) const;
+        [[nodiscard]] bool on_setup_fog( __m128i* output, int* mode ) const;
         void on_set_shader_param( __m128i*& value, std::uint32_t hash ) const;
 
        [[nodiscard]] const std::vector<skybox_entry>& get_skyboxes( ) const { return this->m_skyboxes; }
 
     private:
         void load_skybox_material( const char* path );
-        void update_gradient_fog( ) const;
 
         std::vector<skybox_entry> m_skyboxes{};
-        std::uintptr_t m_custom_sky_resource{};
-        std::uintptr_t m_original_sky_resource{};
+        struct cached_skybox_material
+        {
+            std::uintptr_t texture_binding{};
+            std::uintptr_t material{};
+        };
+
+        std::unordered_map<std::string, cached_skybox_material> m_skybox_materials{};
+        std::uintptr_t m_custom_sky_material{};
         int m_loaded_skybox_index{ -1 };
 
-        std::uintptr_t m_active_texture_binding{};
-        std::uintptr_t m_active_original_resource{};
+        std::uintptr_t m_active_material_binding{};
+        std::uintptr_t m_active_original_material{};
+        std::uintptr_t m_active_skybox_descriptor{};
+        std::array<float, 3> m_active_original_sky_color{};
+        bool m_active_sky_tinted{};
     };
 
     class smoke

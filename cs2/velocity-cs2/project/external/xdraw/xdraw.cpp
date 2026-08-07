@@ -3225,6 +3225,96 @@ namespace xdraw {
 		return result;
 	}
 
+	namespace detail
+	{
+		// Shared construction path for load_font (embedded data) and
+		// load_font_file (system font files). Returns a registered font or
+		// nullptr on failure; the FreeType library and face are owned by the
+		// font object afterwards.
+		[[nodiscard]] font* build_font( FT_Face face, FT_Library ft, float size_px, int atlas_w, int atlas_h )
+		{
+			// REAL_DIM requests produce broken metrics on some CJK fonts (e.g.
+			// Microsoft YaHei reports a negative ascent), which makes every
+			// glyph fail to load. NOMINAL with 26.6 fixed-point pixels is the
+			// portable path and matches FT_Set_Pixel_Sizes for integral sizes.
+			FT_Size_RequestRec req{};
+			req.type = FT_SIZE_REQUEST_TYPE_NOMINAL;
+			req.width = 0;
+			req.height = static_cast< FT_Long >( size_px * 64.0f );
+			FT_Request_Size( face, &req );
+
+			auto f = std::make_unique<font>( );
+			f->size = size_px;
+			f->atlas_w = atlas_w;
+			f->atlas_h = atlas_h;
+			f->ascent = static_cast< float >( FT_MulFix( face->ascender, face->size->metrics.y_scale ) ) / 64.0f;
+			f->descent = static_cast< float >( FT_MulFix( face->descender, face->size->metrics.y_scale ) ) / 64.0f;
+			f->line_height = static_cast< float >( face->size->metrics.height ) / 64.0f;
+
+			// Defense: a broken size request leaves unusable metrics; treat it
+			// as a load failure so callers fall back instead of rendering
+			// nothing.
+			if ( !std::isfinite( f->ascent ) || !std::isfinite( f->line_height ) ||
+				f->ascent <= 0.0f || f->line_height <= 0.0f )
+			{
+				FT_Done_Face( face );
+				FT_Done_FreeType( ft );
+				return nullptr;
+			}
+
+			f->ft_library = ft;
+			f->ft_face = face;
+			f->atlas_bitmap.resize( static_cast< std::size_t >( atlas_w * atlas_h ) * 4, 0 );
+
+			for ( auto i = 0; i < 96; ++i )
+			{
+				f->rasterize( static_cast< char32_t >( 32 + i ) );
+			}
+
+			D3D11_TEXTURE2D_DESC td{};
+			td.Width = static_cast< UINT >( atlas_w );
+			td.Height = static_cast< UINT >( atlas_h );
+			td.MipLevels = 1;
+			td.ArraySize = 1;
+			td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			td.SampleDesc.Count = 1;
+			td.Usage = D3D11_USAGE_DEFAULT;
+			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+			D3D11_SUBRESOURCE_DATA init{};
+			init.pSysMem = f->atlas_bitmap.data( );
+			init.SysMemPitch = static_cast< UINT >( atlas_w * 4 );
+
+			if ( FAILED( detail::g.device->CreateTexture2D( &td, &init, &f->atlas_tex ) ) )
+			{
+				return nullptr;
+			}
+
+			D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+			sv.Format = td.Format;
+			sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			sv.Texture2D.MipLevels = 1;
+
+			if ( FAILED( detail::g.device->CreateShaderResourceView( f->atlas_tex.Get( ), &sv, &f->atlas_srv ) ) )
+			{
+				return nullptr;
+			}
+
+			f->atlas_dirty = false;
+
+			detail::g.fonts.push_back( std::move( f ) );
+			auto result = detail::g.fonts.back( ).get( );
+
+			if ( !detail::g.primary_font )
+			{
+				detail::g.primary_font = result;
+				detail::g.font_stack.push_back( result );
+			}
+
+			return result;
+		}
+	} // namespace detail
+
 	font* load_font( std::span<const std::byte> data, float size_px, int atlas_w, int atlas_h )
 	{
 		FT_Library ft{};
@@ -3240,68 +3330,38 @@ namespace xdraw {
 			return nullptr;
 		}
 
-		FT_Size_RequestRec req{};
-		req.type = FT_SIZE_REQUEST_TYPE_REAL_DIM;
-		req.height = static_cast< FT_Long >( size_px * 64.0f );
-		FT_Request_Size( face, &req );
+		return detail::build_font( face, ft, size_px, atlas_w, atlas_h );
+	}
 
-		auto f = std::make_unique<font>( );
-		f->size = size_px;
-		f->atlas_w = atlas_w;
-		f->atlas_h = atlas_h;
-		f->ascent = static_cast< float >( FT_MulFix( face->ascender, face->size->metrics.y_scale ) ) / 64.0f;
-		f->descent = static_cast< float >( FT_MulFix( face->descender, face->size->metrics.y_scale ) ) / 64.0f;
-		f->line_height = static_cast< float >( face->size->metrics.height ) / 64.0f;
-		f->ft_library = ft;
-		f->ft_face = face;
-		f->atlas_bitmap.resize( static_cast< std::size_t >( atlas_w * atlas_h ) * 4, 0 );
-
-		for ( auto i = 0; i < 96; ++i )
-		{
-			f->rasterize( static_cast< char32_t >( 32 + i ) );
-		}
-
-		D3D11_TEXTURE2D_DESC td{};
-		td.Width = static_cast< UINT >( atlas_w );
-		td.Height = static_cast< UINT >( atlas_h );
-		td.MipLevels = 1;
-		td.ArraySize = 1;
-		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		td.SampleDesc.Count = 1;
-		td.Usage = D3D11_USAGE_DEFAULT;
-		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-		D3D11_SUBRESOURCE_DATA init{};
-		init.pSysMem = f->atlas_bitmap.data( );
-		init.SysMemPitch = static_cast< UINT >( atlas_w * 4 );
-
-		if ( FAILED( detail::g.device->CreateTexture2D( &td, &init, &f->atlas_tex ) ) )
+	font* load_font_file( const wchar_t* path, float size_px, int atlas_w, int atlas_h )
+	{
+		if ( !path || !path[ 0 ] )
 		{
 			return nullptr;
 		}
 
-		D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
-		sv.Format = td.Format;
-		sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		sv.Texture2D.MipLevels = 1;
-
-		if ( FAILED( detail::g.device->CreateShaderResourceView( f->atlas_tex.Get( ), &sv, &f->atlas_srv ) ) )
+		// FreeType's face loading API takes a narrow path; on Windows it
+		// converts UTF-8 internally, so convert the wide path first.
+		char utf8_path[ MAX_PATH ]{};
+		if ( WideCharToMultiByte( CP_UTF8, 0, path, -1, utf8_path, static_cast< int >( sizeof( utf8_path ) ), nullptr, nullptr ) <= 0 )
 		{
 			return nullptr;
 		}
 
-		f->atlas_dirty = false;
-
-		detail::g.fonts.push_back( std::move( f ) );
-		auto result = detail::g.fonts.back( ).get( );
-
-		if ( !detail::g.primary_font )
+		FT_Library ft{};
+		if ( FT_Init_FreeType( &ft ) != 0 )
 		{
-			detail::g.primary_font = result;
-			detail::g.font_stack.push_back( result );
+			return nullptr;
 		}
 
-		return result;
+		FT_Face face{};
+		if ( FT_New_Face( ft, utf8_path, 0, &face ) != 0 )
+		{
+			FT_Done_FreeType( ft );
+			return nullptr;
+		}
+
+		return detail::build_font( face, ft, size_px, atlas_w, atlas_h );
 	}
 
 	void push_font( font* f )
@@ -3315,6 +3375,31 @@ namespace xdraw {
 		{
 			detail::g.font_stack.pop_back( );
 		}
+	}
+
+	void reset_font_stack( )
+	{
+		detail::g.font_stack.clear( );
+		if ( detail::g.primary_font )
+		{
+			detail::g.font_stack.push_back( detail::g.primary_font );
+		}
+	}
+
+	std::size_t font_stack_size( )
+	{
+		return detail::g.font_stack.size( );
+	}
+
+	void set_primary_font( font* f )
+	{
+		if ( !f )
+		{
+			return;
+		}
+
+		detail::g.primary_font = f;
+		reset_font_stack( );
 	}
 
 	font* current_font( )

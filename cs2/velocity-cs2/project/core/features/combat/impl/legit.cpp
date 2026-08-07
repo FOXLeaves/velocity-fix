@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
 #include <utilities/random/random.hpp>
@@ -47,7 +47,9 @@ namespace features::combat {
 			return;
 		}
 
-		math::vector3 shoot_position{};
+		auto shoot_position = g_shared.get_interpolated_shoot_position( local.pawn, false );
+		ctx.spread = g_shared.get_spread( );
+		ctx.inaccuracy = g_shared.get_inaccuracy( true );
 
 		systems::g_prediction.simulate( cmd, local, [ & ]
 			{
@@ -138,7 +140,7 @@ namespace features::combat {
 				continue;
 			}
 
-			const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+			const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 			const auto pawn = systems::g_entities.lookup( pawn_handle );
 
 			if ( !pawn || pawn == local.pawn )
@@ -273,7 +275,7 @@ namespace features::combat {
 			}
 
 			shared::penetration::result pen{};
-			if ( !g_shared.pen( ).run( shoot_position, bone.position, pen_ctx, local.pawn, local.team, pen, hitgroup ) )
+			if ( !g_shared.pen( ).run( shoot_position, bone.position, pen_ctx, local.pawn, local.team, pen ) )
 			{
 				continue;
 			}
@@ -383,6 +385,14 @@ namespace features::combat {
 			{
 				this->m_trigger_release_time = 0.0f;
 				this->m_trigger_pending_pawn = 0;
+
+				// Human-like click: every press packet must be followed by
+				// an explicit release packet (finger off the mouse), so the
+				// server never sees a permanently held button.
+				cmd->buttons.value &= ~cstypes::command_buttons::in_attack;
+				cmd->buttons.value_changed &= ~cstypes::command_buttons::in_attack;
+				cmd->buttons.value_scroll &= ~cstypes::command_buttons::in_attack;
+				cmd->csgo_user_cmd.set_attack1_start_history_index( -1 );
 				return;
 			}
 
@@ -408,6 +418,14 @@ namespace features::combat {
 			const auto tick_base = memory::read<std::int32_t>( local.controller + SCHEMA( "CBasePlayerController", "m_nTickBase"_hash ) );
 			seed = g_shared.get_spread_seed( corrected_angles, tick_base );
 			spread = g_shared.calculate_spread( seed, ctx.inaccuracy, ctx.spread, ctx.recoil_index, ctx.item_def_idx, ctx.num_bullets );
+
+			// Constraint mode: do not compensate the full spread - leave a
+			// human-like residual error so the shot is never "too perfect".
+			if ( config.seed_constraint.value )
+			{
+				spread.x *= 0.8f;
+				spread.y *= 0.8f;
+			}
 
 			math::vector3 forward{}, left{}, up{};
 			math::helpers::angle_vectors_left( corrected_angles, &forward, &left, &up );
@@ -469,7 +487,7 @@ namespace features::combat {
 				continue;
 			}
 
-			const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+			const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 			const auto pawn = systems::g_entities.lookup( pawn_handle );
 
 			if ( !pawn || pawn == local.pawn )
@@ -548,12 +566,20 @@ namespace features::combat {
 						const auto pen_ctx = g_shared.pen( ).prepare_target( pawn, rec );
 
 						shared::penetration::result candidate_pen{};
-						if ( !g_shared.pen( ).run( shoot_position, hit_point, pen_ctx, local.pawn, local.team, candidate_pen, hitgroup ) )
+						if ( !g_shared.pen( ).run( shoot_position, hit_point, pen_ctx, local.pawn, local.team, candidate_pen ) )
 						{
 							continue;
 						}
 
-						if ( candidate_pen.penetrated && candidate_pen.damage < static_cast< float >( config.min_damage.value ) )
+						// Damage floors are split: exposed targets need the
+						// direct min_damage, wall-banged (penetrated) targets
+						// only need the (lower) pen min_damage.
+						// Penetrated targets are gated by the autowall min_damage,
+						// exposed targets by the seed min damage.
+						const auto required_damage = candidate_pen.penetrated
+							? static_cast< float >( config.min_damage.value )
+							: static_cast< float >( config.seed_min_damage.value );
+						if ( candidate_pen.damage < required_damage )
 						{
 							continue;
 						}
@@ -613,7 +639,7 @@ namespace features::combat {
 					const auto pen_ctx = g_shared.pen( ).prepare_target( pawn, rec );
 
 					shared::penetration::result candidate_pen{};
-					if ( !g_shared.pen( ).run( shoot_position, target_point, pen_ctx, local.pawn, local.team, candidate_pen, -1 ) )
+					if ( !g_shared.pen( ).run( shoot_position, target_point, pen_ctx, local.pawn, local.team, candidate_pen ) )
 					{
 						continue;
 					}
@@ -761,7 +787,28 @@ namespace features::combat {
 			cmd->csgo_user_cmd.set_attack1_start_history_index( input_history_size - 1 );
 		}
 
-		this->m_trigger_release_time = ctx.current_time + random::hold_duration( );
+		// Human-like click cadence: minimum hold time, plus (in constraint
+		// mode) a minimum gap after the release before the next trigger so
+		// the fire pattern stays within human reaction times.
+		auto hold_time = random::hold_duration( );
+		if ( config.seed_constraint.value )
+		{
+			hold_time = std::max( hold_time, 0.045f );
+
+			if ( this->m_trigger_next_time > 0.0f )
+			{
+				if ( ctx.current_time < this->m_trigger_next_time )
+				{
+					return;
+				}
+
+				this->m_trigger_next_time = 0.0f;
+			}
+
+			this->m_trigger_next_time = ctx.current_time + hold_time + random::human_gap( );
+		}
+
+		this->m_trigger_release_time = ctx.current_time + hold_time;
 	}
 
 	void legit::apply_rcs( math::vector3& aim_angle, const math::vector3& aim_punch, int rand_min, int rand_max ) const

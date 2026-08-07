@@ -29,6 +29,7 @@
 #include <cmath>
 #include <numbers>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <chrono>
 #include <variant>
@@ -60,7 +61,6 @@
 #include <external/xdraw/xui/xui.hpp>
 #include <external/zydis/zydis.h>
 #include <external/lz4/lz4.h>
-#include <external/rpack.hpp>
 
 #define JM_XORSTR_DISABLE_AVX_INTRINSICS
 #include <external/xorstr.hpp>

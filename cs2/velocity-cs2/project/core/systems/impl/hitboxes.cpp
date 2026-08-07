@@ -11,7 +11,13 @@ namespace systems {
     {
         set result{};
 
-        const auto model_handle = seh ? memory::safe_read<std::uintptr_t>( game_scene_node + 0x210 ).value_or( 0 ) : memory::read<std::uintptr_t>( game_scene_node + 0x210 );
+        // CSkeletonInstance moved its model handle in the current client.
+        auto model_handle = seh ? memory::safe_read<std::uintptr_t>( game_scene_node + 0x1E0 ).value_or( 0 ) : memory::read<std::uintptr_t>( game_scene_node + 0x1E0 );
+        if ( !model_handle )
+        {
+            model_handle = seh ? memory::safe_read<std::uintptr_t>( game_scene_node + 0x210 ).value_or( 0 ) : memory::read<std::uintptr_t>( game_scene_node + 0x210 );
+        }
+
         if ( !model_handle )
         {
             return result;
@@ -23,13 +29,36 @@ namespace systems {
             return result;
         }
 
-        const auto render_meshes = memory::read<std::uintptr_t>( memory::read<std::uintptr_t>( cmodel + 0x78 ) );
+        const auto render_mesh_array = memory::read<std::uintptr_t>( cmodel + 0x78 );
+        if ( !render_mesh_array )
+        {
+            return result;
+        }
+
+        const auto render_meshes = memory::read<std::uintptr_t>( render_mesh_array );
         if ( !render_meshes )
         {
             return result;
         }
 
-        const auto hitbox_set = memory::read<std::uintptr_t>( render_meshes + 0x150 );
+        std::uintptr_t hitbox_set{};
+
+        // Hitbox sets now live in the render mesh's set container. Player
+        // models use the first set; retain the old direct pointer as fallback.
+        const auto set_count = memory::read<int>( render_meshes + 0x174 );
+        if ( set_count > 0 && set_count <= 32 )
+        {
+            const auto storage_flags = memory::read<std::uint32_t>( render_meshes + 0x164 );
+            hitbox_set = ( storage_flags & 0x7fffffff )
+                ? memory::read<std::uintptr_t>( render_meshes + 0x168 )
+                : render_meshes + 0x168;
+        }
+
+        if ( !hitbox_set )
+        {
+            hitbox_set = memory::read<std::uintptr_t>( render_meshes + 0x150 );
+        }
+
         if ( !hitbox_set )
         {
             return result;

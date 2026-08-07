@@ -159,8 +159,23 @@ namespace hooking {
 
 		auto resolved = reinterpret_cast< std::uintptr_t >( target );
 
-		while ( true )
+		for ( auto depth = 0; depth < 8; ++depth )
 		{
+			MEMORY_BASIC_INFORMATION resolved_mbi{};
+			auto resolved_length{ 0ull };
+			if ( detail::nt_query_virtual_memory( GetCurrentProcess( ), reinterpret_cast< void* >( resolved ), 0, &resolved_mbi, sizeof( resolved_mbi ), &resolved_length ) < 0
+				|| resolved_mbi.State != MEM_COMMIT
+				|| !( resolved_mbi.Protect & ( PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY ) ) )
+			{
+				return false;
+			}
+
+			const auto region_end = reinterpret_cast< std::uintptr_t >( resolved_mbi.BaseAddress ) + resolved_mbi.RegionSize;
+			if ( resolved > region_end || region_end - resolved < 6 )
+			{
+				return false;
+			}
+
 			const auto byte = *reinterpret_cast< std::uint8_t* >( resolved );
 
 			if ( byte == 0xe9 )
@@ -176,6 +191,11 @@ namespace hooking {
 			else
 			{
 				break;
+			}
+
+			if ( depth == 7 )
+			{
+				return false;
 			}
 		}
 
@@ -210,6 +230,7 @@ namespace hooking {
 
 		if ( !detail::build_trampoline( target, trampoline, &original_len, &trampoline_len ) )
 		{
+			allocator::free( trampoline );
 			return false;
 		}
 

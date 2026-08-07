@@ -120,31 +120,26 @@ namespace systems {
 
 	const char* entities::get_schema_name( std::uintptr_t entity ) const
 	{
-		const auto identity = memory::read<std::uintptr_t>( entity + 0x10 );
+		const auto identity = memory::safe_read<std::uintptr_t>( entity + 0x10 ).value_or( 0 );
 		if ( !identity )
 		{
 			return nullptr;
 		}
 
-		const auto class_info = memory::read<std::uintptr_t>( identity + 0x8 );
+		const auto entity_class = memory::safe_read<std::uintptr_t>( identity + 0x8 ).value_or( 0 );
+		if ( !entity_class )
+		{
+			return nullptr;
+		}
+
+		// CEntityClass owns the current SchemaClassInfo pointer at 0x58.
+		const auto class_info = memory::safe_read<std::uintptr_t>( entity_class + 0x58 ).value_or( 0 );
 		if ( !class_info )
 		{
 			return nullptr;
 		}
 
-		const auto name_container = memory::read<std::uintptr_t>( class_info + 0x8 );
-		if ( !name_container )
-		{
-			return nullptr;
-		}
-
-		const auto name_ptr = memory::read<std::uintptr_t>( name_container + 0x8 );
-		if ( !name_ptr )
-		{
-			return nullptr;
-		}
-
-		return reinterpret_cast< const char* >( name_ptr );
+		return memory::safe_read<const char*>( class_info + 0x8 ).value_or( nullptr );
 	}
 
 	std::uintptr_t entities::get_by_index( std::int32_t index )

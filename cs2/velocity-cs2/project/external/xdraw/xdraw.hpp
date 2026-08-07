@@ -209,9 +209,21 @@ namespace xdraw {
 
 	[[nodiscard]] gif_image load_gif( std::span<const std::byte> data );
 	[[nodiscard]] font* load_font( std::span<const std::byte> data, float size_px, int atlas_w = 1024, int atlas_h = 1024 );
+	// Loads a font from a system font file (e.g. C:\Windows\Fonts\msyh.ttc).
+	// Returns nullptr when the file is missing or unreadable.
+	[[nodiscard]] font* load_font_file( const wchar_t* path, float size_px, int atlas_w = 1024, int atlas_h = 1024 );
 
 	void push_font( font* f );
 	void pop_font( );
+	// Resets the font stack to just the primary font. Callers that render
+	// before the UI (ESP overlays, widgets) may leave entries on the stack,
+	// which would silently switch the UI text to their font.
+	void reset_font_stack( );
+	[[nodiscard]] std::size_t font_stack_size( );
+	// Replaces the primary (default UI) font and resets the stack. Used after
+	// the default engine font was registered first during renderer setup so a
+	// localized (CJK) family can take over the UI text.
+	void set_primary_font( font* f );
 
 	[[nodiscard]] font* current_font( );
 	[[nodiscard]] font* primary_font( );

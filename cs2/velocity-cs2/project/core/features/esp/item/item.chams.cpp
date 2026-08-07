@@ -4,6 +4,7 @@
 #include <core/systems/systems.hpp>
 #include <core/settings.hpp>
 #include <core/features/features.hpp>
+#include "../primitive_buffer.hpp"
 
 namespace features::esp::item {
 
@@ -49,9 +50,12 @@ namespace features::esp::item {
 		}
 
 		{
-			auto flags = memory::read<std::uint32_t>( scene_object + 0x78 );
-			flags &= ~( 1 << 3 );
-			memory::write( scene_object + 0x78, flags );
+			const auto flags = memory::safe_read<std::uint8_t>( scene_object + 0x78 );
+			if ( flags ) {
+				(void) memory::safe_write<std::uint8_t>(
+					scene_object + 0x78,
+					static_cast<std::uint8_t>( *flags & ~( 1u << 3 ) ) );
+			}
 		}
 
 		if ( cfg.secondary.enabled.value )
@@ -69,18 +73,14 @@ namespace features::esp::item {
 
 	void chams::apply_layer( std::uintptr_t primitive_buffer, void( __fastcall* original_fn )( std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t ), std::uintptr_t a1, std::uintptr_t scene_object, std::uintptr_t scene_view, const xdraw::color& color, settings::esp::cham_ids material_id )
 	{
-		const auto prev_count = memory::read<std::int32_t>( primitive_buffer + 0xc );
+		const auto before = detail::read_primitive_buffer( primitive_buffer );
+		const auto prev_count = before ? before->count() : -1;
 
 		original_fn( a1, scene_object, scene_view, primitive_buffer );
 
-		const auto new_count = memory::read<std::int32_t>( primitive_buffer + 0xc );
-		if ( prev_count >= new_count )
-		{
-			return;
-		}
-
-		const auto primitives_ptr = memory::read<std::uintptr_t>( primitive_buffer );
-		if ( !primitives_ptr )
+		const auto after = detail::read_primitive_buffer( primitive_buffer );
+		const auto new_count = after ? after->count() : -1;
+		if ( !after || prev_count < 0 || prev_count >= new_count )
 		{
 			return;
 		}
@@ -93,9 +93,7 @@ namespace features::esp::item {
 
 		for ( auto i = prev_count; i < new_count; ++i )
 		{
-			const auto primitive = primitives_ptr + ( static_cast< std::size_t >( i ) * 0x68 );
-			memory::write( primitive + 0x20, material );
-			memory::write( primitive + 0x50, color );
+			detail::replace_primitive( after->at( i ), material, color );
 		}
 	}
 

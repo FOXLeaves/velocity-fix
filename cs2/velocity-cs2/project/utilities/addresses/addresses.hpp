@@ -57,13 +57,11 @@ namespace addresses {
 		inline std::uintptr_t view_matrix{};
 		inline std::uintptr_t game_rules{};
 		inline std::uintptr_t light_data_queue{};
-		inline std::uintptr_t dynamic_light_manager_slot{};
 		inline std::uintptr_t particle_manager{};
 		inline std::uintptr_t game_event_manager{};
 		inline std::uintptr_t game_trace_manager{};
-		inline std::uintptr_t render_game_system{};
+		inline std::uintptr_t render_game_system_storage{};
 		inline std::uintptr_t mem_alloc{};
-		inline std::uintptr_t swap_chain{};
 		inline std::uintptr_t material_manager{};
 		inline std::uintptr_t game_entity_system{};
 		inline std::uintptr_t weapon_recoil_data{};
@@ -73,7 +71,6 @@ namespace addresses {
 		inline std::uintptr_t prediction_player{};
 		inline std::uintptr_t planted_c4{};
 		inline std::uintptr_t item_system{};
-		inline std::uintptr_t net_client{};
 		inline std::uintptr_t frame_input_ring_idx{};
 		inline std::uintptr_t frame_input_ring_base{};
 		inline std::uintptr_t prediction_state{};

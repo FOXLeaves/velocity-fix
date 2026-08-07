@@ -3,6 +3,7 @@
 #include <utilities/addresses/addresses.hpp>
 #include <core/settings.hpp>
 #include <utilities/security/security.hpp>
+#include <utilities/steam/steam.hpp>
 #include <external/config.hpp>
 #include <core/systems/systems.hpp>
 
@@ -915,7 +916,7 @@ namespace rendering {
 
 	} // namespace images
 
-	void menu::initialize_graphics_before_rpack( )
+	void menu::initialize_graphics( )
 	{
 		if ( this->m_intro_base_graphics_ready )
 		{
@@ -933,7 +934,6 @@ namespace rendering {
 			&this->m_textures.intro_splash.width,
 			&this->m_textures.intro_splash.height
 		);
-		this->m_textures.user.resource = xdraw::load_texture( std::span( reinterpret_cast< const std::byte* >( images::user ), sizeof( images::user ) ), &this->m_textures.user.width, &this->m_textures.user.height );
 		this->m_textures.search.resource = xdraw::load_svg( svgs::search, icon_target / 16.0f, &this->m_textures.search.width, &this->m_textures.search.height );
 		this->m_textures.settings.resource = xdraw::load_svg( svgs::settings, icon_target / 14.0f, &this->m_textures.settings.width, &this->m_textures.settings.height );
 
@@ -960,19 +960,6 @@ namespace rendering {
 		}
 
 		this->m_intro_base_graphics_ready = true;
-	}
-
-	void menu::finalize_textures_after_rpack( )
-	{
-		if ( this->m_intro_pack_textures_ready )
-		{
-			return;
-		}
-
-		this->m_textures.fih.resource = xdraw::load_texture( std::as_bytes( rpack::reader::get( rpack::images::icons::fih ) ), &this->m_textures.fih.width, &this->m_textures.fih.height );
-		this->m_textures.gif = xdraw::load_gif( std::as_bytes( rpack::reader::get( rpack::images::femboys::furry_gif ) ) );
-		this->m_textures.konata_peek.resource = xdraw::load_texture( std::as_bytes( rpack::reader::get( rpack::images::menu_decor::konata_peek ) ), &this->m_textures.konata_peek.width, &this->m_textures.konata_peek.height );
-		this->m_intro_pack_textures_ready = true;
 	}
 
 	void menu::rebuild_search_index( )
@@ -1060,7 +1047,7 @@ namespace rendering {
 				const auto label_col = xui::lerp( tokens::col_text, tokens::col_dark, row_anim * 0.2f );
 				const auto sub_col = tokens::col_text_dim;
 				const auto name_th = xdraw::measure_text( item.name ).second;
-				const auto subtitle = item.category.empty( ) ? "misc" : item.category.c_str( );
+				const auto subtitle = item.category.empty( ) ? "杂项" : item.category.c_str( );
 				const auto sub_th = xdraw::measure_text( subtitle ).second;
 				const auto block_h = name_th + 3.0f + sub_th;
 				const auto text_start_y = row.y + ( row.h - block_h ) * 0.5f;
@@ -1130,12 +1117,12 @@ namespace rendering {
 
 		const bool pack_ready = g_context.ui_assets_ready( );
 
-		if ( pack_ready && this->m_intro_rpak_ready_at < 0.0f )
+		if ( pack_ready && this->m_intro_assets_ready_at < 0.0f )
 		{
-			this->m_intro_rpak_ready_at = this->m_intro_elapsed;
+			this->m_intro_assets_ready_at = this->m_intro_elapsed;
 		}
 
-		if ( this->m_intro_rpak_ready_at >= 0.0f )
+		if ( this->m_intro_assets_ready_at >= 0.0f )
 		{
 			this->m_intro_finished = true;
 			return false;
@@ -1306,12 +1293,18 @@ namespace rendering {
 
 			const auto menu_reveal = xui::ease::out_cubic( this->m_open_anim );
 
-			this->m_textures.gif.update( dt );
+			// Restore the persisted window size, then let the bottom-right grip
+			// resize it; the new size is written back below.
+			this->m_w = std::max( 640.0f, settings::g_misc.menu_width.value );
+			this->m_h = std::max( 400.0f, settings::g_misc.menu_height.value );
 
-			if ( !xui::begin_window( "##menu", this->m_x, this->m_y, this->m_w, this->m_h, false, 200.0f, 200.0f, menu_reveal ) )
+			if ( !xui::begin_window( "##menu", this->m_x, this->m_y, this->m_w, this->m_h, true, 640.0f, 400.0f, menu_reveal ) )
 			{
 				return;
 			}
+
+			settings::g_misc.menu_width.value = this->m_w;
+			settings::g_misc.menu_height.value = this->m_h;
 
 			auto& dl = xui::draw::current( );
 			const auto wx = this->m_x;
@@ -1323,16 +1316,6 @@ namespace rendering {
 			const auto sb_y = wy + tokens::gap;
 			const auto sb_w = tokens::sidebar_w;
 			const auto sb_h = wh - tokens::gap * 2.0f;
-
-			//if ( this->m_textures.gif.valid( ) )
-			//{
-			//	const auto gw = static_cast< float >( this->m_textures.gif.width( ) );
-			//	const auto gh = static_cast< float >( this->m_textures.gif.height( ) );
-			//	const auto gx = wx + ( ww - gw ) * 0.5f + 50.0f;
-			//	const auto gy = wy + ( wh - gh ) * 0.5f;
-
-			//	dl.image( gx, gy, gw, gh, this->m_textures.gif.current_srv( ), xdraw::color{ 255, 255, 255, 100 } );
-			//}
 
 			const auto logo_h = tokens::subtab_bar_h;
 			dl.rect_filled( sb_x, sb_y, sb_w, logo_h, tokens::col_card, xdraw::corner_radius{ tokens::card_rounding } );
@@ -1376,7 +1359,6 @@ namespace rendering {
 				xui::ctx( ).inside_overlay = xui::null_id;
 
 				xui::end_window( );
-				this->draw_menu_peek_decor( wx, wy, ww, wh, menu_reveal );
 				xui::end( );
 				return;
 			}
@@ -1393,7 +1375,6 @@ namespace rendering {
 			}
 
 			xui::end_window( );
-			this->draw_menu_peek_decor( wx, wy, ww, wh, menu_reveal );
 
 		}
 		xui::end( );
@@ -1424,37 +1405,6 @@ namespace rendering {
 
 		SetCursorPos( x, y );
 		SetCursor( LoadCursor( nullptr, IDC_ARROW ) );
-	}
-
-	void menu::draw_menu_peek_decor( float wx, float wy, float ww, float wh, float reveal ) const
-	{
-		const auto reveal_clamped = std::clamp( reveal, 0.0f, 1.0f );
-		if ( reveal_clamped < 0.02f || !this->m_textures.konata_peek.resource )
-		{
-			return;
-		}
-
-		auto& dl = xui::draw::current( );
-
-		constexpr auto k_display_h{ 96.0f };
-		constexpr auto k_right_inset{ 36.0f };
-		constexpr auto k_top_nudge{ 3.0f };
-
-		const auto canvas_w = ww * reveal_clamped;
-		const auto canvas_h = wh * reveal_clamped;
-		const auto canvas_x = wx + ( ww - canvas_w ) * 0.5f;
-		const auto canvas_y = wy + ( wh - canvas_h ) * 0.5f;
-
-		const auto tex_w = static_cast< float >( this->m_textures.konata_peek.width );
-		const auto tex_h = static_cast< float >( this->m_textures.konata_peek.height );
-		const auto fit = ( k_display_h * reveal_clamped ) / std::max( tex_h, 1.0f );
-		const auto draw_w = std::floor( tex_w * fit );
-		const auto draw_h = std::floor( tex_h * fit );
-		const auto draw_x = std::floor( canvas_x + canvas_w - draw_w - k_right_inset * reveal_clamped );
-		const auto draw_y = std::floor( canvas_y - draw_h + k_top_nudge * reveal_clamped );
-
-		const auto img_a = static_cast< std::uint8_t >( 255.0f * reveal_clamped );
-		dl.image( draw_x, draw_y, draw_w, draw_h, this->m_textures.konata_peek.resource.Get( ), xdraw::color{ 255, 255, 255, img_a } );
 	}
 
 	void menu::draw_side_bar( float h )
@@ -1531,7 +1481,58 @@ namespace rendering {
 
 		this->draw_theme_swatches( sb_x, avatar_y );
 
-		dl.image( std::floor( avatar_x ), std::floor( avatar_y ), tokens::tab_icon_size, tokens::tab_icon_size, this->m_textures.user.resource.Get( ), xdraw::corner_radius{ 7.0f } );
+		this->try_load_user_avatar( );
+		if ( this->m_textures.user.resource )
+		{
+			dl.image( std::floor( avatar_x ), std::floor( avatar_y ), tokens::tab_icon_size, tokens::tab_icon_size, this->m_textures.user.resource.Get( ), xdraw::corner_radius{ 7.0f } );
+		}
+		else
+		{
+			dl.rect_filled( std::floor( avatar_x ), std::floor( avatar_y ), tokens::tab_icon_size, tokens::tab_icon_size, tokens::col_card, xdraw::corner_radius{ 7.0f } );
+		}
+	}
+
+	void menu::try_load_user_avatar( )
+	{
+		if ( this->m_textures.user.resource )
+		{
+			return;
+		}
+
+		this->m_user_avatar_retry_delay -= xdraw::delta_time( );
+		if ( this->m_user_avatar_retry_delay > 0.0f )
+		{
+			return;
+		}
+		this->m_user_avatar_retry_delay = 1.0f;
+
+		const auto steam_id = steam::user::get_steam_id( );
+		if ( !steam_id )
+		{
+			return;
+		}
+
+		const auto image = steam::friends::get_medium_friend_avatar( steam_id );
+		if ( image <= 0 )
+		{
+			return;
+		}
+
+		std::uint32_t width{}, height{};
+		if ( !steam::utils::get_image_size( image, &width, &height ) || !width || !height )
+		{
+			return;
+		}
+
+		std::vector<std::uint8_t> rgba( width * height * 4 );
+		if ( !steam::utils::get_image_rgba( image, rgba.data( ), static_cast< int >( rgba.size( ) ) ) )
+		{
+			return;
+		}
+
+		this->m_textures.user.resource = xdraw::create_srv_from_rgba( rgba.data( ), static_cast< int >( width ), static_cast< int >( height ) );
+		this->m_textures.user.width = static_cast< int >( width );
+		this->m_textures.user.height = static_cast< int >( height );
 	}
 
 	void menu::draw_theme_swatches( float sb_x, float avatar_y )
@@ -1811,7 +1812,7 @@ namespace rendering {
 					xui::push_style_var( xui::style_var::text_input_rounding, tokens::btn_rounding );
 					xui::push_style_color( xui::style_col::text_input_bg, tokens::col_card.alpha( 0 ) );
 					xui::push_style_color( xui::style_col::text_input_border, tokens::col_card.alpha( 0 ) );
-					xui::text_input( "##menu_search_input", this->m_search_query, 96, "i want to find..." );
+					xui::text_input( "##menu_search_input", this->m_search_query, 96, "搜索设置..." );
 					xui::pop_style_color( 2 );
 					xui::pop_style_var( 2 );
 

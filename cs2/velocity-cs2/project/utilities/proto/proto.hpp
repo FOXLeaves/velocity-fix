@@ -271,6 +271,11 @@ namespace proto {
 		float m_player_tick_fraction;
 		std::int32_t m_frame_number;
 		std::int32_t m_target_ent_index;
+		// Sub-tick attack flags (added in later game builds, appended to the
+		// message): bit0 marks an attack inside this entry. Used by the
+		// double-tap charge to tag both attack entries of a pair.
+		std::int32_t m_attack_flags;
+		std::int32_t m_attack_unk;
 
 		[[nodiscard]] bool has_view_angles( ) const;
 		[[nodiscard]] const msg_qangle* view_angles( ) const;
@@ -318,6 +323,13 @@ namespace proto {
 		[[nodiscard]] bool has_target_ent_index( ) const;
 		[[nodiscard]] std::int32_t target_ent_index( ) const;
 		void set_target_ent_index( std::int32_t v );
+
+		[[nodiscard]] bool has_attack_flags( ) const;
+		[[nodiscard]] std::int32_t attack_flags( ) const;
+		void set_attack_flags( std::int32_t v );
+		[[nodiscard]] bool has_attack_unk( ) const;
+		[[nodiscard]] std::int32_t attack_unk( ) const;
+		void set_attack_unk( std::int32_t v );
 	};
 
 	struct csgo_usercmd_pb

@@ -102,7 +102,11 @@ namespace systems {
 		ray ray{};
 		result result{};
 
-		memory::call<bool>(PATTERN (patterns::trace_ray_entity), addresses::globals::game_trace_manager, &ray, &start, &end, target_entity, &filter, &result );
+		const auto trace_ray_entity = PATTERN( patterns::trace_ray_entity );
+		if ( trace_ray_entity )
+		{
+			memory::call<bool>(trace_ray_entity, addresses::globals::game_trace_manager, &ray, &start, &end, target_entity, &filter, &result );
+		}
 
 		return result;
 	}
@@ -143,14 +147,18 @@ namespace systems {
 		return result;
 	}
 
-	void tracing::setup_trace( trace_data* trace_data, const math::vector3& start, const math::vector3& end, const filter& filter, int penetration_count, bool trace_world ) const
+	void tracing::setup_trace( trace_data* trace_data, const math::vector3& start, const math::vector3& delta, const filter& filter, int penetration_count, bool trace_world ) const
 	{
-		memory::call<void>(PATTERN (patterns::trace_bullet_data_init), trace_data, start, end, filter, penetration_count, trace_world );
+		memory::call<void>(PATTERN (patterns::trace_bullet_data_init), trace_data, start, delta, filter, penetration_count, trace_world );
 	}
 
 	void tracing::init_result( result* trace_result ) const
 	{
-		memory::call<void>(PATTERN (patterns::trace_bullet_free), trace_result );
+		const auto trace_bullet_free = PATTERN( patterns::trace_bullet_free );
+		if ( trace_bullet_free )
+		{
+			memory::call<void>(trace_bullet_free, trace_result );
+		}
 	}
 
 	void tracing::finalize_trace( trace_data* trace_data, result* hit, float unknown_float, void* unknown ) const

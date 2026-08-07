@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Development|x64">
@@ -11,7 +11,6 @@
     </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
-    <VCProjectVersion>18.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{d30ae6e8-620d-42e0-b3f4-804cafe20f44}</ProjectGuid>
     <RootNamespace>velocitycs2</RootNamespace>
@@ -25,7 +24,6 @@
     <WholeProgramOptimization>false</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
     <EnableUnitySupport>true</EnableUnitySupport>
-    <LLVMToolsVersion>19</LLVMToolsVersion>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Ship|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
@@ -34,7 +32,6 @@
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
     <EnableUnitySupport>true</EnableUnitySupport>
-    <LLVMToolsVersion>19</LLVMToolsVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -51,20 +48,22 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Development|x64'">
     <OutDir>../bin/</OutDir>
     <IntDir>../bin/intermediates/</IntDir>
-    <IncludePath>project/external/phnt;project/external/vmprotect;project/;project/external/xdraw/dependencies/freetype/x/;$(IncludePath)</IncludePath>
-    <LibraryPath>project/external/vmprotect/lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>project/external/phnt;project/;$(IncludePath)</IncludePath>
     <TargetName>velocity-cs2-dev</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Ship|x64'">
     <OutDir>../bin/</OutDir>
     <IntDir>../bin/intermediates/</IntDir>
-    <IncludePath>project/external/phnt;project/external/vmprotect;project/;project/external/xdraw/dependencies/freetype/x/;$(IncludePath)</IncludePath>
-    <LibraryPath>project/external/vmprotect/lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>project/external/phnt;project/;$(IncludePath)</IncludePath>
     <TargetName>cs2</TargetName>
   </PropertyGroup>
   <PropertyGroup Label="Vcpkg">
-    <VcpkgEnabled>false</VcpkgEnabled>
+    <VcpkgEnabled>true</VcpkgEnabled>
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgRoot Condition="'$(VcpkgRoot)'=='' and Exists('$(VCInstallDir)vcpkg\vcpkg.exe')">$(VCInstallDir)vcpkg\</VcpkgRoot>
+    <VelocityImportVcpkg Condition="'$(VcpkgPropsImported)'!='true' and Exists('$(VcpkgRoot)scripts\buildsystems\msbuild\vcpkg.props')">true</VelocityImportVcpkg>
   </PropertyGroup>
+  <Import Project="$(VcpkgRoot)scripts\buildsystems\msbuild\vcpkg.props" Condition="'$(VelocityImportVcpkg)'=='true'" />
   <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Development|x64'">
     <VcpkgUseStatic>true</VcpkgUseStatic>
   </PropertyGroup>
@@ -87,7 +86,7 @@
       <InlineFunctionExpansion>Disabled</InlineFunctionExpansion>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <OmitFramePointers>false</OmitFramePointers>
-      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <IncludeInUnityFile>false</IncludeInUnityFile>
       <ExceptionHandling>Sync</ExceptionHandling>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
@@ -100,7 +99,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <EntryPointSymbol>entry</EntryPointSymbol>
-      <AdditionalDependencies>Synchronization.lib;VMProtectSDK64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>freetype.lib;Synchronization.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>
       </ModuleDefinitionFile>
     </Link>
@@ -121,9 +120,10 @@
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <OmitFramePointers>true</OmitFramePointers>
-      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <IncludeInUnityFile>false</IncludeInUnityFile>
       <ExceptionHandling>false</ExceptionHandling>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
     </ClCompile>
     <Link>
@@ -131,7 +131,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <EntryPointSymbol>entry</EntryPointSymbol>
-      <AdditionalDependencies>Synchronization.lib;VMProtectSDK64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>freetype.lib;Synchronization.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -144,7 +144,10 @@
     <ClCompile Include="project\core\features\combat\impl\legit.cpp" />
     <ClCompile Include="project\core\features\combat\impl\misc.cpp" />
     <ClCompile Include="project\core\features\combat\impl\rage.cpp" />
+    <ClCompile Include="project\core\features\combat\impl\rage.melee.cpp" />
+    <ClCompile Include="project\core\features\combat\impl\rage.scan.cpp" />
     <ClCompile Include="project\core\features\combat\impl\shared.cpp" />
+    <ClCompile Include="project\core\features\combat\impl\vac_bypass.cpp" />
     <ClCompile Include="project\core\features\esp\item\item.chams.cpp" />
     <ClCompile Include="project\core\features\esp\item\item.glow.cpp" />
     <ClCompile Include="project\core\features\esp\item\item.overlay.cpp" />
@@ -163,20 +166,21 @@
     <ClCompile Include="project\core\features\misc\impl\removals.cpp" />
     <ClCompile Include="project\core\features\misc\impl\scoreboard_weapons.cpp" />
     <ClCompile Include="project\core\features\movement\impl\airstrafe.cpp" />
-    <ClCompile Include="project\core\features\movement\impl\test_strafer.cpp" />
+
     <ClCompile Include="project\core\features\movement\impl\bunnyhop.cpp" />
     <ClCompile Include="project\core\features\movement\impl\edgebug.cpp" />
     <ClCompile Include="project\core\features\movement\impl\edgejump.cpp" />
     <ClCompile Include="project\core\features\movement\impl\edgestop.cpp" />
     <ClCompile Include="project\core\features\movement\impl\fastladder.cpp" />
     <ClCompile Include="project\core\features\movement\impl\jumpbug.cpp" />
+    <ClCompile Include="project\core\features\movement\impl\mini_jump.cpp" />
     <ClCompile Include="project\core\features\movement\impl\slowwalk.cpp" />
+    <ClCompile Include="project\core\features\movement\impl\test_strafer.cpp" />
     <ClCompile Include="project\core\features\world\impl\scene.cpp" />
     <ClCompile Include="project\core\features\world\impl\smoke.cpp" />
     <ClCompile Include="project\core\features\world\impl\weather.cpp" />
     <ClCompile Include="project\core\hooks\impl\cheat.cpp" />
     <ClCompile Include="project\core\hooks\impl\utility.cpp" />
-    <ClCompile Include="project\core\hooks\impl\vac.cpp" />
     <ClCompile Include="project\core\rendering\impl\context.cpp" />
     <ClCompile Include="project\core\rendering\impl\fonts.cpp" />
     <ClCompile Include="project\core\rendering\impl\menu\menu.config.cpp" />
@@ -222,13 +226,11 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Development|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Ship|x64'">Create</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="project\protection\protection.cpp" />
     <ClCompile Include="project\protection\patterns.cpp" />
     <ClCompile Include="project\utilities\addresses\impl\functions.cpp" />
     <ClCompile Include="project\utilities\addresses\impl\globals.cpp" />
     <ClCompile Include="project\utilities\addresses\impl\interfaces\engine_cvar.cpp" />
     <ClCompile Include="project\utilities\addresses\impl\modules.cpp" />
-    <ClCompile Include="project\utilities\bootstrap\bootstrap.cpp" />
     <ClCompile Include="project\utilities\hooking\impl\allocator.cpp" />
     <ClCompile Include="project\utilities\hooking\impl\jmp.cpp" />
     <ClCompile Include="project\utilities\hooking\impl\manager.cpp" />
@@ -244,6 +246,7 @@
     <ClCompile Include="project\utilities\security\impl\regions.cpp" />
     <ClCompile Include="project\utilities\steam\impl\friends.cpp" />
     <ClCompile Include="project\utilities\steam\impl\http.cpp" />
+    <ClCompile Include="project\utilities\steam\impl\user.cpp" />
     <ClCompile Include="project\utilities\steam\impl\utils.cpp" />
     <ClCompile Include="project\utilities\threadpool\threadpool.cpp" />
   </ItemGroup>
@@ -257,6 +260,10 @@
     <ClInclude Include="project\core\features\world\world.hpp" />
     <ClInclude Include="project\core\hooks\hooks.hpp" />
     <ClInclude Include="project\core\rendering\rendering.hpp" />
+    <ClInclude Include="project\core\resources\fonts\inter.hpp" />
+    <ClInclude Include="project\core\resources\fonts\pixel7.hpp" />
+    <ClInclude Include="project\core\resources\particles\effects.hpp" />
+    <ClInclude Include="project\core\resources\particles\weather.hpp" />
     <ClInclude Include="project\core\settings.hpp" />
     <ClInclude Include="project\core\systems\systems.hpp" />
     <ClInclude Include="project\external\bc7.hpp" />
@@ -308,65 +315,9 @@
     <ClInclude Include="project\external\phnt\usermgr.h" />
     <ClInclude Include="project\external\phnt\winsta.h" />
     <ClInclude Include="project\external\poly2d.hpp" />
-    <ClInclude Include="project\external\rpack.hpp" />
     <ClInclude Include="project\external\stackwalker\stackwalker.hpp" />
     <ClInclude Include="project\external\xdraw\dependencies\fonts.hpp" />
     <ClInclude Include="project\external\xdraw\dependencies\freetype\include.hpp" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\config\ftconfig.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\config\ftheader.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\config\ftmodule.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\config\ftoption.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\config\ftstdlib.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\config\integer-types.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\config\mac-support.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\config\public-macros.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\freetype.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftadvanc.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftbbox.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftbdf.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftbitmap.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftbzip2.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftcache.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftchapters.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftcid.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftcolor.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftdriver.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\fterrdef.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\fterrors.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftfntfmt.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftgasp.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftglyph.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftgxval.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftgzip.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftimage.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftincrem.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftlcdfil.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftlist.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftlogging.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftlzw.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftmac.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftmm.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftmodapi.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftmoderr.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftotval.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftoutln.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftparams.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftpfr.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftrender.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftsizes.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftsnames.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftstroke.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftsynth.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftsystem.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\fttrigon.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\fttypes.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ftwinfnt.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\otsvg.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\t1tables.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\ttnameid.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\tttables.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\freetype\tttags.h" />
-    <ClInclude Include="project\external\xdraw\dependencies\freetype\x\ft2build.h" />
     <ClInclude Include="project\external\xdraw\dependencies\nanosvg\include.hpp" />
     <ClInclude Include="project\external\xdraw\dependencies\nanosvg\x\nanosvg.h" />
     <ClInclude Include="project\external\xdraw\dependencies\nanosvg\x\nanosvgrast.h" />
@@ -378,14 +329,12 @@
     <ClInclude Include="project\pch\pch.hpp" />
     <ClInclude Include="project\protection\game_addresses.hpp" />
     <ClInclude Include="project\protection\patterns.hpp" />
-    <ClInclude Include="project\protection\protection.hpp" />
-    <ClInclude Include="project\protection\protection_hash.hpp" />
     <ClInclude Include="project\utilities\addresses\addresses.hpp" />
     <ClInclude Include="project\utilities\addresses\interfaces.hpp" />
-    <ClInclude Include="project\utilities\bootstrap\bootstrap.hpp" />
     <ClInclude Include="project\utilities\animation.hpp" />
     <ClInclude Include="project\utilities\cstypes.hpp" />
     <ClInclude Include="project\utilities\fnv1a.hpp" />
+    <ClInclude Include="project\utilities\game_path.hpp" />
     <ClInclude Include="project\utilities\hooking\hooking.hpp" />
     <ClInclude Include="project\utilities\logging\logging.hpp" />
     <ClInclude Include="project\utilities\math\math.hpp" />
@@ -397,14 +346,15 @@
     <ClInclude Include="project\utilities\threadpool\threadpool.hpp" />
   </ItemGroup>
   <ItemGroup>
-    <Library Include="project\external\xdraw\dependencies\freetype\x\freetype.lib" />
-  </ItemGroup>
-  <ItemGroup>
     <None Include=".editorconfig" />
     <None Include="project\external\inline-syscall\inline_syscall.inl" />
-    <None Include="project\protection\impl\protection.inl" />
+    <None Include="vcpkg.json" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="$(VcpkgRoot)scripts\buildsystems\msbuild\vcpkg.targets" Condition="'$(VelocityImportVcpkg)'=='true'" />
+  <Target Name="EnsureVcpkgAvailable" BeforeTargets="PrepareForBuild" Condition="'$(VcpkgPropsImported)'!='true'">
+    <Error Text="vcpkg was not found. Install the Visual Studio vcpkg component or set VCPKG_ROOT to a vcpkg installation." />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>

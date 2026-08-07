@@ -15,6 +15,7 @@ namespace features::misc {
 
 	namespace detail {
 
+		constexpr std::uint32_t invalid_particle_effect{ static_cast<std::uint32_t>( -1 ) };
 		constexpr std::uint8_t k_periwinkle_start_r{ 130 };
 		constexpr std::uint8_t k_periwinkle_start_g{ 160 };
 		constexpr std::uint8_t k_periwinkle_start_b{ 240 };
@@ -32,26 +33,50 @@ namespace features::misc {
 			return std::format( "<font color='#CCCCCC'>{}</font>", text );
 		}
 
+		// Whole-message solid colors: kill = green, hit = yellow, miss = red;
+		// the brand prefix rendered by chat_print keeps its periwinkle
+		// gradient.
+		[[nodiscard]] std::string chat_hit( std::string_view text )
+		{
+			return std::format( "<font color='#55FF55'>{}</font>", text );
+		}
+
+		[[nodiscard]] std::string chat_hit_yellow( std::string_view text )
+		{
+			return std::format( "<font color='#FFD700'>{}</font>", text );
+		}
+
+		[[nodiscard]] std::string chat_miss( std::string_view text )
+		{
+			return std::format( "<font color='#FF5555'>{}</font>", text );
+		}
+
+		// kill (health <= 0) = green, otherwise yellow.
+		[[nodiscard]] std::string chat_hit_colored( std::string_view text, int health )
+		{
+			return health <= 0 ? chat_hit( text ) : chat_hit_yellow( text );
+		}
+
 		[[nodiscard]] std::string format_hit_chat_message( const std::string& name, int damage, const std::string& hitgroup, int health, const std::string& reason = {} )
 		{
 			const auto damage_str = std::to_string( damage );
 
 			if ( !reason.empty( ) )
 			{
-				return chat_dim( "hit " ) + chat_white( name ) + chat_dim( " for " ) + chat_white( damage_str ) + chat_dim( " in " ) + chat_white( hitgroup ) + chat_dim( std::format( ", {} ({} remaining)", reason, health ) );
+				return chat_hit_colored( std::format( "命中 {} 造成 {} 伤害（{}），{}（剩余 {}）", name, damage_str, hitgroup, reason, health ), health );
 			}
 
-			return chat_dim( "hit " ) + chat_white( name ) + chat_dim( " for " ) + chat_white( damage_str ) + chat_dim( " in " ) + chat_white( hitgroup ) + chat_dim( std::format( " ({} remaining)", health ) );
+			return chat_hit_colored( std::format( "命中 {} 造成 {} 伤害（{}）（剩余 {}）", name, damage_str, hitgroup, health ), health );
 		}
 
 		[[nodiscard]] std::string format_knife_chat_message( const std::string& name, int damage, int health )
 		{
-			return chat_dim( "knifed " ) + chat_white( name ) + chat_dim( " for " ) + chat_white( std::to_string( damage ) ) + chat_dim( std::format( " ({} remaining)", health ) );
+			return chat_hit_colored( std::format( "刀杀 {} 造成 {} 伤害（剩余 {}）", name, damage, health ), health );
 		}
 
 		[[nodiscard]] std::string format_taser_chat_message( const std::string& name )
 		{
-			return chat_dim( "zapped the fuck out of " ) + chat_white( name );
+			return chat_hit_yellow( std::format( "电击了 {}", name ) );
 		}
 
 		[[nodiscard]] std::string make_gradient_label( const char* text, std::uint8_t sr, std::uint8_t sg, std::uint8_t sb, std::uint8_t er, std::uint8_t eg, std::uint8_t eb )
@@ -83,7 +108,11 @@ namespace features::misc {
 		void chat_print( const char* label_text, std::uint8_t sr, std::uint8_t sg, std::uint8_t sb, std::uint8_t er, std::uint8_t eg, std::uint8_t eb, const char* msg )
 		{
 			const auto local = systems::g_local.get( );
-			if ( !local.is_valid( ) || !local.is_alive || systems::g_local.is_in_cinematic( ) || !local.pawn )
+			// Miss/hit confirmations resolve 0.35-1s after the shot, so the
+			// local player can be dead by the time the log fires. The chat
+			// is still visible in death cam - keep sending instead of
+			// silently dropping the log.
+			if ( !local.is_valid( ) || systems::g_local.is_in_cinematic( ) || !local.pawn )
 			{
 				return;
 			}
@@ -101,7 +130,12 @@ namespace features::misc {
 			std::snprintf( buf, sizeof( buf ), "%s <font color='#CCCCCC'>- </font>%s", label.c_str( ), msg );
 
 			std::uint8_t flags[ 2 ]{ 1, 0 };
-			memory::call<void>( PATTERN (patterns::set_voice_data), voice, buf, 0xFFFFFFFF, flags );
+
+			const auto set_voice_data = PATTERN( patterns::set_voice_data );
+			if ( set_voice_data )
+			{
+				memory::call<void>(set_voice_data, voice, buf, 0xFFFFFFFF, flags );
+			}
 		}
 
 		void chat_print_velocity( const char* msg )
@@ -122,6 +156,9 @@ namespace features::misc {
 
 	void impacts::on_frame_stage_notify( )
 	{
+		// Frame-stage updates can overlap Present, which renders the same impact vectors.
+		std::unique_lock lock( this->m_mtx );
+
 		if ( this->m_buffered_impact_time > 0.0f )
 		{
 			this->flush_buffered_impacts( );
@@ -141,7 +178,6 @@ namespace features::misc {
 		this->m_bullet_impacts.clear( );
 		this->m_buffered_impacts.clear( );
 		this->m_buffered_impact_time = -1.0f;
-		this->m_last_event.reset( );
 		this->m_hit_effect_time = 0.0f;
 	}
 
@@ -169,6 +205,11 @@ namespace features::misc {
 		}
 
 		const auto position = memory::read<math::vector3>( msg + 0x18 );
+		if ( !std::isfinite( position.x ) || !std::isfinite( position.y ) || !std::isfinite( position.z ) || position.length_sqr( ) < 1.0f )
+		{
+			return;
+		}
+
 		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
 		const auto current_time = memory::read<float>( global_vars + 0x30 );
 
@@ -202,11 +243,26 @@ namespace features::misc {
 		{
 			const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
 			const auto current_time = memory::read<float>( global_vars + 0x30 );
+			auto position = math::vector3{};
+			auto has_position{ false };
+
+			// Report-hit contains the most accurate contact point, but it is not
+			// guaranteed to arrive before player_hurt. Use it when available and
+			// fall back to the confirmed shot impact or the victim's position.
+			const auto game_scene_node = memory::read<std::uintptr_t>( data.victim_pawn + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
+			if ( game_scene_node )
+			{
+				const auto origin = memory::read<math::vector3>( game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
+				const auto view_offset = memory::read<math::vector3>( data.victim_pawn + SCHEMA( "C_BaseModelEntity", "m_vecViewOffset"_hash ) );
+
+				position = origin + view_offset * 0.75f;
+				has_position = true;
+			}
 
 			std::unique_lock lock( this->m_mtx );
 
 			auto best_idx{ SIZE_MAX };
-			auto best_diff{ 0.1f };
+			auto best_diff{ 0.5f };
 
 			for ( auto i = 0ull; i < this->m_pending_hits.size( ); ++i )
 			{
@@ -220,8 +276,25 @@ namespace features::misc {
 
 			if ( best_idx != SIZE_MAX )
 			{
-				const auto position = this->m_pending_hits[ best_idx ].position;
+				position = this->m_pending_hits[ best_idx ].position;
+				has_position = true;
 				this->m_pending_hits.erase( this->m_pending_hits.begin( ) + best_idx );
+			}
+			else
+			{
+				for ( auto it = this->m_pending_shots.rbegin( ); it != this->m_pending_shots.rend( ); ++it )
+				{
+					if ( it->victim_pawn == data.victim_pawn && it->impact_confirmed && current_time - it->impact_time <= 1.0f )
+					{
+						position = it->impact_position;
+						has_position = true;
+						break;
+					}
+				}
+			}
+
+			if ( has_position )
+			{
 				this->m_hitmarkers.push_back( { position, current_time, data.damage } );
 
 				if ( this->m_hitmarkers.size( ) > 10 )
@@ -280,28 +353,90 @@ namespace features::misc {
 
 		{
 			std::unique_lock lock( this->m_mtx );
+			const auto pos = math::vector3{ x, y, z };
+			const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
+			const auto current_time = memory::read<float>( global_vars + 0x30 );
+			shot_record* matched_shot{};
+			auto best_score{ -FLT_MAX };
 
-			for ( auto it = this->m_pending_shots.begin( ); it != this->m_pending_shots.end( ); ++it )
+			// Server shot callbacks and bullet-impact events preserve command order.
+			// Match the oldest shot that does not have an impact before considering
+			// extra impacts from an already matched shot.
+			for ( auto& shot : this->m_pending_shots )
 			{
-				if ( !it->resolved )
+				if ( shot.resolved || shot.impact_confirmed )
 				{
-					const auto pos = math::vector3{ x, y, z };
-					const auto target_origin = it->skeleton[ 0 ].position;
-					const auto dist_sq = ( pos - target_origin ).length_sqr( );
+					continue;
+				}
 
-					if ( !it->impact_confirmed || dist_sq < it->best_impact_dist_sq )
+				const auto age = current_time - shot.time;
+				if ( age < -0.05f || age > 1.0f )
+				{
+					continue;
+				}
+
+				const auto origin = shot.server_shoot_position_confirmed ? shot.server_shoot_position : shot.shoot_position;
+				const auto impact_delta = pos - origin;
+				if ( impact_delta.length_sqr( ) < 1.0f )
+				{
+					continue;
+				}
+
+				math::vector3 expected_direction{};
+				math::helpers::angle_vectors_left( shot.aim_angle, &expected_direction );
+				const auto alignment = expected_direction.dot( impact_delta.normalized( ) );
+				if ( alignment > -0.25f )
+				{
+					matched_shot = &shot;
+					break;
+				}
+			}
+
+			if ( !matched_shot )
+			{
+				for ( auto& shot : this->m_pending_shots )
+				{
+					if ( shot.resolved || !shot.impact_confirmed )
 					{
-						it->impact_position = pos;
-						it->best_impact_dist_sq = dist_sq;
-						it->impact_time = memory::read<float>( memory::read<std::uintptr_t>( addresses::globals::global_vars ) + 0x30 );
-
-						if ( !it->impact_confirmed )
-						{
-							it->impact_confirmed = true;
-						}
+						continue;
 					}
 
-					break;
+					const auto age = current_time - shot.time;
+					if ( age < -0.05f || age > 1.0f )
+					{
+						continue;
+					}
+
+					const auto origin = shot.server_shoot_position_confirmed ? shot.server_shoot_position : shot.shoot_position;
+					const auto impact_delta = pos - origin;
+					if ( impact_delta.length_sqr( ) < 1.0f )
+					{
+						continue;
+					}
+
+					math::vector3 expected_direction{};
+					math::helpers::angle_vectors_left( shot.aim_angle, &expected_direction );
+					const auto score = expected_direction.dot( impact_delta.normalized( ) ) * 4.0f - std::fabs( age );
+
+					if ( score > best_score )
+					{
+						best_score = score;
+						matched_shot = &shot;
+					}
+				}
+			}
+
+			if ( matched_shot )
+			{
+				const auto target_origin = matched_shot->skeleton[ 0 ].position;
+				const auto dist_sq = ( pos - target_origin ).length_sqr( );
+
+				if ( !matched_shot->impact_confirmed || dist_sq < matched_shot->best_impact_dist_sq )
+				{
+					matched_shot->impact_position = pos;
+					matched_shot->best_impact_dist_sq = dist_sq;
+					matched_shot->impact_time = current_time;
+					matched_shot->impact_confirmed = true;
 				}
 			}
 
@@ -405,41 +540,39 @@ namespace features::misc {
 		}
 	}
 
-	void impacts::on_boom( std::uintptr_t victim_pawn, int hitgroup, float damage, float hitchance, float inaccuracy, const math::vector3& aim_angle, const math::vector3& shoot_position, int tick, const std::array<systems::bones::data, 27>& skeleton, bool forced )
+	void impacts::on_boom( const shot_parameters& params )
 	{
 		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
 		const auto current_time = memory::read<float>( global_vars + 0x30 );
 
 		std::unique_lock lock( this->m_mtx );
 
-		for ( const auto& shot : this->m_pending_shots )
-		{
-			if ( shot.victim_pawn == victim_pawn )
-			{
-				return;
-			}
-		}
-
-		const auto target_velocity = memory::read<math::vector3>( victim_pawn + SCHEMA( "C_BaseEntity", "m_vecVelocity"_hash ) );
+		const auto target_velocity = memory::read<math::vector3>( params.victim_pawn + SCHEMA( "C_BaseEntity", "m_vecVelocity"_hash ) );
 
 		this->m_pending_shots.push_back(
 			{
-				.victim_pawn = victim_pawn,
-				.hitgroup = hitgroup,
-				.damage = damage,
-				.hitchance = hitchance,
-				.predicted_inaccuracy = inaccuracy,
+				.victim_pawn = params.victim_pawn,
+				.hitgroup = params.hitgroup,
+				.damage = params.damage,
+				.hitchance = params.hitchance,
+				.predicted_inaccuracy = params.inaccuracy,
+				.predicted_spread = params.spread,
 				.server_inaccuracy = 0.0f,
-				.aim_angle = aim_angle,
-				.shoot_position = shoot_position,
-				.tick = tick,
+				.aim_angle = params.aim_angle,
+				.aim_position = params.aim_position,
+				.shoot_position = params.shoot_position,
+				.tick = params.tick,
+				.stamp_tick = params.stamp_tick,
 				.time = current_time,
-				.skeleton = skeleton,
+				.skeleton = params.skeleton,
 				.resolved = false,
 				.server_confirmed = false,
 				.impact_confirmed = false,
 				.target_velocity = target_velocity,
-				.forced = forced,
+				.forced = params.forced,
+				.extrapolated = params.extrapolated,
+				.seed_mode = params.seed_mode,
+				.dt = params.dt,
 				.weapon_type = features::combat::g_shared.ctx( ).weapon_type,
 			} );
 
@@ -449,55 +582,34 @@ namespace features::misc {
 		}
 	}
 
-	std::optional<impacts::recent_event> impacts::poll_event( )
-	{
-		std::unique_lock lock( this->m_mtx );
-		if ( !this->m_last_event.has_value( ) )
-		{
-			return std::nullopt;
-		}
-
-		auto ev = std::move( this->m_last_event.value( ) );
-		this->m_last_event.reset( );
-		return ev;
-	}
-
-	std::optional<impacts::recent_event> impacts::peek_event( ) const
-	{
-		std::unique_lock lock( this->m_mtx );
-		return this->m_last_event;
-	}
-
 	const char* impacts::classify_shot_deviation( const shot_record& shot ) const
 	{
 		if ( !shot.impact_confirmed )
 		{
-			return "death";
+			return "未知";
 		}
 
 		if ( shot.server_confirmed && std::fabsf( shot.server_inaccuracy - shot.predicted_inaccuracy ) > 0.003f )
 		{
-			return "prediction error";
+			return "预测偏差";
 		}
 
-		//if ( shot.server_shoot_position_confirmed )
-		//{
-		//	const auto pos_delta = ( shot.server_shoot_position - shot.shoot_position ).length( );
-		//	if ( pos_delta > 1.0f )
-		//	{
-		//		return "shoot position error (server mismatch)";
-		//	}
-		//}
+		if ( shot.server_shoot_position_confirmed && ( shot.server_shoot_position - shot.shoot_position ).length_sqr( ) > 1.0f )
+		{
+			return "射击位置不匹配";
+		}
+
+		const auto shoot_position = shot.server_shoot_position_confirmed ? shot.server_shoot_position : shot.shoot_position;
 
 		math::vector3 ideal_forward{};
 		math::helpers::angle_vectors_left( shot.aim_angle, &ideal_forward );
 
-		const auto to_impact = shot.impact_position - shot.shoot_position;
+		const auto to_impact = shot.impact_position - shoot_position;
 		const auto impact_dist = to_impact.length( );
 
 		if ( impact_dist <= 0.1f )
 		{
-			return "impact too close to origin (likely penetration)";
+			return "弹着点过近（可能穿透）";
 		}
 
 		const auto impact_dir = to_impact * ( 1.0f / impact_dist );
@@ -505,52 +617,51 @@ namespace features::misc {
 		const auto angular_deviation = std::acosf( std::clamp( dot, -1.0f, 1.0f ) );
 
 		const auto inaccuracy = shot.server_confirmed ? shot.server_inaccuracy : shot.predicted_inaccuracy;
-		const auto max_spread_angle = std::atanf( inaccuracy ) * 2.0f;
+		const auto max_spread_angle = std::atanf( std::max( inaccuracy, 0.0f ) + std::max( shot.predicted_spread, 0.0f ) );
+		const auto impact_mismatch_angle = std::max( max_spread_angle * 3.0f, math::helpers::deg_to_rad( 2.0f ) );
 
 		const auto hitbox_dist = this->distance_to_nearest_hitbox( shot );
 		const auto ray_dist = this->ray_distance_to_nearest_hitbox( shot, impact_dir );
-		const auto target_dist = ( shot.skeleton[ 0 ].position - shot.shoot_position ).length( );
+		const auto ideal_ray_dist = this->ray_distance_to_nearest_hitbox( shot, ideal_forward );
+		const auto target_dist = ( shot.skeleton[ 0 ].position - shoot_position ).length( );
 
-		if ( angular_deviation > max_spread_angle * 0.5f )
+		// The scalar cone is only an estimate of the server's shot state. Reserve
+		// this label for an impact that clearly belongs to another direction;
+		// smaller deviations are classified from their hitbox geometry below.
+		if ( angular_deviation > impact_mismatch_angle )
 		{
-			return "spread";
+			return "弹着点偏差";
 		}
 
-		if ( ray_dist < 8.0f && impact_dist > target_dist * 1.1f )
+		if ( ideal_ray_dist <= 1.0f && impact_dist < target_dist * 0.85f )
+		{
+			return "障碍";
+		}
+
+		// If the server impact ray misses the saved hitboxes, weapon spread is
+		// already sufficient to explain the miss. Do not blame lag compensation
+		// merely because it passed within several units of the target.
+		if ( ray_dist > 1.0f )
+		{
+			return "散布";
+		}
+
+		if ( impact_dist > target_dist * 1.05f )
 		{
 			if ( shot.target_velocity.length_2d( ) < 5.0f )
 			{
-				//if ( shot.server_shoot_position_confirmed )
-				//{
-				//	const auto pos_delta = ( shot.server_shoot_position - shot.shoot_position ).length( );
-				//	if ( pos_delta > 0.1f )
-				//	{
-				//		return "shoot position error (minor)";
-				//	}
-				//}
-
-				return "spread";
+			return "服务器偏差";
 			}
 
-			return "lag compensation";
-		}
-
-		if ( ray_dist < 8.0f && hitbox_dist > 16.0f && impact_dist < target_dist * 0.85f )
-		{
-			return "occlusion";
+			return "延迟补偿偏差";
 		}
 
 		if ( hitbox_dist > 16.0f )
 		{
-			return "spread";
+			return "散布";
 		}
 
-		if ( ray_dist >= 8.0f )
-		{
-			return "near miss (likely spread)";
-		}
-
-		return "unforseen circumstances";
+		return "服务器偏差";
 	}
 
 	impacts::hit_data impacts::parse_event( std::uintptr_t event )
@@ -587,6 +698,8 @@ namespace features::misc {
 		auto expected_damage{ 0.0f };
 		auto was_aimbot{ false };
 		auto weapon_type{ 0u };
+		auto backtrack_ticks{ 0 };
+		math::vector3 aim_position{};
 		std::string mismatch_reason{};
 		math::vector3 impact_pos{};
 
@@ -598,29 +711,40 @@ namespace features::misc {
 				impact_pos = this->m_pending_hits.back( ).position;
 			}
 
+			auto matched_shot = this->m_pending_shots.end( );
 			for ( auto it = this->m_pending_shots.begin( ); it != this->m_pending_shots.end( ); ++it )
 			{
-				if ( it->victim_pawn == victim_pawn && !it->resolved )
+				if ( it->victim_pawn != victim_pawn || it->resolved )
 				{
-					const auto is_knife_or_taser = it->weapon_type == cstypes::weapon_type::knife || it->weapon_type == cstypes::weapon_type::taser;
-					if ( !is_knife_or_taser && !it->server_confirmed )
-					{
-						continue;
-					}
+					continue;
+				}
 
-					expected_hitgroup = it->hitgroup;
-					was_aimbot = true;
-					weapon_type = it->weapon_type;
-					expected_damage = it->damage;
+				if ( matched_shot == this->m_pending_shots.end( ) ||
+					( it->impact_confirmed && ( !matched_shot->impact_confirmed || it->impact_time > matched_shot->impact_time ) ) )
+				{
+					matched_shot = it;
+				}
+			}
 
-					it->resolved = true;
+			if ( matched_shot != this->m_pending_shots.end( ) )
+			{
+				expected_hitgroup = matched_shot->hitgroup;
+				was_aimbot = true;
+				weapon_type = matched_shot->weapon_type;
+				expected_damage = matched_shot->damage;
+				backtrack_ticks = std::max( matched_shot->stamp_tick - matched_shot->tick, 0 );
+				aim_position = matched_shot->aim_position;
+				matched_shot->resolved = true;
 
-					if ( expected_hitgroup > 0 && hitgroup != expected_hitgroup )
-					{
-						mismatch_reason = this->classify_shot_deviation( *it );
-					}
+				// Seed-mode hit confirmation feeds the seed-sync verdict.
+				if ( matched_shot->seed_mode )
+				{
+					features::combat::g_shared.note_seed_shot( true );
+				}
 
-					break;
+				if ( expected_hitgroup > 0 && hitgroup != expected_hitgroup )
+				{
+					mismatch_reason = this->classify_shot_deviation( *matched_shot );
 				}
 			}
 		}
@@ -656,6 +780,9 @@ namespace features::misc {
 			.health = memory::call<int>( PATTERN (patterns::game_event_get_int), event, "health", false ),
 			.hitgroup = hitgroup,
 			.expected_hitgroup = expected_hitgroup,
+			.backtrack_ticks = backtrack_ticks,
+			.aim_position = aim_position,
+			.impact_position = impact_pos,
 			.was_aimbot = was_aimbot,
 			.mismatch_reason = std::move( mismatch_reason ),
 			.weapon_type = weapon_type,
@@ -718,7 +845,7 @@ namespace features::misc {
 
 		for ( const auto& entry : hitbox_set )
 		{
-			if ( entry.bone < 0 || entry.bone >= 28 )
+			if ( entry.bone < 0 || entry.bone >= static_cast< int >( shot.skeleton.size( ) ) )
 			{
 				continue;
 			}
@@ -729,21 +856,33 @@ namespace features::misc {
 				continue;
 			}
 
-			const auto capsule_start = bone.rotation.rotate_vector( entry.mins ) + bone.position;
-			const auto capsule_end = bone.rotation.rotate_vector( entry.maxs ) + bone.position;
-
-			const auto seg = capsule_end - capsule_start;
-			const auto seg_len_sqr = seg.length_sqr( );
-
-			auto t{ 0.0f };
-
-			if ( seg_len_sqr > 0.001f )
+			auto dist{ FLT_MAX };
+			if ( entry.radius > 0.001f )
 			{
-				t = std::clamp( ( shot.impact_position - capsule_start ).dot( seg ) / seg_len_sqr, 0.0f, 1.0f );
+				const auto capsule_start = bone.rotation.rotate_vector( entry.mins ) + bone.position;
+				const auto capsule_end = bone.rotation.rotate_vector( entry.maxs ) + bone.position;
+				const auto segment = capsule_end - capsule_start;
+				const auto segment_length_sq = segment.length_sqr( );
+				const auto t = segment_length_sq > 0.001f
+					? std::clamp( ( shot.impact_position - capsule_start ).dot( segment ) / segment_length_sq, 0.0f, 1.0f )
+					: 0.0f;
+				dist = ( shot.impact_position - ( capsule_start + segment * t ) ).length( ) - entry.radius;
 			}
-
-			const auto closest = capsule_start + seg * t;
-			const auto dist = ( shot.impact_position - closest ).length( ) - entry.radius;
+			else
+			{
+				auto inverse = bone.rotation;
+				inverse.x = -inverse.x;
+				inverse.y = -inverse.y;
+				inverse.z = -inverse.z;
+				const auto local = inverse.rotate_vector( shot.impact_position - bone.position );
+				const math::vector3 closest
+				{
+					std::clamp( local.x, entry.mins.x, entry.maxs.x ),
+					std::clamp( local.y, entry.mins.y, entry.maxs.y ),
+					std::clamp( local.z, entry.mins.z, entry.maxs.z )
+				};
+				dist = ( local - closest ).length( );
+			}
 
 			if ( dist < best_dist )
 			{
@@ -769,10 +908,11 @@ namespace features::misc {
 		}
 
 		auto best_dist{ FLT_MAX };
+		const auto shoot_position = shot.server_shoot_position_confirmed ? shot.server_shoot_position : shot.shoot_position;
 
 		for ( const auto& entry : hitbox_set )
 		{
-			if ( entry.bone < 0 || entry.bone >= 28 )
+			if ( entry.bone < 0 || entry.bone >= static_cast< int >( shot.skeleton.size( ) ) )
 			{
 				continue;
 			}
@@ -783,20 +923,76 @@ namespace features::misc {
 				continue;
 			}
 
-			const auto capsule_start = bone.rotation.rotate_vector( entry.mins ) + bone.position;
-			const auto capsule_end = bone.rotation.rotate_vector( entry.maxs ) + bone.position;
-			const auto capsule_center = ( capsule_start + capsule_end ) * 0.5f;
-
-			const auto to_center = capsule_center - shot.shoot_position;
-			const auto proj = to_center.dot( direction );
-
-			if ( proj < 0.0f )
+			auto dist{ FLT_MAX };
+			if ( entry.radius > 0.001f )
 			{
-				continue;
-			}
+				const auto capsule_start = bone.rotation.rotate_vector( entry.mins ) + bone.position;
+				const auto capsule_end = bone.rotation.rotate_vector( entry.maxs ) + bone.position;
+				const auto segment = capsule_end - capsule_start;
+				const auto to_start = capsule_start - shoot_position;
+				const auto perpendicular_segment = segment - direction * segment.dot( direction );
+				const auto perpendicular_start = to_start - direction * to_start.dot( direction );
+				const auto perpendicular_length_sq = perpendicular_segment.length_sqr( );
+				auto segment_t = perpendicular_length_sq > 1.0e-6f
+					? std::clamp( -perpendicular_start.dot( perpendicular_segment ) / perpendicular_length_sq, 0.0f, 1.0f )
+					: 0.0f;
+				auto segment_point = capsule_start + segment * segment_t;
+				auto ray_t = ( segment_point - shoot_position ).dot( direction );
 
-			const auto closest_on_ray = shot.shoot_position + direction * proj;
-			const auto dist = ( capsule_center - closest_on_ray ).length( ) - entry.radius;
+				if ( ray_t < 0.0f )
+				{
+					const auto segment_length_sq = segment.length_sqr( );
+					segment_t = segment_length_sq > 1.0e-6f
+						? std::clamp( ( shoot_position - capsule_start ).dot( segment ) / segment_length_sq, 0.0f, 1.0f )
+						: 0.0f;
+					segment_point = capsule_start + segment * segment_t;
+					ray_t = 0.0f;
+				}
+
+				const auto ray_point = shoot_position + direction * ray_t;
+				dist = ( segment_point - ray_point ).length( ) - entry.radius;
+			}
+			else
+			{
+				auto inverse = bone.rotation;
+				inverse.x = -inverse.x;
+				inverse.y = -inverse.y;
+				inverse.z = -inverse.z;
+				const auto local_origin = inverse.rotate_vector( shoot_position - bone.position );
+				const auto local_direction = inverse.rotate_vector( direction );
+				auto entry_t{ 0.0f };
+				auto exit_t{ FLT_MAX };
+
+				const auto intersect_axis = [ & ]( float origin, float delta, float minimum, float maximum )
+				{
+					if ( std::fabs( delta ) < 1.0e-8f )
+					{
+						return origin >= minimum && origin <= maximum;
+					}
+
+					auto first = ( minimum - origin ) / delta;
+					auto second = ( maximum - origin ) / delta;
+					if ( first > second ) std::swap( first, second );
+					entry_t = std::max( entry_t, first );
+					exit_t = std::min( exit_t, second );
+					return entry_t <= exit_t;
+				};
+
+				if ( intersect_axis( local_origin.x, local_direction.x, entry.mins.x, entry.maxs.x ) &&
+					intersect_axis( local_origin.y, local_direction.y, entry.mins.y, entry.maxs.y ) &&
+					intersect_axis( local_origin.z, local_direction.z, entry.mins.z, entry.maxs.z ) )
+				{
+					dist = 0.0f;
+				}
+				else
+				{
+					const auto center = ( entry.mins + entry.maxs ) * 0.5f;
+					const auto extents = ( entry.maxs - entry.mins ) * 0.5f;
+					const auto to_center = center - local_origin;
+					const auto projection = std::max( to_center.dot( local_direction ), 0.0f );
+					dist = std::max( ( to_center - local_direction * projection ).length( ) - extents.length( ), 0.0f );
+				}
+			}
 
 			if ( dist < best_dist )
 			{
@@ -833,11 +1029,23 @@ namespace features::misc {
 		if ( data.was_aimbot && !data.mismatch_reason.empty( ) )
 		{
 			const auto expected_name = systems::g_hitboxes.hitgroup_to_name( data.expected_hitgroup );
-			entry.reason = std::format( "{} was expected ({})", expected_name, data.mismatch_reason );
+			entry.reason = std::format( "预期 {}（{}，回溯 {}t）", expected_name, data.mismatch_reason, data.backtrack_ticks );
 		}
 		else if ( data.was_aimbot && data.health > 0 && data.expected_damage > 0.0f && static_cast< float >( data.damage ) < data.expected_damage )
 		{
-			entry.reason = std::format( "expected {:.0f} damage, dealt {}", data.expected_damage, data.damage );
+			entry.reason = std::format( "预期 {} 伤害，实际 {}（回溯 {}t）", data.expected_damage, data.damage, data.backtrack_ticks );
+		}
+
+		// When the actual hit landed off the point the aimbot aimed at,
+		// note the offset (same hitgroup but a grazing hit, or spread drift).
+		if ( data.was_aimbot && data.aim_position.length_sqr( ) > 1.0f && data.impact_position.length_sqr( ) > 1.0f )
+		{
+			const auto offset = ( data.impact_position - data.aim_position ).length( );
+			if ( offset > 5.0f )
+			{
+				const auto offset_note = std::format( "弹着偏移 {:.0f}u（瞄准点偏差）", offset );
+				entry.reason = entry.reason.empty( ) ? offset_note : entry.reason + "，" + offset_note;
+			}
 		}
 
 		if ( cfg.console_log.value || cfg.chat_log.value )
@@ -847,28 +1055,31 @@ namespace features::misc {
 
 			if ( data.weapon_type == cstypes::weapon_type::taser )
 			{
-				plain_msg = std::format( "zapped the fuck out of {}", entry.name );
+				plain_msg = std::format( "电击了 {}", entry.name );
 				chat_msg = detail::format_taser_chat_message( entry.name );
 			}
 			else if ( data.weapon_type == cstypes::weapon_type::knife )
 			{
-				plain_msg = std::format( "knifed {} for {} ({} remaining)", entry.name, entry.damage, entry.health );
+				plain_msg = std::format( "刀杀 {} 造成 {} 伤害（剩余 {}）", entry.name, entry.damage, entry.health );
 				chat_msg = detail::format_knife_chat_message( entry.name, entry.damage, entry.health );
 			}
 			else if ( !entry.reason.empty( ) )
 			{
-				plain_msg = std::format( "hit {} for {} in {}, {} ({} remaining)", entry.name, entry.damage, entry.hitgroup, entry.reason, entry.health );
+				plain_msg = std::format( "命中 {} 造成 {} 伤害（{}），{}（剩余 {}）", entry.name, entry.damage, entry.hitgroup, entry.reason, entry.health );
 				chat_msg = detail::format_hit_chat_message( entry.name, entry.damage, entry.hitgroup, entry.health, entry.reason );
 			}
 			else
 			{
-				plain_msg = std::format( "hit {} for {} in {} ({} remaining)", entry.name, entry.damage, entry.hitgroup, entry.health );
+				plain_msg = std::format( "命中 {} 造成 {} 伤害（{}）（剩余 {}）", entry.name, entry.damage, entry.hitgroup, entry.health );
 				chat_msg = detail::format_hit_chat_message( entry.name, entry.damage, entry.hitgroup, entry.health );
 			}
 
 			if ( cfg.console_log.value )
 			{
-				logging::console::print( xs( "{}" ), plain_msg );
+				// Console severity colors: kill = 4, hit = 2 (yellow),
+				// miss = 3 (red). Green is only available in the chat log
+				// (engine console severity has no green level).
+				logging::console::print_severity( entry.health <= 0 ? 4 : 2, xs( "{}" ), plain_msg );
 			}
 
 			if ( cfg.chat_log.value )
@@ -887,7 +1098,6 @@ namespace features::misc {
 			}
 		}
 
-		this->m_last_event = recent_event{ .type = data.health <= 0 ? event_type::kill : event_type::hit, .victim_name = entry.name, .damage = data.damage, .hitgroup = data.hitgroup, .time = current_time };
 	}
 
 	void impacts::add_miss_log( const shot_record& shot, const char* reason )
@@ -908,29 +1118,32 @@ namespace features::misc {
 			{
 				if ( shot.weapon_type == cstypes::weapon_type::knife )
 				{
-					plain_msg = std::format( "missed knife on {} due to latency", name );
-					chat_msg = detail::chat_dim( "missed knife on " ) + detail::chat_white( name ) + detail::chat_dim( " due to latency" );
+					plain_msg = std::format( "刀未命中 {}（延迟）", name );
+					chat_msg = detail::chat_miss( std::format( "刀未命中 {}（延迟）", name ) );
 				}
 				else
 				{
-					plain_msg = std::format( "missed zeus on {} due to idk ill improve the zeusbot later jeez.", name );
-					chat_msg = detail::chat_dim( "missed zeus on " ) + detail::chat_white( name ) + detail::chat_dim( " due to idk ill improve the zeusbot later jeez." );
+					plain_msg = std::format( "电击未命中 {}（目标移动/偏差）", name );
+					chat_msg = detail::chat_miss( std::format( "电击未命中 {}（目标移动/偏差）", name ) );
 				}
 			}
 			else if ( shot.forced )
 			{
-				plain_msg = std::format( "missed {} (forced shot, {:.0f}% hitchance)", name, shot.hitchance * 100.0f );
-				chat_msg = detail::chat_dim( "missed " ) + detail::chat_white( name ) + detail::chat_dim( std::format( " (forced shot, {:.0f}% hitchance)", shot.hitchance * 100.0f ) );
+				plain_msg = std::format( "未命中 {}（强制射击）", name );
+				chat_msg = detail::chat_miss( std::format( "未命中 {}（强制射击）", name ) );
 			}
 			else
 			{
-				plain_msg = std::format( "missed {}, targeted {} (hc={:.0f}%, dmg={:.0f}, reason={})", name, group, shot.hitchance * 100.0f, shot.damage, reason );
-				chat_msg = detail::chat_dim( "missed " ) + detail::chat_white( name ) + detail::chat_dim( ", targeted " ) + detail::chat_white( group ) + detail::chat_dim( std::format( " (hc={:.0f}%, dmg={:.0f}, reason={})", shot.hitchance * 100.0f, shot.damage, reason ) );
+				// Short format: player, hitgroup and the classified cause.
+				// The raw diagnostics (deviation, distance, speed,
+				// backtrack depth) stay in the on-screen miss log list.
+				plain_msg = std::format( "未命中 {}，目标 {}（{}）", name, group, reason );
+				chat_msg = detail::chat_miss( std::format( "未命中 {}，目标 {}（{}）", name, group, reason ) );
 			}
 
 			if ( cfg.console_log.value )
 			{
-				logging::console::print( xs( "{}" ), plain_msg );
+				logging::console::print_severity( 3, xs( "{}" ), plain_msg );
 			}
 
 			if ( cfg.chat_log.value )
@@ -949,8 +1162,8 @@ namespace features::misc {
 
 		if ( shot.forced )
 		{
-			entry.reason = "forced shot";
-			entry.hitgroup = std::format( "({:.0f}% hitchance)", shot.hitchance * 100.0f );
+			entry.reason = "强制射击";
+			entry.hitgroup = std::format( "（强制命中率 {:.0f}%）", shot.hitchance * 100.0f );
 		}
 		else
 		{
@@ -977,7 +1190,6 @@ namespace features::misc {
 			this->m_logs.pop_back( );
 		}
 
-		this->m_last_event = recent_event{ .type = event_type::miss, .victim_name = name, .hitgroup = shot.hitgroup, .miss_reason = reason, .time = current_time };
 	}
 
 	void impacts::check_misses( )
@@ -985,7 +1197,7 @@ namespace features::misc {
 		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
 		const auto current_time = memory::read<float>( global_vars + 0x30 );
 
-		constexpr auto hurt_grace_period{ 0.1f };
+		constexpr auto hurt_grace_period{ 0.35f };
 		constexpr auto absolute_timeout{ 1.0f };
 
 		const auto& cfg = settings::g_misc.m_impacts;
@@ -1005,19 +1217,99 @@ namespace features::misc {
 
 			if ( is_stale || is_expired )
 			{
+				// A predicted trigger command is not necessarily a shot (notably
+				// while cocking the R8). Discard it unless the server fire path or
+				// a bullet impact confirms that a round was emitted.
+				if ( !it->server_confirmed && !it->impact_confirmed )
+				{
+					// Neither the server fire callback nor a bullet impact
+					// confirmed the round (pattern drift / missed event / the
+					// shot landed outside the confirm window). fire_gun only
+					// calls on_boom after a real fire decision, so the round
+					// was emitted - record it instead of silently dropping the
+					// log (the old build's silent erase made every such miss
+					// invisible, and no-spread whiffs are exactly the shots
+					// the user wants surfaced).
+					it->resolved = true;
+
+					if ( cfg.miss_log.value )
+					{
+						const auto local = systems::g_local.get( );
+						const auto local_dead = !local.is_alive
+							|| ( local.pawn && memory::read<int>( local.pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) ) <= 0 );
+
+						if ( !local_dead )
+						{
+							// Double tap: a rejected pair attempt produces a
+							// shot on consecutive ticks - one entry per 0.5s
+							// keeps the log readable.
+							if ( it->dt )
+							{
+								if ( current_time - this->m_last_dt_empty_log > 0.5f )
+								{
+									this->m_last_dt_empty_log = current_time;
+									this->add_miss_log( *it, "服务器未确认空枪" );
+								}
+							}
+							else
+							{
+								this->add_miss_log( *it, "未知空枪" );
+							}
+						}
+					}
+
+					it = this->m_pending_shots.erase( it );
+					continue;
+				}
+
 				it->resolved = true;
+
+				// Seed-mode miss feeds the seed-sync verdict: a predicted
+				// seed that keeps scattering off the body means the server
+				// blocks seed sync and the gate should be dropped.
+				if ( it->seed_mode )
+				{
+					features::combat::g_shared.note_seed_shot( false );
+				}
 
 				if ( cfg.miss_log.value )
 				{
+					// The victim is already dead: the shot that finished the
+					// target (or the burst that did) landed - hurt/impact
+					// confirmations become unreliable post-mortem, so a shot
+					// at a dead target is never a miss.
+					const auto victim_dead = it->victim_pawn
+						&& ( !systems::g_entities.exists( it->victim_pawn )
+							|| memory::read<int>( it->victim_pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) ) <= 0 );
+
+					if ( victim_dead )
+					{
+						it = this->m_pending_shots.erase( it );
+						continue;
+					}
+
 					const char* reason;
 
-					if ( it->forced )
+					// If the local player is dead the shot very likely never
+					// left the barrel (interrupted by the kill) - classify it
+					// as such instead of blaming the aim.
+					const auto local = systems::g_local.get( );
+					const auto local_dead = !local.is_alive
+						|| ( local.pawn && memory::read<int>( local.pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) ) <= 0 );
+
+					if ( local_dead )
 					{
-						reason = "forced";
+						reason = "本地玩家已死亡";
+					}
+					else if ( it->forced )
+					{
+						reason = "强制射击";
 					}
 					else if ( !it->impact_confirmed )
 					{
-						reason = "death";
+						// No impact point and no other classification could be
+						// derived - a bare whiff with an unknown cause.
+						reason = "未知空枪";
 					}
 					else
 					{
@@ -1875,10 +2167,10 @@ void play_engine_path( const char* sound_path, float volume )
 			this->m_death_effect_loaded = true;
 		}
 
-		auto effect_index{ 0u };
-		memory::call<int*>(PATTERN (patterns::particle_create_effect), particle_manager, &effect_index, particle_path, 2, 0ll, 0ll, 0ll, 0 );
+		auto effect_index{ detail::invalid_particle_effect };
+		memory::call<int*>(PATTERN (patterns::particle_create_effect), particle_manager, &effect_index, particle_path, 8, 0ll, 0ll, 0ll, 0 );
 
-		if ( !effect_index )
+		if ( effect_index == detail::invalid_particle_effect )
 		{
 			return;
 		}
@@ -1932,10 +2224,10 @@ void play_engine_path( const char* sound_path, float volume )
 			this->m_bullet_impact_effect_loaded = true;
 		}
 
-		auto effect_index{ 0u };
-		memory::call<int*>(PATTERN (patterns::particle_create_effect), particle_manager, &effect_index, particle_path, 2, 0ll, 0ll, 0ll, 0 );
+		auto effect_index{ detail::invalid_particle_effect };
+		memory::call<int*>(PATTERN (patterns::particle_create_effect), particle_manager, &effect_index, particle_path, 8, 0ll, 0ll, 0ll, 0 );
 
-		if ( !effect_index )
+		if ( effect_index == detail::invalid_particle_effect )
 		{
 			return;
 		}
@@ -1984,10 +2276,10 @@ void play_engine_path( const char* sound_path, float volume )
 			this->m_bullet_tracers_loaded = true;
 		}
 
-		auto effect_index{ 0u };
-		memory::call<int*>(PATTERN (patterns::particle_create_effect), particle_manager, &effect_index, particle_path, 2, 0ll, 0ll, 0ll, 0 );
+		auto effect_index{ detail::invalid_particle_effect };
+		memory::call<int*>(PATTERN (patterns::particle_create_effect), particle_manager, &effect_index, particle_path, 8, 0ll, 0ll, 0ll, 0 );
 
-		if ( !effect_index )
+		if ( effect_index == detail::invalid_particle_effect )
 		{
 			return;
 		}

@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <core/features/features.hpp>
 #include <core/settings.hpp>
 
@@ -200,7 +200,7 @@ namespace rendering {
 				const auto it = skin_map( ).find( this->m_def );
 				if ( it != skin_map( ).end( ) )
 				{
-					xui::slider_float( "wear", it->second.wear, 0.0f, 1.0f, "%.4f" );
+					xui::slider_float( "磨损", it->second.wear, 0.0f, 1.0f, "%.4f" );
 				}
 
 				c.inside_overlay = prev_inside;
@@ -553,19 +553,19 @@ namespace rendering {
 						col = xui::lerp( col, xdraw::color{ 255, 100, 100, 255 }, ha );
 						col.a = static_cast< std::uint8_t >( col.a * item_alpha );
 
-						const auto [tw, th] = xdraw::measure_text( "remove skin" );
-						dl.text( ir.x + 8.0f, ir.y + ( k_item_h - th ) * 0.5f + slide, "remove skin", col );
+						const auto [tw, th] = xdraw::measure_text( "移除皮肤" );
+						dl.text( ir.x + 8.0f, ir.y + ( k_item_h - th ) * 0.5f + slide, "移除皮肤", col );
 						continue;
 					}
 
-					static constexpr const char* labels[ ]{ "", "stattrak", "wear", "seed" };
+					static constexpr const char* labels[ ]{ "", "计数", "磨损", "种子" };
 
 					std::string value;
 					if ( it != skin_map( ).end( ) )
 					{
 						if ( i == 1 )
 						{
-							value = it->second.stattrak ? "on" : "off";
+							value = it->second.stattrak ? "开" : "关";
 						}
 						else if ( i == 2 )
 						{
@@ -623,6 +623,107 @@ namespace rendering {
 			std::array<float, 5> m_hover_anims{};
 			std::array<float, 5> m_item_anims{};
 		};
+
+		static inline void draw_custom_model_picker( std::string_view id, xui::setting& enabled, std::string& model_path, const char* checkbox_label )
+		{
+			xui::checkbox( checkbox_label, enabled );
+			if ( !enabled.value )
+			{
+				return;
+			}
+
+			auto& custom_models = features::changer::g_custom_models;
+
+			const auto id_hash = xui::fnv1a( id );
+
+			static std::unordered_map<std::uintptr_t, bool> scanned;
+			static std::unordered_map<std::uintptr_t, std::string> filters;
+			static std::unordered_map<std::uintptr_t, int> sels;
+
+			auto& did_scan = scanned[ id_hash ];
+			auto& filter = filters[ id_hash ];
+			auto& sel = sels[ id_hash ];
+
+			if ( !did_scan )
+			{
+				custom_models.refresh( );
+				did_scan = true;
+			}
+
+			xui::text_input( "搜索模型" + std::string( id ), filter, 64, "搜索模型..." );
+
+			const auto& models = custom_models.models( );
+
+			const auto lower = [ ]( const std::string& value )
+			{
+				auto out = value;
+				std::transform( out.begin( ), out.end( ), out.begin( ), [ ]( char c )
+				{
+					return static_cast< char >( std::tolower( static_cast< unsigned char >( c ) ) );
+				} );
+				return out;
+			};
+
+			const auto filter_lower = lower( filter );
+
+			std::vector<int> indices;
+			indices.reserve( models.size( ) );
+
+			for ( auto i = 0; i < static_cast< int >( models.size( ) ); ++i )
+			{
+				if ( filter_lower.empty( ) || lower( models[ i ] ).find( filter_lower ) != std::string::npos )
+				{
+					indices.push_back( i );
+				}
+			}
+
+			if ( indices.empty( ) )
+			{
+				xui::text( "无匹配模型", tokens::col_text_dim );
+			}
+			else
+			{
+				const auto current_idx = custom_models.find( model_path );
+
+				auto found_sel = -1;
+				for ( auto i = 0; i < static_cast< int >( indices.size( ) ); ++i )
+				{
+					if ( indices[ i ] == current_idx )
+					{
+						found_sel = i;
+						break;
+					}
+				}
+
+				if ( found_sel >= 0 )
+				{
+					sel = found_sel;
+				}
+
+				if ( sel >= static_cast< int >( indices.size( ) ) )
+				{
+					sel = 0;
+				}
+
+				std::vector<const char*> items;
+				items.reserve( indices.size( ) );
+				for ( const auto idx : indices )
+				{
+					items.push_back( models[ idx ].c_str( ) );
+				}
+
+				if ( xui::combo( "模型列表" + std::string( id ), sel, items.data( ), static_cast< int >( items.size( ) ) ) )
+				{
+					model_path = models[ indices[ sel ] ];
+				}
+			}
+
+			if ( xui::button( "刷新" + std::string( id ), 130.0f, 22.0f ) )
+			{
+				custom_models.refresh( );
+				did_scan = true;
+			}
+		}
 
 		static inline void draw_agent_team_card( const xui::rect& card, int team, float fade_alpha )
 		{
@@ -1208,6 +1309,12 @@ namespace rendering {
 				detail::draw_agent_team_card( t_card, 2, fade_alpha );
 
 				xui::layout::item( inner_w, card_h );
+
+				auto& agents_cfg = settings::g_changer.agents;
+
+				detail::draw_custom_model_picker( "##ctmodel", agents_cfg.ct_custom_enabled, agents_cfg.ct_custom_model, "CT 自定义模型" );
+				detail::draw_custom_model_picker( "##tmodel", agents_cfg.t_custom_enabled, agents_cfg.t_custom_model, "T 自定义模型" );
+
 				xui::end_child( );
 				return;
 			}
@@ -1299,13 +1406,13 @@ namespace rendering {
 			back_bg.a = static_cast< std::uint8_t >( back_bg.a * fade_alpha );
 			dl.rect_filled( back_rect.x, back_rect.y, back_rect.w, back_rect.h, back_bg, xdraw::corner_radius{ s.button_rounding } );
 
-			const auto [bw, bh] = xdraw::measure_text( "back" );
+			const auto [bw, bh] = xdraw::measure_text( "返回" );
 			auto back_text = xui::lerp( s.text_dim, s.text, back_hover );
 			back_text.a = static_cast< std::uint8_t >( back_text.a * fade_alpha );
-			dl.text( back_rect.x + ( back_rect.w - bw ) * 0.5f, back_rect.y + ( back_rect.h - bh ) * 0.5f, "back", back_text );
+			dl.text( back_rect.x + ( back_rect.w - bw ) * 0.5f, back_rect.y + ( back_rect.h - bh ) * 0.5f, "返回", back_text );
 
 			xui::layout::set_cursor( back_rect.right( ) + 6.0f - win->bounds.x, bar_y - win->bounds.y );
-			xui::text_input( "##skin_search", detail::skins_ui.search_buf, 64, "search..." );
+			xui::text_input( "##skin_search", detail::skins_ui.search_buf, 64, "搜索..." );
 
 			const auto grid_top_y = bar_y + bar_h + 12.0f;
 			const auto base_x = win->bounds.x + s.window_pad_x + offset_x;

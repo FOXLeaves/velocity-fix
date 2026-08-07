@@ -16,6 +16,12 @@ namespace rendering {
 		auto confirm_reset{ false };
 		auto confirm_timer{ 0.0f };
 
+		// "New config" second-level UI state: open flag, the name being
+		// typed and a duplicate name flag.
+		auto new_config_open{ false };
+		std::string new_config_buf{};
+		auto new_config_error{ false };
+
 		static inline bool copy_to_clipboard( const std::string& text )
 		{
 			if ( !OpenClipboard( nullptr ) )
@@ -180,11 +186,20 @@ namespace rendering {
 			return;
 		}
 
-		xui::text_input( "##cfg_search", detail::search_buf, 64, "search configs..." );
+		xui::text_input( "##cfg_search", detail::search_buf, 64, "搜索配置..." );
 
 		constexpr auto btn_h{ 28.0f };
 		const auto [ avail_w, avail_h ] = xui::layout::avail( );
-		const auto list_h = std::max( 80.0f, avail_h - btn_h - s.item_spacing_y );
+
+		// Reserve exactly the space the second-level new-config UI takes
+		// (input row + optional error row + create/cancel row). While it
+		// is open the bottom button row is hidden (it is redundant there),
+		// so its height is only reserved when the row is actually drawn.
+		const auto new_ui_h = detail::new_config_open
+			? s.text_input_h + s.item_spacing_y + ( detail::new_config_error ? 18.0f + s.item_spacing_y : 0.0f ) + btn_h + s.item_spacing_y
+			: 0.0f;
+		const auto buttons_visible = !detail::new_config_open;
+		const auto list_h = std::max( 80.0f, avail_h - ( buttons_visible ? btn_h + s.item_spacing_y : 0.0f ) - new_ui_h );
 
 		if ( xui::begin_child( "##cfg_list", avail_w, list_h, true ) )
 		{
@@ -242,20 +257,77 @@ namespace rendering {
 			if ( visible_rows == 0 )
 			{
 				const auto row = xui::layout::item( row_w, row_h );
-				dl.text( row.x + 10.0f, row.y + 6.0f, detail::config_list.empty( ) ? "no configs found" : "no matches", tokens::col_text_dim );
+				dl.text( row.x + 10.0f, row.y + 6.0f, detail::config_list.empty( ) ? "未找到配置" : "无匹配项", tokens::col_text_dim );
 			}
 
 			xui::end_child( );
 		}
 
-		const auto btn_w = ( avail_w - s.item_spacing_x * 4.0f ) / 5.0f;
-		const auto has_selection = detail::selected >= 0 && detail::selected < static_cast< int >( detail::config_list.size( ) );
-		const auto save_name = has_selection ? detail::selected_name( ) : detail::search_buf;
-		const auto can_save = !save_name.empty( );
-
-		if ( xui::button( "save", btn_w, btn_h ) && can_save )
+		// Second-level UI: expands above the button row only after the
+		// "new" button on the first level is clicked.
+		if ( detail::new_config_open )
 		{
-			config::registry::save( detail::utf8_to_wide( save_name ) );
+			xui::text_input( "##cfg_new_name", detail::new_config_buf, 64, "输入配置名..." );
+
+			if ( detail::new_config_error )
+			{
+				const auto err_row = xui::layout::item( xui::layout::avail( ).first, 18.0f );
+				auto& err_dl = xui::draw::current( );
+				err_dl.text( err_row.x, err_row.y, "名称已存在", xdraw::color{ 255, 80, 80 } );
+			}
+
+			const auto half_w = ( avail_w - s.item_spacing_x ) * 0.5f;
+
+			if ( xui::button( "创建", half_w, btn_h ) && !detail::new_config_buf.empty( ) )
+			{
+				const auto wname = detail::utf8_to_wide( detail::new_config_buf );
+				const auto duplicate = std::find( detail::config_list.begin( ), detail::config_list.end( ), wname ) != detail::config_list.end( );
+
+				if ( duplicate )
+				{
+					detail::new_config_error = true;
+				}
+				else
+				{
+					config::registry::save( wname );
+					detail::needs_refresh = true;
+					detail::new_config_open = false;
+					detail::new_config_error = false;
+				}
+			}
+
+			xui::layout::same_line( );
+
+			if ( xui::button( "取消", half_w, btn_h ) )
+			{
+				detail::new_config_open = false;
+				detail::new_config_error = false;
+			}
+		}
+
+		// The bottom button row is only meaningful on the first level;
+		// while the new-config UI is open it is hidden entirely.
+		if ( buttons_visible )
+		{
+		const auto btn_w = ( avail_w - s.item_spacing_x * 5.0f ) / 6.0f;
+		const auto has_selection = detail::selected >= 0 && detail::selected < static_cast< int >( detail::config_list.size( ) );
+
+		// New: opens the second-level UI above the button row; the config
+		// is created there under an explicit name. Saving only overwrites
+		// the selected config (no accidental creation from the search box).
+		if ( xui::button( "新建", btn_w, btn_h ) )
+		{
+			detail::new_config_open = true;
+			detail::new_config_buf.clear( );
+			detail::new_config_error = false;
+		}
+
+		xui::layout::same_line( );
+
+		// Save only: overwrites the currently selected config.
+		if ( xui::button( "保存", btn_w, btn_h ) && has_selection )
+		{
+			config::registry::save( detail::config_list[ detail::selected ] );
 			detail::needs_refresh = true;
 		}
 
@@ -263,13 +335,13 @@ namespace rendering {
 
 		if ( detail::confirm_reset )
 		{
-			if ( xui::button( "confirm", btn_w, btn_h ) )
+			if ( xui::button( "确认", btn_w, btn_h ) )
 			{
 				detail::reset_defaults( );
 				detail::confirm_reset = false;
 			}
 		}
-		else if ( xui::button( "reset", btn_w, btn_h ) )
+		else if ( xui::button( "重置", btn_w, btn_h ) )
 		{
 			detail::confirm_reset = true;
 			detail::confirm_delete = false;
@@ -280,7 +352,7 @@ namespace rendering {
 
 		if ( detail::confirm_delete )
 		{
-			if ( xui::button( "confirm", btn_w, btn_h ) && has_selection )
+			if ( xui::button( "确认", btn_w, btn_h ) && has_selection )
 			{
 				config::registry::remove( detail::config_list[ detail::selected ] );
 				detail::selected = -1;
@@ -288,7 +360,7 @@ namespace rendering {
 				detail::confirm_delete = false;
 			}
 		}
-		else if ( xui::button( "delete", btn_w, btn_h ) && has_selection )
+		else if ( xui::button( "删除", btn_w, btn_h ) && has_selection )
 		{
 			detail::confirm_delete = true;
 			detail::confirm_reset = false;
@@ -297,7 +369,7 @@ namespace rendering {
 
 		xui::layout::same_line( );
 
-		if ( xui::button( "import", btn_w, btn_h ) )
+		if ( xui::button( "导入", btn_w, btn_h ) )
 		{
 			const auto clip = detail::paste_from_clipboard( );
 			if ( !clip.empty( ) )
@@ -330,7 +402,7 @@ namespace rendering {
 
 		xui::layout::same_line( );
 
-		if ( xui::button( "export", btn_w, btn_h ) )
+		if ( xui::button( "导出", btn_w, btn_h ) )
 		{
 			const auto name = has_selection ? detail::selected_name( ) : detail::search_buf;
 			const auto code = config::export_share_words( name );
@@ -339,6 +411,8 @@ namespace rendering {
 				detail::copy_to_clipboard( code );
 			}
 		}
+
+		} // buttons_visible
 
 		xui::end_child( );
 	}

@@ -8,8 +8,8 @@ namespace rendering {
 	namespace detail {
 
 		constexpr const char* k_cham_material_names[ ]{
-			"liquid", "metallic", "matte", "flat", "bloom", "outlines", "glow", "electric", "distortion", "hologram", "pearl",
-			"liquid (iz)", "matte (iz)", "flat (iz)", "bloom (iz)", "outlines (iz)", "glow (iz)", "distortion (iz)", "hologram (iz)"
+			"液态", "金属", "哑光", "平涂", "泛光", "描边", "发光", "电流", "扭曲", "全息", "珍珠",
+			"液态 (iz)", "哑光 (iz)", "平涂 (iz)", "泛光 (iz)", "描边 (iz)", "发光 (iz)", "扭曲 (iz)", "全息 (iz)"
 		};
 		constexpr auto k_cham_material_count = static_cast< int >( settings::esp::cham_ids::count );
 
@@ -18,8 +18,8 @@ namespace rendering {
 			xui::checkbox( label, layer.enabled );
 			if ( xui::begin_popup( popup_id, 220.0f ) )
 			{
-				xui::combo( "material", layer.material.value, k_cham_material_names, k_cham_material_count );
-				xui::color_picker( "color", layer.color );
+				xui::combo( "材质", layer.material.value, k_cham_material_names, k_cham_material_count );
+				xui::color_picker( "颜色", layer.color );
 				xui::end_popup( );
 			}
 		}
@@ -31,17 +31,17 @@ namespace rendering {
 			char label_buf[ 64 ]{};
 			char popup_id[ 64 ]{};
 
-			std::snprintf( label_buf, sizeof( label_buf ), "primary layer##%s", id_suffix );
+			std::snprintf( label_buf, sizeof( label_buf ), "主图层##%s", id_suffix );
 			std::snprintf( popup_id, sizeof( popup_id ), "##primary_%s", id_suffix );
 			draw_chams_layer( label_buf, popup_id, cfg.primary );
 
-			std::snprintf( label_buf, sizeof( label_buf ), "secondary layer##%s", id_suffix );
+			std::snprintf( label_buf, sizeof( label_buf ), "副图层##%s", id_suffix );
 			std::snprintf( popup_id, sizeof( popup_id ), "##secondary_%s", id_suffix );
 			draw_chams_layer( label_buf, popup_id, cfg.secondary );
 
 			if ( show_overlay )
 			{
-				std::snprintf( label_buf, sizeof( label_buf ), "overlay layer##%s", id_suffix );
+				std::snprintf( label_buf, sizeof( label_buf ), "叠加图层##%s", id_suffix );
 				std::snprintf( popup_id, sizeof( popup_id ), "##overlay_%s", id_suffix );
 				draw_chams_layer( label_buf, popup_id, cfg.overlay );
 			}
@@ -69,119 +69,134 @@ namespace rendering {
 
 			if ( xui::begin_child( "##player_esp", col_w ) )
 			{
-				xui::checkbox( "esp overlay", ov.enabled );
+				xui::checkbox( "透视覆盖层", ov.enabled );
 
-				xui::checkbox( "bounding box", ov.m_box.enabled );
+				xui::checkbox( "方框", ov.m_box.enabled );
 				if ( xui::begin_popup( "##box_popup", 220.0f ) )
 				{
-					constexpr const char* box_styles[ ]{ "full", "cornered" };
-					xui::combo( "style##box", ov.m_box.style.value, box_styles, 2 );
+					constexpr const char* box_styles[ ]{ "完整", "四角" };
+					xui::combo( "样式##box", ov.m_box.style.value, box_styles, 2 );
 
-					xui::checkbox( "fill", ov.m_box.fill );
-					xui::checkbox( "outline", ov.m_box.outline );
-					xui::slider_float( "corner length", ov.m_box.corner_length, 2.0f, 20.0f, "%.0f" );
-					xui::color_picker( "visible color##box", ov.m_box.visible_color );
-					xui::color_picker( "occluded color##box", ov.m_box.occluded_color );
+					xui::checkbox( "填充", ov.m_box.fill );
+					xui::checkbox( "描边", ov.m_box.outline );
+					xui::slider_float( "转角长度", ov.m_box.corner_length, 2.0f, 20.0f, "%.0f" );
+					xui::color_picker( "可见颜色##box", ov.m_box.visible_color );
+					xui::color_picker( "遮挡颜色##box", ov.m_box.occluded_color );
 					xui::end_popup( );
 				}
 
-				xui::checkbox( "skeleton", ov.m_skeleton.enabled );
+				xui::checkbox( "骨骼", ov.m_skeleton.enabled );
 				if ( xui::begin_popup( "##skeleton_popup", 220.0f ) )
 				{
-					constexpr const char* skel_modes[ ]{ "normal", "backtrack" };
-					xui::combo( "mode##skel", ov.m_skeleton.type.value, skel_modes, 2 );
+					constexpr const char* skel_modes[ ]{ "正常", "回溯" };
+					xui::combo( "模式##skel", ov.m_skeleton.type.value, skel_modes, 2 );
 
-					xui::slider_float( "thickness##skel", ov.m_skeleton.thickness, 0.5f, 4.0f, "%.1f" );
-					xui::color_picker( "visible color##skel", ov.m_skeleton.visible_color );
-					xui::color_picker( "occluded color##skel", ov.m_skeleton.occluded_color );
+					xui::slider_float( "粗细##skel", ov.m_skeleton.thickness, 0.5f, 4.0f, "%.1f" );
+					xui::color_picker( "可见颜色##skel", ov.m_skeleton.visible_color );
+					xui::color_picker( "遮挡颜色##skel", ov.m_skeleton.occluded_color );
 					xui::end_popup( );
 				}
 
-				xui::checkbox( "health bar", ov.m_health_bar.enabled );
+				xui::checkbox( "血条", ov.m_health_bar.enabled );
 				if ( xui::begin_popup( "##health_popup", 220.0f ) )
 				{
-					constexpr const char* bar_positions[ ]{ "left", "top", "bottom" };
-					xui::combo( "position##hp", ov.m_health_bar.position.value, bar_positions, 3 );
+					constexpr const char* bar_positions[ ]{ "左侧", "顶部", "底部" };
+					xui::combo( "位置##hp", ov.m_health_bar.position.value, bar_positions, 3 );
 
-					xui::checkbox( "outline##hp", ov.m_health_bar.outline_setting );
-					xui::checkbox( "gradient##hp", ov.m_health_bar.gradient );
-					xui::checkbox( "show value##hp", ov.m_health_bar.show_value );
-					xui::checkbox( "glow##hp", ov.m_health_bar.glow );
-					xui::color_picker( "full color##hp", ov.m_health_bar.full_color );
-					xui::color_picker( "low color##hp", ov.m_health_bar.low_color );
-					xui::color_picker( "background##hp", ov.m_health_bar.background_color );
-					xui::color_picker( "outline color##hp", ov.m_health_bar.outline_color );
-					xui::color_picker( "text color##hp", ov.m_health_bar.text_color );
-					xui::color_picker( "glow color##hp", ov.m_health_bar.glow_color );
-					xui::slider_float( "glow strength##hp", ov.m_health_bar.glow_strength, 0.1f, 1.0f, "%.2f" );
+					xui::checkbox( "描边##hp", ov.m_health_bar.outline_setting );
+					xui::checkbox( "渐变##hp", ov.m_health_bar.gradient );
+					xui::checkbox( "显示数值##hp", ov.m_health_bar.show_value );
+					xui::checkbox( "发光##hp", ov.m_health_bar.glow );
+					xui::color_picker( "满血颜色##hp", ov.m_health_bar.full_color );
+					xui::color_picker( "低血颜色##hp", ov.m_health_bar.low_color );
+					xui::color_picker( "背景##hp", ov.m_health_bar.background_color );
+					xui::color_picker( "描边颜色##hp", ov.m_health_bar.outline_color );
+					xui::color_picker( "文本颜色##hp", ov.m_health_bar.text_color );
+					xui::color_picker( "发光颜色##hp", ov.m_health_bar.glow_color );
+					xui::slider_float( "发光强度##hp", ov.m_health_bar.glow_strength, 0.1f, 1.0f, "%.2f" );
 					xui::end_popup( );
 				}
 
-				xui::checkbox( "ammo bar", ov.m_ammo_bar.enabled );
+				xui::checkbox( "弹药条", ov.m_ammo_bar.enabled );
 				if ( xui::begin_popup( "##ammo_popup", 220.0f ) )
 				{
-					constexpr const char* bar_positions[ ]{ "left", "top", "bottom" };
-					xui::combo( "position##ammo", ov.m_ammo_bar.position.value, bar_positions, 3 );
+					constexpr const char* bar_positions[ ]{ "左侧", "顶部", "底部" };
+					xui::combo( "位置##ammo", ov.m_ammo_bar.position.value, bar_positions, 3 );
 
-					xui::checkbox( "outline##ammo", ov.m_ammo_bar.outline_setting );
-					xui::checkbox( "gradient##ammo", ov.m_ammo_bar.gradient );
-					xui::checkbox( "show value##ammo", ov.m_ammo_bar.show_value );
-					xui::checkbox( "glow##ammo", ov.m_ammo_bar.glow );
-					xui::color_picker( "full color##ammo", ov.m_ammo_bar.full_color );
-					xui::color_picker( "low color##ammo", ov.m_ammo_bar.low_color );
-					xui::color_picker( "background##ammo", ov.m_ammo_bar.background_color );
-					xui::color_picker( "outline color##ammo", ov.m_ammo_bar.outline_color );
-					xui::color_picker( "text color##ammo", ov.m_ammo_bar.text_color );
-					xui::color_picker( "glow color##ammo", ov.m_ammo_bar.glow_color );
-					xui::slider_float( "glow strength##ammo", ov.m_ammo_bar.glow_strength, 0.1f, 1.0f, "%.2f" );
+					xui::checkbox( "描边##ammo", ov.m_ammo_bar.outline_setting );
+					xui::checkbox( "渐变##ammo", ov.m_ammo_bar.gradient );
+					xui::checkbox( "显示数值##ammo", ov.m_ammo_bar.show_value );
+					xui::checkbox( "发光##ammo", ov.m_ammo_bar.glow );
+					xui::color_picker( "满弹颜色##ammo", ov.m_ammo_bar.full_color );
+					xui::color_picker( "低弹颜色##ammo", ov.m_ammo_bar.low_color );
+					xui::color_picker( "背景##ammo", ov.m_ammo_bar.background_color );
+					xui::color_picker( "描边颜色##ammo", ov.m_ammo_bar.outline_color );
+					xui::color_picker( "文本颜色##ammo", ov.m_ammo_bar.text_color );
+					xui::color_picker( "发光颜色##ammo", ov.m_ammo_bar.glow_color );
+					xui::slider_float( "发光强度##ammo", ov.m_ammo_bar.glow_strength, 0.1f, 1.0f, "%.2f" );
 					xui::end_popup( );
 				}
 
-				xui::checkbox( "name", ov.m_name.enabled );
+				xui::checkbox( "名字", ov.m_name.enabled );
 				if ( xui::begin_popup( "##name_popup", 220.0f ) )
 				{
-					xui::color_picker( "color##name", ov.m_name.color );
+					xui::color_picker( "颜色##name", ov.m_name.color );
 					xui::end_popup( );
 				}
 
-				xui::checkbox( "weapon", ov.m_weapon.enabled );
+				xui::checkbox( "武器", ov.m_weapon.enabled );
 				if ( xui::begin_popup( "##weapon_popup", 220.0f ) )
 				{
-					constexpr const char* display_types[ ]{ "text", "icon", "text + icon" };
-					xui::combo( "display##wep", ov.m_weapon.display.value, display_types, 3 );
+					constexpr const char* display_types[ ]{ "文本", "图标", "文本 + 图标" };
+					xui::combo( "显示##wep", ov.m_weapon.display.value, display_types, 3 );
 
-					xui::color_picker( "text color##wep", ov.m_weapon.text_color );
-					xui::color_picker( "icon color##wep", ov.m_weapon.icon_color );
+					xui::color_picker( "文本颜色##wep", ov.m_weapon.text_color );
+					xui::color_picker( "图标颜色##wep", ov.m_weapon.icon_color );
 					xui::end_popup( );
 				}
 
-				xui::checkbox( "info flags", ov.m_info_flags.enabled );
+				xui::checkbox( "信息标志", ov.m_info_flags.enabled );
 				if ( xui::begin_popup( "##flags_popup", 220.0f ) )
 				{
-					constexpr const char* flag_names[ ]{ "money", "armor", "kit", "scoped", "defusing", "flashed", "ping", "distance" };
-					xui::multicombo( "flags##mc", ov.m_info_flags.flags, flag_names, settings::esp::player::overlay::info_flags::count );
+					constexpr const char* flag_names[ ]{ "金钱", "护甲", "拆弹器", "开镜", "拆弹中", "被闪", "延迟", "距离" };
+					xui::multicombo( "标志##mc", ov.m_info_flags.flags, flag_names, settings::esp::player::overlay::info_flags::count );
 
-					xui::color_picker( "money##flags", ov.m_info_flags.money_color );
-					xui::color_picker( "armor##flags", ov.m_info_flags.armor_color );
-					xui::color_picker( "kit##flags", ov.m_info_flags.kit_color );
-					xui::color_picker( "scoped##flags", ov.m_info_flags.scoped_color );
-					xui::color_picker( "defusing##flags", ov.m_info_flags.defusing_color );
-					xui::color_picker( "flashed##flags", ov.m_info_flags.flashed_color );
-					xui::color_picker( "distance##flags", ov.m_info_flags.distance_color );
+					xui::color_picker( "金钱##flags", ov.m_info_flags.money_color );
+					xui::color_picker( "护甲##flags", ov.m_info_flags.armor_color );
+					xui::color_picker( "拆弹器##flags", ov.m_info_flags.kit_color );
+					xui::color_picker( "开镜##flags", ov.m_info_flags.scoped_color );
+					xui::color_picker( "拆弹中##flags", ov.m_info_flags.defusing_color );
+					xui::color_picker( "被闪##flags", ov.m_info_flags.flashed_color );
+					xui::color_picker( "距离##flags", ov.m_info_flags.distance_color );
 					xui::end_popup( );
 				}
 
-				xui::checkbox( "oof arrows", ov.m_oof_arrow.enabled );
+				xui::checkbox( "屏幕外箭头", ov.m_oof_arrow.enabled );
 				if ( xui::begin_popup( "##oof_popup", 220.0f ) )
 				{
-					xui::checkbox( "glow##oof", ov.m_oof_arrow.glow );
-					xui::slider_float( "width##oof", ov.m_oof_arrow.width, 4.0f, 40.0f, "%.0f" );
-					xui::slider_float( "height##oof", ov.m_oof_arrow.height, 4.0f, 40.0f, "%.0f" );
-					xui::slider_float( "radius x##oof", ov.m_oof_arrow.radius_x, 50.0f, 600.0f, "%.0f" );
-					xui::slider_float( "radius y##oof", ov.m_oof_arrow.radius_y, 50.0f, 600.0f, "%.0f" );
-					xui::slider_float( "glow strength##oof", ov.m_oof_arrow.glow_strength, 0.1f, 1.0f, "%.2f" );
-					xui::color_picker( "visible color##oof", ov.m_oof_arrow.visible_color );
-					xui::color_picker( "occluded color##oof", ov.m_oof_arrow.occluded_color );
+					xui::checkbox( "发光##oof", ov.m_oof_arrow.glow );
+					xui::slider_float( "宽度##oof", ov.m_oof_arrow.width, 4.0f, 40.0f, "%.0f" );
+					xui::slider_float( "高度##oof", ov.m_oof_arrow.height, 4.0f, 40.0f, "%.0f" );
+					xui::slider_float( "半径X##oof", ov.m_oof_arrow.radius_x, 50.0f, 600.0f, "%.0f" );
+					xui::slider_float( "半径Y##oof", ov.m_oof_arrow.radius_y, 50.0f, 600.0f, "%.0f" );
+					xui::slider_float( "发光强度##oof", ov.m_oof_arrow.glow_strength, 0.1f, 1.0f, "%.2f" );
+					xui::color_picker( "可见颜色##oof", ov.m_oof_arrow.visible_color );
+					xui::color_picker( "遮挡颜色##oof", ov.m_oof_arrow.occluded_color );
+					xui::end_popup( );
+				}
+
+				// Ragebot diagnostics on the enemy body.
+				xui::checkbox( "回溯显示", p.m_backtrack_display.enabled );
+				if ( xui::begin_popup( "##bt_popup", 220.0f ) )
+				{
+					xui::color_picker( "颜色##bt", p.m_backtrack_display.color );
+					xui::end_popup( );
+				}
+
+				xui::checkbox( "外推显示", p.m_extrapolation_display.enabled );
+				if ( xui::begin_popup( "##extpopup2", 220.0f ) )
+				{
+					xui::color_picker( "颜色##ext2", p.m_extrapolation_display.color );
 					xui::end_popup( );
 				}
 
@@ -189,15 +204,15 @@ namespace rendering {
 				xui::end_child ();
 
 				if (xui::begin_child ("##player_glow", col_w)) {
-					xui::checkbox ("glow", glow.enabled);
+					xui::checkbox ("发光", glow.enabled);
 					if (xui::begin_popup ("##glow_popup", 220.0f)) {
-						xui::color_picker ("color##glow", glow.color);
+						xui::color_picker ("颜色##glow", glow.color);
 						xui::end_popup ();
 					}
 
-					xui::checkbox ("ragdoll glow", glow_ragdoll.enabled);
+					xui::checkbox ("尸体发光", glow_ragdoll.enabled);
 					if (xui::begin_popup ("##glow_rag_popup", 220.0f)) {
-						xui::color_picker ("color##glow_rag", glow_ragdoll.color);
+						xui::color_picker ("颜色##glow_rag", glow_ragdoll.color);
 						xui::end_popup ();
 					}
 
@@ -211,35 +226,35 @@ namespace rendering {
 		{
 			if ( xui::begin_child( "##local_chams_glow", col_w ) )
 			{
-				detail::draw_chams_config( "chams", "local_main", p.m_chams.local );
+				detail::draw_chams_config( "变色", "local_main", p.m_chams.local );
 
 				xui::layout::separator( );
 
-				xui::checkbox( "lower opacity", esp.m_local_alpha.enabled );
+				xui::checkbox( "降低透明度", esp.m_local_alpha.enabled );
 				if ( xui::begin_popup( "##local_alpha_popup", 220.0f ) )
 				{
-					xui::slider_float( "opacity", esp.m_local_alpha.opacity, 0.0f, 1.0f, "%.2f" );
-					xui::checkbox( "only when scoped", esp.m_local_alpha.only_scoped );
+					xui::slider_float( "透明度", esp.m_local_alpha.opacity, 0.0f, 1.0f, "%.2f" );
+					xui::checkbox( "仅开镜时", esp.m_local_alpha.only_scoped );
 					xui::end_popup( );
 				}
 
 				xui::layout::separator( );
 
-				detail::draw_chams_config( "ragdoll chams", "local_ragdoll", p.m_chams.local_ragdoll, false );
+				detail::draw_chams_config( "尸体变色", "local_ragdoll", p.m_chams.local_ragdoll, false );
 
 				xui::layout::separator( );
 
-				xui::checkbox( "glow", p.m_glow.local.enabled );
+				xui::checkbox( "发光", p.m_glow.local.enabled );
 				if ( xui::begin_popup( "##local_glow_popup", 220.0f ) )
 				{
-					xui::color_picker( "color##local_glow", p.m_glow.local.color );
+					xui::color_picker( "颜色##local_glow", p.m_glow.local.color );
 					xui::end_popup( );
 				}
 
-				xui::checkbox( "ragdoll glow", p.m_glow.local_ragdoll.enabled );
+				xui::checkbox( "尸体发光", p.m_glow.local_ragdoll.enabled );
 				if ( xui::begin_popup( "##local_glow_rag_popup", 220.0f ) )
 				{
-					xui::color_picker( "color##local_glow_rag", p.m_glow.local_ragdoll.color );
+					xui::color_picker( "颜色##local_glow_rag", p.m_glow.local_ragdoll.color );
 					xui::end_popup( );
 				}
 
@@ -258,21 +273,21 @@ namespace rendering {
 
 			if ( xui::begin_child( "##player_chams", col_w ) )
 			{
-				detail::draw_chams_config( "chams", "main", chams );
+				detail::draw_chams_config( "变色", "main", chams );
 
 				xui::layout::separator( );
 
-				detail::draw_chams_config( "ragdoll chams", "ragdoll", chams_ragdoll, false );
+				detail::draw_chams_config( "尸体变色", "ragdoll", chams_ragdoll, false );
 
 				if ( subtab == 0 )
 				{
 					xui::layout::separator( );
 
-					detail::draw_chams_config( "backtrack chams", "bt", p.m_chams.backtrack, false );
+					detail::draw_chams_config( "回溯变色", "bt", p.m_chams.backtrack, false );
 /*					xui::layout::separator (); not enough menu space with this*/
-					detail::draw_chams_config ("onshot chams", "os", p.m_chams.onshot, false);
+					detail::draw_chams_config ("射击变色", "os", p.m_chams.onshot, false);
 
-					xui::slider_float ("fade##ft", p.m_chams.onshot_fade_time, 0.1f, 5.0f, "%.0f");
+					xui::slider_float ("淡出##ft", p.m_chams.onshot_fade_time, 0.1f, 5.0f, "%.0f");
 
 				}
 
@@ -284,11 +299,11 @@ namespace rendering {
 		{
 			if ( xui::begin_child( "##viewmodel", col_w ) )
 			{
-				detail::draw_chams_config( "weapon chams", "vm_weapon", esp.m_viewmodel.weapon );
+				detail::draw_chams_config( "武器变色", "vm_weapon", esp.m_viewmodel.weapon );
 
 				xui::layout::separator( );
 
-				detail::draw_chams_config( "arms chams", "vm_arms", esp.m_viewmodel.arms );
+				detail::draw_chams_config( "手臂变色", "vm_arms", esp.m_viewmodel.arms );
 
 				xui::end_child( );
 			}

@@ -5,6 +5,7 @@
 #include <core/rendering/rendering.hpp>
 #include <core/settings.hpp>
 #include <core/features/features.hpp>
+#include <protection/game_addresses.hpp>
 
 namespace features::esp::other {
 
@@ -165,13 +166,7 @@ namespace features::esp::other {
 			return;
 		}
 
-		const auto c4_is_planted = memory::read<bool>( addresses::globals::planted_c4 - 0x8 );
-		if ( !c4_is_planted )
-		{
-			return;
-		}
-
-		const auto planted_c4 = memory::read<std::uintptr_t>( memory::read<std::uintptr_t>( addresses::globals::planted_c4 ) );
+		const auto planted_c4 = memory::read<std::uintptr_t>( addresses::globals::planted_c4 );
 		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
 
 		if ( !planted_c4 || !global_vars )
@@ -203,51 +198,58 @@ namespace features::esp::other {
 
 		const auto calculate_bomb_damage = [ & ]( ) -> float
 			{
+				// Newer builds propagate the blast as a WAVE (obstacle/
+				// geometry dependent), so distance falloff models no longer
+				// describe the damage at all. The HUD bomb bar shows the
+				// server-computed value: current fraction is the health bar
+				// before the blast, after fraction is what remains, so the
+				// damage is derivable from the two and the local health.
+				// When the bar is unavailable no prediction is shown.
 				const auto view_pawn = local.view_pawn( );
 				if ( !view_pawn )
 				{
 					return 0.0f;
 				}
 
-				const auto c4_scene_node = memory::read<std::uintptr_t>( planted_c4 + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
-				const auto pawn_scene_node = memory::read<std::uintptr_t>( view_pawn + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
-
-				if ( !c4_scene_node || !pawn_scene_node )
+				const auto health = memory::read<int>( view_pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) );
+				if ( health <= 0 )
 				{
 					return 0.0f;
 				}
 
-				const auto c4_origin = memory::read<math::vector3>( c4_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
-				const auto pawn_origin = memory::read<math::vector3>( pawn_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
-
-				const auto distance = ( c4_origin - pawn_origin ).length( );
-
-				constexpr auto default_damage{ 650.0f };
-				constexpr auto default_radius{ 2275.0f };
-
-				const auto sigma = default_radius / 3.0f;
-				auto damage = default_damage * std::exp( -( distance * distance ) / ( 2.0f * sigma * sigma ) );
-
-				const auto armor = memory::read<int>( view_pawn + SCHEMA( "C_CSPlayerPawn", "m_ArmorValue"_hash ) );
-
-				if ( armor > 0 )
+				const auto hud_element = memory::call<std::uintptr_t>( PATTERN (patterns::find_hud_element), xs( "CCSGO_HudHealthAmmoCenter" ) );
+				if ( !hud_element )
 				{
-					constexpr auto armor_ratio = 0.5f;
-					constexpr auto armor_bonus = 0.5f;
-
-					auto armor_absorbed = damage * armor_ratio;
-					auto armor_cost = ( damage - armor_absorbed ) * armor_bonus;
-
-					if ( armor_cost > static_cast< float >( armor ) )
-					{
-						armor_cost = static_cast< float >( armor ) * ( 1.0f / armor_bonus );
-						armor_absorbed = damage - armor_cost;
-					}
-
-					damage = armor_absorbed;
+					return 0.0f;
 				}
 
-				return std::floor( damage );
+				const auto avatar_health_bar = hud_element - 0x20;
+				const auto expected_panel = memory::read<std::uintptr_t>( avatar_health_bar + 0x68 );
+				if ( !expected_panel )
+				{
+					return 0.0f;
+				}
+
+				const auto after_fraction = memory::read<float>( expected_panel + 0x28 );
+				const auto current_fraction = memory::read<float>( expected_panel + 0x2C );
+				if ( current_fraction <= 0.001f )
+				{
+					return 0.0f;
+				}
+
+				const auto damage_fraction = current_fraction - after_fraction;
+				if ( damage_fraction <= 0.001f )
+				{
+					return 0.0f;
+				}
+
+				const auto damage = static_cast< int >( std::lround( ( damage_fraction / current_fraction ) * static_cast< float >( health ) ) );
+				if ( damage <= 0 )
+				{
+					return 0.0f;
+				}
+
+				return static_cast< float >( std::min( damage, health ) );
 			}( );
 
 		const auto [screen_w, screen_h] = xdraw::viewport_size( );
@@ -310,14 +312,15 @@ namespace features::esp::other {
 		const auto damage = static_cast< int >( calculate_bomb_damage );
 		const auto view_pawn = local.view_pawn( );
 		const auto health = view_pawn ? memory::read<int>( view_pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) ) : 0;
-		const auto will_kill = health <= damage;
+		const auto will_kill = damage > 0 && health <= damage;
+		const auto show_damage = damage > 0;
 
 		char health_buf[ 16 ]{};
 		std::snprintf( health_buf, sizeof( health_buf ), "%+d", -damage );
 
 		const auto [health_vw, health_vh] = xdraw::measure_text( health_buf );
 		const auto [health_uw, health_uh] = xdraw::measure_text( " health" );
-		const auto health_pill_w = health_vw + health_uw + text_pad_x * 2.0f;
+		const auto health_pill_w = show_damage ? health_vw + health_uw + text_pad_x * 2.0f : 0.0f;
 		const auto health_col = will_kill ? xdraw::color{ 255, 120, 120, 255 } : xdraw::color{ 160, 210, 140, 255 };
 
 		char timer_buf[ 16 ]{};
@@ -352,9 +355,12 @@ namespace features::esp::other {
 		cx += site_pill_w + section_spacing;
 
 		const auto health_unit_col = xdraw::color{ health_col.r, health_col.g, health_col.b, 120 };
-		draw_list.rect_filled( cx, y + inner_pad, health_pill_w, inner_h, s.child_bg, xdraw::corner_radius{ inner_r } );
-		draw_list.text( cx + text_pad_x, y + ( h - health_vh ) * 0.5f + text_nudge, health_buf, health_col );
-		draw_list.text( cx + text_pad_x + health_vw, y + ( h - health_uh ) * 0.5f + text_nudge, " health", health_unit_col );
+		if ( show_damage )
+		{
+			draw_list.rect_filled( cx, y + inner_pad, health_pill_w, inner_h, s.child_bg, xdraw::corner_radius{ inner_r } );
+			draw_list.text( cx + text_pad_x, y + ( h - health_vh ) * 0.5f + text_nudge, health_buf, health_col );
+			draw_list.text( cx + text_pad_x + health_vw, y + ( h - health_uh ) * 0.5f + text_nudge, " health", health_unit_col );
+		}
 		cx += health_pill_w + section_spacing;
 
 		const auto timer_unit_col = xdraw::color{ timer_color.r, timer_color.g, timer_color.b, 120 };
@@ -478,7 +484,7 @@ namespace features::esp::other {
 		static auto icon_w_px = 0, icon_h_px = 0;
 		static const auto eye_icon = xdraw::load_svg( std::span<const std::byte>( reinterpret_cast< const std::byte* >( detail::spectator_icon ), sizeof( detail::spectator_icon ) ), 1.0f, &icon_w_px, &icon_h_px );
 
-		const auto [header_tw, header_th] = xdraw::measure_text( "spectators" );
+		const auto [header_tw, header_th] = xdraw::measure_text( "观战者" );
 		const auto inner_h = row_h - inner_pad * 2.0f;
 		const auto header_inner_h = header_h - inner_pad * 2.0f;
 
@@ -492,7 +498,7 @@ namespace features::esp::other {
 		const auto htx = x + inner_pad;
 		const auto htw = header_tw + text_pad_x * 2.0f;
 		draw_list.rect_filled( htx, ry + inner_pad, htw, header_inner_h, s.child_bg, xdraw::corner_radius{ inner_r } );
-		draw_list.text( htx + text_pad_x, ry + ( header_h - header_th ) * 0.5f + text_nudge, "spectators", s.accent );
+		draw_list.text( htx + text_pad_x, ry + ( header_h - header_th ) * 0.5f + text_nudge, "观战者", s.accent );
 
 		const auto icon_x = x + inner_pad + htw + inner_pad;
 		draw_list.rect_filled( icon_x, ry + inner_pad, icon_size, header_inner_h, s.accent, xdraw::corner_radius{ inner_r } );

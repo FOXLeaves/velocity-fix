@@ -37,8 +37,7 @@ namespace rendering {
     class menu
     {
     public:
-        void initialize_graphics_before_rpack( );
-        void finalize_textures_after_rpack( );
+        void initialize_graphics( );
 
         void draw( );
         void shutdown( ) const;
@@ -57,7 +56,7 @@ namespace rendering {
         void draw_side_bar( float h );
         void draw_top_bar( float w );
         void draw_theme_swatches( float sb_x, float avatar_y );
-        void draw_menu_peek_decor( float wx, float wy, float ww, float wh, float reveal ) const;
+        void try_load_user_avatar( );
         void apply_theme_preset( int preset );
         void sync_theme_style( ) const;
         void draw_search_results( float x, float y, float w, float h );
@@ -98,13 +97,13 @@ namespace rendering {
         int m_subtab_pill_tab{ -1 };
         float m_subtab_pill_x{ -1.0f };
 		float m_intro_elapsed{};
-		float m_intro_rpak_ready_at{ -1.0f };
+		float m_intro_assets_ready_at{ -1.0f };
 		float m_intro_bar_phase{};
 		bool m_intro_base_graphics_ready{};
-		bool m_intro_pack_textures_ready{};
 		bool m_intro_finished{};
 		bool m_search_open{};
 		int m_theme_preset{};
+		float m_user_avatar_retry_delay{};
 		std::string m_search_query{};
 		std::vector<std::size_t> m_search_visible_indices{};
 
@@ -139,10 +138,7 @@ namespace rendering {
             entry cfg_cloud_on{};
             entry cfg_cloud_off{};
             entry cfg_plus{};
-			entry fih{};
 			entry intro_splash{};
-			entry konata_peek{};
-            xdraw::gif_image gif{};
         } m_textures{};
 
         static constexpr auto k_max_subtabs{ 6 };
@@ -155,13 +151,13 @@ namespace rendering {
 
         static constexpr subtab_info k_subtab_defs[ static_cast< int >( tab::count ) ]
         {
-            { { "pistol", "smg", "rifle", "shotgun", "sniper", "lmg" }, 6 },
-            { { "pistol", "smg", "rifle", "shotgun", "sniper", "lmg" }, 6 },
-            { { "enemies", "allies", "local" },                         3 },
-            { { "esp", "scene", "weather" },                            3 },
-            { { "guns", "knives", "gloves", "agents" },                 4 },
-            { { "main", "removals", "camera", "hud" },                  4 },
-            { { "general" },                                            1 }
+            { { "手枪", "冲锋枪", "步枪", "霰弹枪", "狙击枪", "机枪" }, 6 },
+            { { "手枪", "冲锋枪", "步枪", "霰弹枪", "狙击枪", "机枪" }, 6 },
+            { { "敌人", "队友", "本地" },                             3 },
+            { { "透视", "场景", "天气" },                             3 },
+            { { "武器", "刀", "手套", "角色" },                       4 },
+            { { "主菜单", "移除", "摄像机", "HUD" },                  4 },
+            { { "通用" },                                             1 }
         };
     };
 
@@ -198,12 +194,14 @@ namespace rendering {
 
 		void initialize( );
 
+		family_t chinese{};
 		family_t inter_medium{};
 		family_t inter_bold{};
 		family_t smallest_pixel7{};
 
 	private:
-		void load_family( family_t& family, std::uint32_t resource_id, const std::array<float, static_cast< std::size_t >( size::count )>& sizes );
+		void load_family( family_t& family, std::span<const std::byte> data, const std::array<float, static_cast< std::size_t >( size::count )>& sizes );
+		void load_family_file( family_t& family, const wchar_t* path, const std::array<float, static_cast< std::size_t >( size::count )>& sizes );
 	};
 
 	inline context g_context{};

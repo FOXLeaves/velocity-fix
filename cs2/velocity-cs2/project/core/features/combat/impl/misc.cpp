@@ -76,6 +76,41 @@ namespace features::combat {
 		this->m_modified_angles.x = this->get_pitch( this->m_old_angles.x );
 		this->m_modified_angles.y = this->get_yaw( this->m_old_angles, local );
 
+		// Airborne AA switch (test-strafer assist): while a side-step is
+		// active the back mode accels correctly and the side-step stalls,
+		// so in the air the yaw temporarily flips back to the back heading
+		// and returns to the side-step on landing. Holding a grenade/throw
+		// disables the AA entirely in the air (real view) and restores it
+		// on landing.
+		const auto& prestate = systems::g_prediction.pre( );
+		if ( settings::g_movement.m_test_strafer.enabled.value && !( prestate.flags & cstypes::entity_flags::on_ground ) )
+		{
+			if ( ctx.weapon_type == cstypes::weapon_type::grenade )
+			{
+				this->m_modified_angles = this->m_old_angles;
+			}
+			else
+			{
+				auto side = this->m_modified_angles.y - this->m_old_angles.y;
+				math::helpers::normalize_angle( side );
+				if ( side > 90.0f )
+				{
+					side -= 180.0f;
+				}
+				else if ( side < -90.0f )
+				{
+					side += 180.0f;
+				}
+
+				if ( std::fabsf( side ) > 30.0f )
+				{
+					this->m_modified_angles.y = this->m_old_angles.y + 180.0f;
+				}
+			}
+
+			math::helpers::normalize_angles( this->m_modified_angles );
+		}
+
 		math::helpers::normalize_angles( this->m_modified_angles );
 
 		base->mutable_viewangles( )->set_x( this->m_modified_angles.x );
@@ -213,27 +248,41 @@ namespace features::combat {
 
 	float misc::antiaim::get_yaw( const math::vector3& view_angles, const systems::local::snapshot& local )
 	{
+		if ( settings::g_combat.m_antiaim.yaw.value == settings::combat::antiaim::yaw_mode::real_view )
+		{
+			// Real-view facing: the yaw is the player's actual view
+			// direction rotated 180 degrees - always back to the real
+			// view, without the enemy threat targeting. The manual side
+			// offset and roll compensation still apply.
+			auto yaw = view_angles.y + 180.0f;
+
+			if ( this->m_yaw_side == -1 )
+			{
+				yaw -= 90.0f;
+			}
+			else if ( this->m_yaw_side == 1 )
+			{
+				yaw += 90.0f;
+			}
+
+			if ( settings::g_combat.m_antiaim.auto_yaw_adjust.value )
+			{
+				yaw += 33.0f;
+			}
+
+			this->m_indicator_yaw = yaw;
+			return yaw;
+		}
+
 		auto base_yaw_offset{ 180.0f };
 
 		const auto view_yaw = view_angles.y;
 		auto base_yaw = view_yaw - base_yaw_offset;
 
-		const auto view_forward_3d = [ & ]( ) -> math::vector3
-			{
-				const auto pitch_rad = view_angles.x * ( std::numbers::pi_v<float> / 180.0f );
-				const auto yaw_rad = view_angles.y * ( std::numbers::pi_v<float> / 180.0f );
-
-				return math::vector3
-				{
-					std::cos( pitch_rad ) * std::cos( yaw_rad ),
-					std::cos( pitch_rad ) * std::sin( yaw_rad ),
-					-std::sin( pitch_rad )
-				};
-			}( );
 		const auto local_game_scene_node = memory::read<std::uintptr_t>( local.pawn + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
 		const auto local_origin = memory::read<math::vector3>( local_game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
 		const auto players = systems::g_entities.get_by_type( systems::entities::type::player );
-		const auto eye_pos = g_shared.get_shoot_position( );
+		const auto eye_pos = local_origin + memory::read<math::vector3>( local.pawn + SCHEMA( "C_BaseModelEntity", "m_vecViewOffset"_hash ) );
 
 		if ( settings::g_combat.m_antiaim.avoid_backstab.value )
 		{
@@ -254,7 +303,7 @@ namespace features::combat {
 					continue;
 				}
 
-				const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+				const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 				const auto pawn = systems::g_entities.lookup( pawn_handle );
 
 				if ( !pawn || pawn == local.pawn )
@@ -335,20 +384,10 @@ namespace features::combat {
 			}
 		}
 
-		const auto pick_autoyaw = [ & ]( ) -> std::optional<float>
+		const auto pick_target_yaw = [ & ]( ) -> std::optional<float>
 			{
-				const auto mode = settings::g_combat.m_antiaim.autoyaw.value;
-				if ( mode == settings::combat::antiaim::autoyaw_mode::none )
-				{
-					return std::nullopt;
-				}
-
 				auto best_yaw = base_yaw;
-				auto found{ false };
-
-				auto best_crosshair_dot = -2.0f;
-				auto best_distance_sq = std::numeric_limits<float>::max( );
-				auto best_health = std::numeric_limits<int>::max( );
+				auto best_threat_score = std::numeric_limits<float>::max( );
 
 				for ( const auto& p : players )
 				{
@@ -362,7 +401,7 @@ namespace features::combat {
 						continue;
 					}
 
-					const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+					const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 					const auto pawn = systems::g_entities.lookup( pawn_handle );
 
 					if ( !pawn || pawn == local.pawn )
@@ -376,8 +415,7 @@ namespace features::combat {
 						continue;
 					}
 
-					const auto health = memory::read<int>( pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) );
-					if ( health <= 0 )
+					if ( memory::read<int>( pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) ) <= 0 )
 					{
 						continue;
 					}
@@ -394,153 +432,42 @@ namespace features::combat {
 					}
 
 					const auto enemy_origin = memory::read<math::vector3>( enemy_game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
-					const auto dx = enemy_origin.x - local_origin.x;
-					const auto dy = enemy_origin.y - local_origin.y;
-					const auto dist_sq = dx * dx + dy * dy;
-					const auto target_yaw = std::atan2f( dy, dx ) * ( 180.0f / std::numbers::pi_v<float> ) - base_yaw_offset;
+					const auto enemy_eye_pos = enemy_origin + memory::read<math::vector3>( pawn + SCHEMA( "C_BaseModelEntity", "m_vecViewOffset"_hash ) );
+					const auto angle_to_enemy = math::helpers::calculate_angle( eye_pos, enemy_eye_pos );
+					const auto fov = math::helpers::angle_distance( view_angles, angle_to_enemy );
+					const auto distance = eye_pos.distance( enemy_eye_pos );
 
-					const auto chest_bone = systems::g_bones.get( pawn, cstypes::bone_ids::spine_3 );
-					const auto to_tgt = chest_bone.position - eye_pos;
-					const auto len_sq = to_tgt.length_sqr( );
-					const auto aim_dot = len_sq < 1.0f ? -1.0f : view_forward_3d.dot( to_tgt * ( 1.0f / std::sqrt( len_sq ) ) );
+					// Match Requiem's threat order: crosshair first, then proximity, whether
+					// the enemy is looking at us, and finally whether they are visible.
+					auto threat_score = fov * 4.0f + distance * 0.01f;
 
-					auto is_better = false;
-					switch ( mode )
+					math::vector3 enemy_forward{};
+					const auto enemy_eye_angles = memory::read<math::vector3>( pawn + SCHEMA( "C_CSPlayerPawn", "m_angEyeAngles"_hash ) );
+					math::helpers::angle_vectors_left( enemy_eye_angles, &enemy_forward );
+					const auto direction_to_us = ( eye_pos - enemy_eye_pos ).normalized( );
+					threat_score -= std::clamp( enemy_forward.dot( direction_to_us ), -1.0f, 1.0f ) * 25.0f;
+
+					if ( systems::g_tracing.is_visible( eye_pos, enemy_eye_pos, pawn, local.pawn ) )
 					{
-					case settings::combat::antiaim::autoyaw_mode::crosshair:
-						is_better = aim_dot > best_crosshair_dot;
-						if ( is_better )
-						{
-							best_crosshair_dot = aim_dot;
-						}
-						break;
-					case settings::combat::antiaim::autoyaw_mode::distance:
-						is_better = dist_sq < best_distance_sq;
-						if ( is_better )
-						{
-							best_distance_sq = dist_sq;
-						}
-						break;
-					case settings::combat::antiaim::autoyaw_mode::health:
-						is_better = health < best_health;
-						if ( is_better )
-						{
-							best_health = health;
-						}
-						break;
-					default:
-						break;
+						threat_score -= 15.0f;
 					}
 
-					if ( is_better )
+					if ( threat_score < best_threat_score )
 					{
-						best_yaw = target_yaw;
-						found = true;
+						best_threat_score = threat_score;
+						best_yaw = angle_to_enemy.y - base_yaw_offset;
 					}
 				}
 
-				return found ? std::optional<float>{ best_yaw } : std::nullopt;
+				return best_threat_score < std::numeric_limits<float>::max( ) ? std::optional<float>{ best_yaw } : std::nullopt;
 			};
 
-		if ( const auto autoyaw = pick_autoyaw( ) )
+		if ( const auto target_yaw = pick_target_yaw( ) )
 		{
-			base_yaw = *autoyaw;
-		}
-		else if ( settings::g_combat.m_antiaim.at_targets.value )
-		{
-			auto best_visible_dot = -2.0f;
-			auto best_visible_yaw = base_yaw;
-			auto found_visible{ false };
-
-			auto best_fallback_dot = -2.0f;
-			auto best_fallback_yaw = base_yaw;
-			auto found_fallback{ false };
-
-			for ( const auto& p : players )
-			{
-				if ( !p.ptr || p.ptr == local.controller )
-				{
-					continue;
-				}
-
-				if ( !memory::read<bool>( p.ptr + SCHEMA( "CCSPlayerController", "m_bPawnIsAlive"_hash ) ) )
-				{
-					continue;
-				}
-
-				const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
-				const auto pawn = systems::g_entities.lookup( pawn_handle );
-
-				if ( !pawn || pawn == local.pawn )
-				{
-					continue;
-				}
-
-				const auto team = memory::read<int>( pawn + SCHEMA( "C_BaseEntity", "m_iTeamNum"_hash ) );
-				if ( !local.is_this_other_team( team ) )
-				{
-					continue;
-				}
-
-				const auto health = memory::read<int>( pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) );
-				if ( health <= 0 )
-				{
-					continue;
-				}
-
-				if ( memory::read<bool>( pawn + SCHEMA( "C_CSPlayerPawn", "m_bGunGameImmunity"_hash ) ) )
-				{
-					continue;
-				}
-
-				const auto enemy_game_scene_node = memory::read<std::uintptr_t>( pawn + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
-				if ( !enemy_game_scene_node )
-				{
-					continue;
-				}
-
-				const auto enemy_origin = memory::read<math::vector3>( enemy_game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
-				const auto dx = enemy_origin.x - local_origin.x;
-				const auto dy = enemy_origin.y - local_origin.y;
-				const auto target_yaw = std::atan2f( dy, dx ) * ( 180.0f / std::numbers::pi_v<float> ) - base_yaw_offset;
-				const auto chest_bone = systems::g_bones.get( pawn, cstypes::bone_ids::spine_3 );
-				const auto visible = chest_bone.position.length_sqr( ) > 1.0f && systems::g_tracing.is_visible( eye_pos, chest_bone.position, pawn, local.pawn );
-
-				const auto to_tgt = chest_bone.position - eye_pos;
-				const auto len_sq = to_tgt.length_sqr( );
-				const auto aim_dot = len_sq < 1.0f ? -1.0f : view_forward_3d.dot( to_tgt * ( 1.0f / std::sqrt( len_sq ) ) );
-
-				if ( visible )
-				{
-					if ( aim_dot > best_visible_dot )
-					{
-						best_visible_dot = aim_dot;
-						best_visible_yaw = target_yaw;
-						found_visible = true;
-					}
-				}
-				else
-				{
-					if ( aim_dot > best_fallback_dot )
-					{
-						best_fallback_dot = aim_dot;
-						best_fallback_yaw = target_yaw;
-						found_fallback = true;
-					}
-				}
-			}
-
-			if ( found_visible )
-			{
-				base_yaw = best_visible_yaw;
-			}
-			else if ( found_fallback )
-			{
-				base_yaw = best_fallback_yaw;
-			}
+			base_yaw = *target_yaw;
 		}
 
-		auto indicator = view_yaw + 180.0f;
+		auto indicator = base_yaw;
 		if ( this->m_yaw_side == -1 )
 		{
 			indicator -= 90.0f;
@@ -563,71 +490,239 @@ namespace features::combat {
 		}
 
 		if (settings::g_combat.m_antiaim.auto_yaw_adjust.value)
-			yaw += 33.0f; // thx saphy
+			yaw += 20.0f; // thx saphy
 
 		return yaw;
 	}
 
-	void misc::antiaim::correct_movement (systems::input::usercmd* cmd) {
-		if (!this->m_should_correct) {
+	void misc::antiaim::correct_movement( systems::input::usercmd* cmd )
+	{
+		if ( !this->m_should_correct )
+		{
 			return;
 		}
 
 		this->m_should_correct = false;
 
-		const auto base = cmd->csgo_user_cmd.mutable_base ();
-		const auto forward_move = base->forwardmove ();
-		const auto side_move = base->leftmove ();
+		const auto base = cmd->csgo_user_cmd.mutable_base( );
+		const auto forward_move = base->forwardmove( );
+		const auto side_move = base->leftmove( );
 
-		if (forward_move == 0.0f && side_move == 0.0f) {
+		if ( forward_move == 0.0f && side_move == 0.0f )
+		{
 			return;
 		}
 
-		math::vector3 new_forward {}, new_left {};
-		math::helpers::angle_vectors_left (this->m_modified_angles, &new_forward, &new_left, nullptr);
+		// The engine view starts each tick at the anti-aim yaw and the
+		// test_strafer yaw deltas stack on top of it. Keeping the input in
+		// the real frame while the view sits at AA + deltas reverses the
+		// wish by the AA offset (back mode: walks backwards, no accel), so
+		// the input must be rotated into the AA frame - the 180 deg back
+		// mode then cancels and accels forward. With AA active the move
+		// direction is the AA movement direction.
+		const auto& prestate = systems::g_prediction.pre( );
+		const auto in_air = !( prestate.flags & cstypes::entity_flags::on_ground );
 
-		math::vector3 old_forward {}, old_left {};
-		math::helpers::angle_vectors_left (this->m_old_angles, &old_forward, &old_left, nullptr);
+		math::vector3 new_forward{}, new_left{};
+		math::helpers::angle_vectors_left( this->m_modified_angles, &new_forward, &new_left, nullptr );
+
+		math::vector3 old_forward{}, old_left{};
+		math::helpers::angle_vectors_left( this->m_old_angles, &old_forward, &old_left, nullptr );
 
 		new_forward.z = 0.0f; new_left.z = 0.0f;
 		old_forward.z = 0.0f; old_left.z = 0.0f;
-		new_forward.normalize ();
-		new_left.normalize ();
-		old_forward.normalize ();
-		old_left.normalize ();
+		new_forward.normalize( );
+		new_left.normalize( );
+		old_forward.normalize( );
+		old_left.normalize( );
 
 		const auto intent = old_forward * forward_move + old_left * -side_move;
-		const auto intent_len = intent.length ();
+		const auto intent_len = intent.length( );
 
-		if (intent_len == 0.0f) {
+		if ( intent_len == 0.0f )
+		{
 			return;
 		}
 
 		const auto intent_dir = intent / intent_len;
-		const auto corrected_forward = new_forward.dot (intent_dir) * intent_len;
-		const auto corrected_side = -new_left.dot (intent_dir) * intent_len;
+		const auto corrected_forward = new_forward.dot( intent_dir ) * intent_len;
+		const auto corrected_side = -new_left.dot( intent_dir ) * intent_len;
 
-		base->set_forwardmove (std::clamp (corrected_forward, -1.0f, 1.0f));
-		base->set_leftmove (std::clamp (corrected_side, -1.0f, 1.0f));
+		auto final_forward = std::clamp( corrected_forward, -1.0f, 1.0f );
+		auto final_side = std::clamp( corrected_side, -1.0f, 1.0f );
 
-		if (systems::g_prediction.pre ().flags & cstypes::entity_flags::on_ground) {
+		// Air only: a 90 deg side-step rotates forward inputs into a pure
+		// side move, which cannot accelerate in CS2 physics (wish is
+		// perpendicular to the velocity - dot product zero). Inject a
+		// forward component in the air; on the ground the rewritten move
+		// keys keep the walk straight.
+		if ( in_air && std::fabsf( final_forward ) < 0.3f && std::fabsf( final_side ) > 0.3f )
+		{
+			final_forward = final_side * 1.0f;
+		}
+
+		base->set_forwardmove( final_forward );
+		base->set_leftmove( final_side );
+
+		// Snapshot the raw command buttons before the rewrite below: the
+		// airstrafe / test_strafer derive their direction bookkeeping from
+		// these, and a 90 deg side-step rewrite (W -> moveleft) would
+		// otherwise mis-steer the bunnyhop accel by 90 deg.
+		this->m_raw_movement_buttons = cmd->buttons.value;
+
+		if ( systems::g_prediction.pre( ).flags & cstypes::entity_flags::on_ground )
+		{
 			auto buttons = cmd->buttons.value;
-			buttons &= ~static_cast<std::uintptr_t>(cstypes::command_buttons::in_forward | cstypes::command_buttons::in_back | cstypes::command_buttons::in_moveleft | cstypes::command_buttons::in_moveright);
+			buttons &= ~static_cast< std::uintptr_t >( cstypes::command_buttons::in_forward | cstypes::command_buttons::in_back | cstypes::command_buttons::in_moveleft | cstypes::command_buttons::in_moveright );
 
-			if (base->forwardmove () > 0.0f) {
+			if ( base->forwardmove( ) > 0.0f )
+			{
 				buttons |= cstypes::command_buttons::in_forward;
-			} else if (base->forwardmove () < 0.0f) {
+			}
+			else if ( base->forwardmove( ) < 0.0f )
+			{
 				buttons |= cstypes::command_buttons::in_back;
 			}
 
-			if (base->leftmove () > 0.0f) {
+			if ( base->leftmove( ) > 0.0f )
+			{
 				buttons |= cstypes::command_buttons::in_moveleft;
-			} else if (base->leftmove () < 0.0f) {
+			}
+			else if ( base->leftmove( ) < 0.0f )
+			{
 				buttons |= cstypes::command_buttons::in_moveright;
 			}
 
 			cmd->buttons.value = buttons;
 		}
+
+		// Re-level the history pitch only: a fake pitch makes the local
+		// movement pitch forward into the ground. The yaw stays on the
+		// command/AA heading - the strafer's subtick yaw deltas stack on
+		// top of it, so the body sways on the AA base.
+		const auto history_size = cmd->csgo_user_cmd.input_history_size( );
+		for ( auto i = 0; i < history_size; ++i )
+		{
+			auto entry = cmd->csgo_user_cmd.mutable_input_history( i );
+			if ( !entry )
+			{
+				continue;
+			}
+
+			if ( const auto angles = entry->mutable_view_angles( ) )
+			{
+				angles->set_x( 0.0f );
+			}
+		}
+	}
+
+	void misc::antiaim::rotate_move_to_aa( proto::base_usercmd_pb* base ) const
+	{
+		if ( !this->m_antiaim_active )
+		{
+			return;
+		}
+
+		const auto forward_move = base->forwardmove( );
+		const auto side_move = base->leftmove( );
+
+		if ( forward_move == 0.0f && side_move == 0.0f )
+		{
+			return;
+		}
+
+		// Same world-intent projection as correct_movement, so the move-key
+		// convention (leftmove > 0 = left) stays identical everywhere. A
+		// plain 2D Lua rotation assumes side > 0 = right and doubles the
+		// 90 deg side-step error into 180 deg - invisible under the 180 deg
+		// back mode (left/right symmetric), fatal for side-steps.
+		math::vector3 new_forward{}, new_left{};
+		math::helpers::angle_vectors_left( this->m_modified_angles, &new_forward, &new_left, nullptr );
+
+		math::vector3 old_forward{}, old_left{};
+		math::helpers::angle_vectors_left( this->m_old_angles, &old_forward, &old_left, nullptr );
+
+		new_forward.z = 0.0f; new_left.z = 0.0f;
+		old_forward.z = 0.0f; old_left.z = 0.0f;
+		new_forward.normalize( );
+		new_left.normalize( );
+		old_forward.normalize( );
+		old_left.normalize( );
+
+		const auto intent = old_forward * forward_move + old_left * -side_move;
+		const auto intent_len = intent.length( );
+
+		if ( intent_len == 0.0f )
+		{
+			return;
+		}
+
+		const auto intent_dir = intent / intent_len;
+		const auto corrected_forward = new_forward.dot( intent_dir ) * intent_len;
+		const auto corrected_side = -new_left.dot( intent_dir ) * intent_len;
+
+		auto final_forward = std::clamp( corrected_forward, -1.0f, 1.0f );
+		auto final_side = std::clamp( corrected_side, -1.0f, 1.0f );
+
+		// A 90 deg side-step rotates forward inputs into a pure side move,
+		// and the engine barely walks on side input alone while anti-aim
+		// locks the view (the A/D turn is overwritten every tick). Inject a
+		// forward component so W/S still move; the small direction bias is
+		// preferable to no movement at all.
+		if ( std::fabsf( final_forward ) < 0.3f && std::fabsf( final_side ) > 0.3f )
+		{
+			final_forward = final_side * 1.0f;
+		}
+
+		base->set_forwardmove( final_forward );
+		base->set_leftmove( final_side );
+	}
+
+	void misc::antiaim::unrotate_move_from_aa( proto::base_usercmd_pb* base ) const
+	{
+		if ( !this->m_antiaim_active )
+		{
+			return;
+		}
+
+		const auto forward_move = base->forwardmove( );
+		const auto side_move = base->leftmove( );
+
+		if ( forward_move == 0.0f && side_move == 0.0f )
+		{
+			return;
+		}
+
+		// Mirror of rotate_move_to_aa with the frames swapped: the input
+		// sits in the anti-aim (modified) frame, project its world intent
+		// back into the real (old) frame.
+		math::vector3 new_forward{}, new_left{};
+		math::helpers::angle_vectors_left( this->m_modified_angles, &new_forward, &new_left, nullptr );
+
+		math::vector3 old_forward{}, old_left{};
+		math::helpers::angle_vectors_left( this->m_old_angles, &old_forward, &old_left, nullptr );
+
+		new_forward.z = 0.0f; new_left.z = 0.0f;
+		old_forward.z = 0.0f; old_left.z = 0.0f;
+		new_forward.normalize( );
+		new_left.normalize( );
+		old_forward.normalize( );
+		old_left.normalize( );
+
+		const auto intent = new_forward * forward_move + new_left * -side_move;
+		const auto intent_len = intent.length( );
+
+		if ( intent_len == 0.0f )
+		{
+			return;
+		}
+
+		const auto intent_dir = intent / intent_len;
+		const auto corrected_forward = old_forward.dot( intent_dir ) * intent_len;
+		const auto corrected_side = -old_left.dot( intent_dir ) * intent_len;
+
+		base->set_forwardmove( std::clamp( corrected_forward, -1.0f, 1.0f ) );
+		base->set_leftmove( std::clamp( corrected_side, -1.0f, 1.0f ) );
 	}
 
 	bool misc::antiaim::is_near_ladder( std::uintptr_t local_pawn ) const
@@ -819,7 +914,7 @@ namespace features::combat {
 			}
 		}
 
-		if ( cmd->buttons.value & cstypes::command_buttons::in_attack )
+		if ( ( cmd->buttons.value & cstypes::command_buttons::in_attack ) && !g_rage.is_cocking_revolver( ) )
 		{
 			this->m_should_retrack = true;
 			this->m_fired = true;
@@ -882,12 +977,12 @@ namespace features::combat {
 			this->m_particle_loaded = true;
 		}
 
-		auto effect_index{ 0u };
-		memory::call<int*>(PATTERN (patterns::particle_create_effect), particle_manager, &effect_index, particle_path, 2, 0ll, 0ll, 0ll, 0 );
+		auto effect_index{ invalid_effect_index };
+		memory::call<int*>(PATTERN (patterns::particle_create_effect), particle_manager, &effect_index, particle_path, 8, 0ll, 0ll, 0ll, 0 );
 
 		this->m_particle_effect = effect_index;
 
-		if ( !effect_index )
+		if ( effect_index == invalid_effect_index )
 		{
 			return;
 		}
@@ -897,7 +992,7 @@ namespace features::combat {
 
 	void misc::quickpeek::update_particle( )
 	{
-		if ( !this->m_particle_effect )
+		if ( this->m_particle_effect == invalid_effect_index )
 		{
 			return;
 		}
@@ -918,7 +1013,7 @@ namespace features::combat {
 
 	void misc::quickpeek::release_particle( )
 	{
-		if ( !this->m_particle_effect )
+		if ( this->m_particle_effect == invalid_effect_index )
 		{
 			return;
 		}
@@ -927,10 +1022,9 @@ namespace features::combat {
 		if ( particle_manager )
 		{
 			memory::call<void>(PATTERN (patterns::particle_destroy_effect), particle_manager, this->m_particle_effect, true, true );
-			memory::call<void>(PATTERN (patterns::particle_stop_effect), particle_manager, this->m_particle_effect );
 		}
 
-		this->m_particle_effect = 0;
+		this->m_particle_effect = invalid_effect_index;
 	}
 
 	void misc::quickpeek::reset( )
@@ -1020,6 +1114,10 @@ namespace features::combat {
 		velocity.y += wish_y * accel_speed;
 
 		const auto move_magnitude = std::clamp( speed / ctx.weapon_max_speed, 0.0f, 1.0f );
+
+		// Decompose with the command yaw, matching the old build: the
+		// auto-stop counter-move works correctly there, while decomposing
+		// with the real view yaw made the stop wander under anti-aim.
 		const auto yaw_rad = base->viewangles( )->y( ) * ( std::numbers::pi_v<float> / 180.0f );
 		const auto sy = std::sinf( yaw_rad );
 		const auto cy = std::cosf( yaw_rad );

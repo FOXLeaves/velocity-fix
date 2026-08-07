@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/logging/logging.hpp>
 #include <core/systems/systems.hpp>
@@ -21,11 +21,20 @@ namespace features::movement {
 			return;
 		}
 
+		// Community servers run with sv_quantize_movement_input 0 and ignore
+		// subtick moves; use the dedicated unquantized path there.
+		if ( !CONVAR ("sv_quantize_movement_input")->get<bool>( ) )
+		{
+			this->unquantized_move( cmd );
+			return;
+		}
+
 		const auto current_buttons = cmd->buttons.value;
 		const bool shift_held = current_buttons & static_cast< std::uintptr_t >( cstypes::command_buttons::in_sprint );
 
 		const auto& prestate = systems::g_prediction.pre( );
 		const bool in_air = !( prestate.flags & cstypes::entity_flags::on_ground );
+
 
 		if ( shift_held && in_air )
 		{
@@ -38,7 +47,7 @@ namespace features::movement {
 				const auto vel_yaw = std::atan2f( vel.y, vel.x )
 					* ( 180.0f / std::numbers::pi_v<float> );
 
-				const auto view_yaw = base->viewangles( )->y( );
+				const auto view_yaw = this->m_angles.y;
 				const auto relative_yaw = ( vel_yaw - view_yaw )
 					* ( std::numbers::pi_v<float> / 180.0f );
 
@@ -52,6 +61,11 @@ namespace features::movement {
 			base->set_forwardmove( forward_move );
 			base->set_leftmove( left_move );
 
+			// With anti-aim active the engine decomposes along the command
+			// angles, so rotate this real-view stop output into the AA
+			// frame (angle_vectors convention matches the shift output).
+			features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
+
 			// write subtick entries so the engine respects the input precisely 
 			const auto subtick_moves = base->mutable_subtick_moves( );
 			if ( subtick_moves )
@@ -62,8 +76,11 @@ namespace features::movement {
 					step->set_button( 0 );
 					step->set_pressed( false );
 					step->set_when( 0.0f );
-					step->set_analog_forward_delta( forward_move - prestate.last_movement_impulses.x );
-					step->set_analog_left_delta( left_move - prestate.last_movement_impulses.y );
+					// The engine consumes the analog deltas, not the base
+					// move fields, so the deltas must carry the AA-rotated
+					// values or the rotation (and the stop) is ignored.
+					step->set_analog_forward_delta( base->forwardmove( ) - prestate.last_movement_impulses.x );
+					step->set_analog_left_delta( base->leftmove( ) - prestate.last_movement_impulses.y );
 				}
 			}
 			return;
@@ -111,11 +128,18 @@ namespace features::movement {
 
 		if ( !wants_stop )
 		{
-			this->check_button( current_buttons, cstypes::command_buttons::in_moveleft );
-			this->check_button( current_buttons, cstypes::command_buttons::in_moveright );
-			this->check_button( current_buttons, cstypes::command_buttons::in_forward );
-			this->check_button( current_buttons, cstypes::command_buttons::in_back );
-			this->m_last_buttons = current_buttons;
+			// Use the pre-fix command buttons: correct_movement rewrites the
+			// move keys under anti-aim (W -> moveleft on a side-step), and
+			// that would skew the direction bookkeeping by 90 deg.
+			const auto raw_buttons = features::combat::g_misc.antiaim( ).antiaim_active( )
+				? features::combat::g_misc.antiaim( ).raw_movement_buttons( )
+				: current_buttons;
+
+			this->check_button( raw_buttons, cstypes::command_buttons::in_moveleft );
+			this->check_button( raw_buttons, cstypes::command_buttons::in_moveright );
+			this->check_button( raw_buttons, cstypes::command_buttons::in_forward );
+			this->check_button( raw_buttons, cstypes::command_buttons::in_back );
+			this->m_last_buttons = raw_buttons;
 		}
 
 		const auto movement_services = memory::read<std::uintptr_t>( local.pawn + SCHEMA( "C_BasePlayerPawn", "m_pMovementServices"_hash ) );
@@ -129,6 +153,10 @@ namespace features::movement {
 		const auto sv_gravity = CONVAR ("sv_gravity")->get<float>( );
 		const auto sv_staminarecoveryrate = CONVAR ("sv_staminarecoveryrate")->get<float>( );
 
+		// Steering is derived from the REAL view yaw (the airstrafe frame
+		// that keeps bunnyhop accel self-consistent); anti-aim only rewrites
+		// the command view angles, and the movement fix rotates the user's
+		// input into that modified frame separately.
 		const auto view_angles = this->m_angles;
 		const auto cmd_move_backup = math::vector3{ base->forwardmove( ), base->leftmove( ), 0.0f };
 		const auto effective_maxspeed = memory::read<float>( movement_services + SCHEMA( "CPlayer_MovementServices", "m_flMaxspeed"_hash ) );
@@ -264,11 +292,24 @@ namespace features::movement {
 			{
 				base->set_forwardmove( 0.0f );
 				base->set_leftmove( 0.0f );
+					if ( effective_wants_stop )
+					{
+						this->rotate_to_stop( base, velocity );
 
-				if ( effective_wants_stop )
-				{
-					this->rotate_to_stop( base, velocity );
-				}
+						features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
+
+						if ( const auto stop_subtick = base->mutable_subtick_moves( ) )
+							{
+								if ( const auto stop_step = systems::g_input.acquire_subtick_step( stop_subtick ) )
+								{
+									stop_step->set_button( 0 );
+									stop_step->set_pressed( false );
+									stop_step->set_when( 0.0f );
+									stop_step->set_analog_forward_delta( base->forwardmove( ) - prestate.last_movement_impulses.x );
+									stop_step->set_analog_left_delta( base->leftmove( ) - prestate.last_movement_impulses.y );
+							}
+						}
+					}
 				else
 				{
 					const auto velocity_angle = std::atan2f( velocity.y, velocity.x ) * ( 180.0f / std::numbers::pi_v<float> );
@@ -309,7 +350,23 @@ namespace features::movement {
 
 					math::helpers::normalize_angle( target_yaw );
 
-					this->rotate_movement( base, target_yaw, base->viewangles( )->y( ) );
+					this->rotate_movement( base, target_yaw, this->m_angles.y );
+					features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
+
+					// Carry the rotated values into the analog deltas: the
+					// engine moves from the subtick deltas, so a rotation
+					// that only touches the base fields is ignored.
+					if ( const auto accel_subtick = base->mutable_subtick_moves( ) )
+						{
+							if ( const auto accel_step = systems::g_input.acquire_subtick_step( accel_subtick ) )
+							{
+								accel_step->set_button( 0 );
+								accel_step->set_pressed( false );
+								accel_step->set_when( 0.0f );
+								accel_step->set_analog_forward_delta( base->forwardmove( ) - prestate.last_movement_impulses.x );
+								accel_step->set_analog_left_delta( base->leftmove( ) - prestate.last_movement_impulses.y );
+						}
+					}
 				}
 			}
 
@@ -333,6 +390,163 @@ namespace features::movement {
 				this->m_side_switch = !this->m_side_switch;
 			}
 		}
+	}
+
+	void airstrafe::unquantized_move( systems::input::usercmd* cmd )
+	{
+		if ( features::movement::g_jumpbug.active_this_tick( ) )
+		{
+			return;
+		}
+
+		const auto base = cmd->csgo_user_cmd.mutable_base( );
+		if ( !base )
+		{
+			return;
+		}
+
+		const auto current_buttons = cmd->buttons.value;
+		const bool shift_held = current_buttons & static_cast< std::uintptr_t >( cstypes::command_buttons::in_sprint );
+
+		const auto& prestate = systems::g_prediction.pre( );
+		const bool in_air = !( prestate.flags & cstypes::entity_flags::on_ground );
+		if ( !in_air )
+		{
+			return;
+		}
+
+		const auto local = systems::g_local.get( );
+		if ( !local.pawn )
+		{
+			return;
+		}
+
+		const auto move_type = memory::read<std::uint8_t>( local.pawn + SCHEMA( "CBaseEntity", "m_nActualMoveType"_hash ) );
+		if ( move_type == cstypes::move_type::ladder || move_type == cstypes::move_type::noclip )
+		{
+			return;
+		}
+
+		const auto& velocity = prestate.networked_velocity;
+
+		// Shift air-stop: push against the velocity (base fields only).
+		if ( shift_held )
+		{
+			float forward_move = 0.0f;
+			float left_move = 0.0f;
+
+			if ( velocity.length_2d( ) > 10.0f )
+			{
+				const auto vel_yaw = std::atan2f( velocity.y, velocity.x ) * ( 180.0f / std::numbers::pi_v<float> );
+				const auto relative_yaw = ( vel_yaw - this->m_angles.y ) * ( std::numbers::pi_v<float> / 180.0f );
+
+				forward_move = std::clamp( -std::cosf( relative_yaw ), -1.0f, 1.0f );
+				left_move = std::clamp( -std::sinf( relative_yaw ), -1.0f, 1.0f );
+			}
+
+			base->set_forwardmove( forward_move );
+			base->set_leftmove( left_move );
+			features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
+			return;
+		}
+
+		const auto wants_stop = features::combat::g_rage.should_stop( ) || features::misc::g_projectile_trajectory.should_stop( );
+
+		if ( !settings::g_movement.airstrafe.value && !wants_stop || features::combat::g_rage.is_firing_this_tick( ) )
+		{
+			return;
+		}
+
+		if ( settings::g_movement.m_test_strafer.enabled.value && features::movement::g_test_strafer.handled_this_tick( ) )
+		{
+			return;
+		}
+
+		const auto movement_services = memory::read<std::uintptr_t>( local.pawn + SCHEMA( "C_BasePlayerPawn", "m_pMovementServices"_hash ) );
+		if ( !movement_services )
+		{
+			return;
+		}
+
+		this->check_button( current_buttons, cstypes::command_buttons::in_moveleft );
+		this->check_button( current_buttons, cstypes::command_buttons::in_moveright );
+		this->check_button( current_buttons, cstypes::command_buttons::in_forward );
+		this->check_button( current_buttons, cstypes::command_buttons::in_back );
+		this->m_last_buttons = current_buttons;
+
+		const auto speed_2d = velocity.length_2d( );
+		const auto effective_maxspeed = memory::read<float>( movement_services + SCHEMA( "CPlayer_MovementServices", "m_flMaxspeed"_hash ) );
+
+		if ( wants_stop && speed_2d <= 10.0f )
+		{
+			this->rotate_to_stop( base, velocity );
+			features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
+			return;
+		}
+
+		const auto sv_airaccelerate = CONVAR ("sv_airaccelerate")->get<float>( );
+		const auto sv_air_max_wishspeed = CONVAR ("sv_air_max_wishspeed")->get<float>( );
+		const auto surface_friction = prestate.surface_friction;
+
+		auto yaw_offset{ 0.0f };
+		if ( this->m_last_pressed & cstypes::command_buttons::in_moveleft )
+		{
+			yaw_offset += 90.0f;
+		}
+		if ( this->m_last_pressed & cstypes::command_buttons::in_moveright )
+		{
+			yaw_offset -= 90.0f;
+		}
+		if ( this->m_last_pressed & cstypes::command_buttons::in_forward )
+		{
+			yaw_offset *= 0.5f;
+		}
+		else if ( this->m_last_pressed & cstypes::command_buttons::in_back )
+		{
+			yaw_offset = -yaw_offset * 0.5f + 180.0f;
+		}
+
+		auto target_yaw = this->m_angles.y + yaw_offset;
+		math::helpers::normalize_angle( target_yaw );
+
+		const auto velocity_angle = std::atan2f( velocity.y, velocity.x ) * ( 180.0f / std::numbers::pi_v<float> );
+		auto velocity_delta = target_yaw - velocity_angle;
+		math::helpers::normalize_angle( velocity_delta );
+
+		const auto accel_speed = sv_airaccelerate * effective_maxspeed * cstypes::tick_interval * surface_friction;
+		const auto half_accel = accel_speed * 0.5f;
+		const auto optimal_floor = std::fmaxf( half_accel, sv_air_max_wishspeed - half_accel );
+		const auto ideal_angle = std::clamp( std::atanf( optimal_floor / std::fmaxf( speed_2d, 1.0f ) ) * ( 180.0f / std::numbers::pi_v<float> ), 0.0f, 45.0f );
+
+		if ( ( std::fabsf( velocity_delta ) > 170.0f && speed_2d > 80.0f ) || ( velocity_delta > ideal_angle && speed_2d > 80.0f ) )
+		{
+			target_yaw = velocity_angle + ideal_angle;
+			base->set_leftmove( -1.0f );
+		}
+		else if ( -ideal_angle <= velocity_delta || speed_2d <= 80.0f )
+		{
+			if ( this->m_side_switch )
+			{
+				target_yaw = target_yaw - ideal_angle;
+				base->set_leftmove( -1.0f );
+			}
+			else
+			{
+				target_yaw = target_yaw + ideal_angle;
+				base->set_leftmove( 1.0f );
+			}
+		}
+		else
+		{
+			target_yaw = velocity_angle - ideal_angle;
+			base->set_leftmove( 1.0f );
+		}
+
+		math::helpers::normalize_angle( target_yaw );
+
+		this->rotate_movement( base, target_yaw, this->m_angles.y );
+		features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
+		this->m_side_switch = !this->m_side_switch;
 	}
 
 	void airstrafe::store_angles( )
@@ -408,7 +622,7 @@ namespace features::movement {
 			base->set_leftmove( 0.0f );
 		}
 
-		const auto rotation = ( base->viewangles( )->y( ) - wish_yaw ) * ( std::numbers::pi_v<float> / 180.0f );
+		const auto rotation = ( this->m_angles.y - wish_yaw ) * ( std::numbers::pi_v<float> / 180.0f );
 		const auto fwd = base->forwardmove( );
 		const auto side = base->leftmove( );
 

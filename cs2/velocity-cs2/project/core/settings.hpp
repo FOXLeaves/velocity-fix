@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <utilities/math/math.hpp>
 #include <external/config.hpp>
@@ -12,12 +12,39 @@ namespace settings {
 			static constexpr auto k_group_count{ 6u };
 
 			xui::setting enabled{ true, {}, "enabled", "ragebot" };
+			// VAC live bypass: hides the modified view angles from the
+			// outgoing usercmd (original angles are sent; the aim is carried
+			// through subtick/input), mirroring the FVA view-angle spoofer.
+			xui::setting vac_bypass{ false, {}, "vac bypass", "ragebot" };
+
+			// Double tap: fires two shots one tick apart by rewriting the
+			// input-history claimed tick of the second shot (the "charge").
+			// The subtick input history accepts arbitrarily old claimed
+			// ticks, so stamping the charged shot at `shoot_tick - 1` makes
+			// the server cooldown arithmetic believe the attack is legal.
+			struct double_tap
+			{
+				xui::setting enabled{ false, {}, "double tap", "ragebot" };
+				xui::setting preview{ true, {}, "charge preview", "ragebot" };
+				// Quick bolt: a fire below 50% charge keeps charging instead
+				// of restarting (continuous cycle); off restarts the charge
+				// on every fire regardless of the charge level.
+				xui::setting quick_bolt{ false, {}, "quick bolt", "ragebot" };
+				config::col charging_color{ { 255, 200, 60, 255 }, "ragebot", "dt charging color" };
+				config::col ready_color{ { 120, 220, 140, 255 }, "ragebot", "dt ready color" };
+				config::col failed_color{ { 255, 90, 90, 255 }, "ragebot", "dt failed color" };
+			} m_double_tap{};
 
 			struct weapon_group
 			{
+				enum class no_spread_mode : int { off = 0, forced = 1, seed = 2 };
+
 				xui::setting silent{ true, {}, "silent", "ragebot" };
 				xui::setting no_spread{ false, {}, "no spread", "ragebot" };
-				xui::setting doubletap{ false, {}, "doubletap", "ragebot" };
+				// 1 = forced (classic correction), 2 = seed mode (legit-style,
+				// no angle compensation - the view aims at the target and the
+				// bullet keeps its natural spread).
+				config::enm<no_spread_mode> no_spread_mode{ no_spread_mode::forced };
 				xui::setting body_aim{ false, {}, "force b-aim", "ragebot" };
 				xui::setting force_shot_air{ false, {}, "force shot in air", "ragebot" };
 				xui::setting force_shot{ false, {}, "force shot on ground", "ragebot" };
@@ -36,6 +63,17 @@ namespace settings {
 			config::val<float> pointscale{ 85.0f };
 			xui::setting dynamic_pointscale{ true, {}, "dynamic point scale", "ragebot" };
 			xui::setting debug_multipoints{ false, {}, "debug multipoints", "ragebot" };
+			// Extra dense head/body multipoint sets (diagonals, face/back)
+			// layered on top of the base points. Toggles manage enable/disable;
+			// the scale sliders tune their distance (0 = auto, follows the
+			// point scale including the automatic multipoint scale).
+			xui::setting extra_head_points{ true, {}, "extra head points", "ragebot" };
+			xui::setting extra_body_points{ true, {}, "extra body points", "ragebot" };
+			config::val<int> extra_head_scale{ 100 };
+			config::val<int> extra_body_scale{ 100 };
+			// Force-shot minimum hitchance (0 = only at max accuracy).
+			config::val<int> force_hitchance{ 0 };
+			config::val<int> force_hitchance_air{ 0 };
 
 			config::bools<6> hitboxes{ { true, true, true, true, true, true } };
 
@@ -45,7 +83,7 @@ namespace settings {
 
 				this->silent.category = s;
 				this->no_spread.category = s;
-				this->doubletap.category = s;
+				this->no_spread_mode.reg( s, "no spread mode" );
 				this->body_aim.category = s;
 				this->force_shot_air.category = s;
 				this->force_shot.category = s;
@@ -53,6 +91,10 @@ namespace settings {
 				this->hitchance_override.category = s;
 				this->dynamic_pointscale.category = s;
 				this->debug_multipoints.category = s;
+				this->extra_head_points.category = s;
+				this->extra_body_points.category = s;
+				this->extra_head_scale.reg( s, "extra head scale" );
+				this->extra_body_scale.reg( s, "extra body scale" );
 
 				this->max_fov.reg( s, "max fov" );
 				this->hitchance.reg( s, "hit chance" );
@@ -60,6 +102,8 @@ namespace settings {
 				this->min_damage_override_value.reg( s, "min damage override value" );
 				this->hitchance_override_value.reg( s, "hit chance override value" );
 				this->pointscale.reg( s, "point scale" );
+				this->force_hitchance.reg( s, "force shot hit chance" );
+				this->force_hitchance_air.reg( s, "force shot air hit chance" );
 				this->hitboxes.reg( s, "hitboxes" );
 			}
 
@@ -124,9 +168,15 @@ namespace settings {
 				config::val<int> trigger_hitchance{ 80 };
 				xui::setting trigger_head_only{ false, {}, "trigger head only", "legitbot" };
 				xui::setting give_me_your_seed{ false, {}, "trigger seed mode", "legitbot" };
+				// Constrain the seed correction and fire cadence so the
+				// result stays inside what a human could plausibly produce.
+				xui::setting seed_constraint{ false, {}, "seed constraint", "legitbot" };
 
 				xui::setting autowall{ true, {}, "autowall", "legitbot" };
 				config::val<int> min_damage{ 101 };
+				// Damage floor for fully exposed targets (seed trigger mode);
+				// the autowall min_damage covers wall-banged targets.
+				config::val<int> seed_min_damage{ 35 };
 
 				xui::setting visualize_fov{ true, {}, "visualize fov", "legitbot" };
 				config::col fov_color{ { 255, 255, 255, 150 } };
@@ -141,6 +191,7 @@ namespace settings {
 					this->triggerbot.category = s;
 					this->trigger_head_only.category = s;
 					this->give_me_your_seed.category = s;
+					this->seed_constraint.category = s;
 					this->autowall.category = s;
 					this->visualize_fov.category = s;
 
@@ -155,6 +206,7 @@ namespace settings {
 					this->trigger_delay.reg( s, "trigger delay" );
 					this->trigger_hitchance.reg( s, "trigger hitchance" );
 					this->min_damage.reg( s, "min damage" );
+					this->seed_min_damage.reg( s, "seed min damage" );
 					this->fov_color.reg( s, "fov color" );
 				}
 			};
@@ -194,24 +246,20 @@ namespace settings {
 				up
 			};
 
+			enum class yaw_mode : std::uint8_t
+			{
+				back,
+				real_view
+			};
+
 			xui::setting enabled{ true, {}, "anti aim", "anti aim" };
 			config::enm<pitch_mode> pitch{ pitch_mode::down, "anti aim", "pitch" };
-			xui::setting at_targets{ false, { VK_SPACE, xui::bind_mode::hold_on }, "force back to targets", "anti aim" };
+			config::enm<yaw_mode> yaw{ yaw_mode::back, "anti aim", "yaw" };
 			xui::setting auto_yaw_adjust{true, {}, "correct yaw to compensate for the models inherit sideways roll", "anti aim"};
 			xui::setting manual_left{ false, { 'Z', xui::bind_mode::toggle }, "force left", "anti aim" };
 			xui::setting manual_right{ false, { 'C', xui::bind_mode::toggle }, "force right", "anti aim" };
 			xui::setting hide_shots{ true, {}, "hide onshot", "anti aim" };
 			xui::setting avoid_backstab{ true, {}, "avoid backstab", "anti aim" };
-
-			enum class autoyaw_mode : std::uint8_t
-			{
-				none,
-				crosshair,
-				distance,
-				health
-			};
-
-			config::enm<autoyaw_mode> autoyaw{ autoyaw_mode::none, "anti aim", "autoyaw" };
 
 			xui::setting direction_indicator{ true, {}, "direction indicator", "anti aim" };
 			config::col direction_indicator_color{ { 173, 192, 255, 220 }, "anti aim", "direction indicator color" };
@@ -239,9 +287,23 @@ namespace settings {
 
 		struct lagcomp_settings
 		{
+			// Attack-backtrack: when enabled the ragebot may shoot at
+			// rewound (lag-compensated) records up to max_backtrack_ticks;
+			// when disabled only the live record and the extrapolated
+			// prediction are used.
+			xui::setting backtrack{ true, {}, "backtrack", "ragebot" };
 			config::val<int> max_backtrack_ticks{ 12, "ragebot", "max backtrack ticks" };
 			xui::setting extrapolation{ true, {}, "extrapolation", "ragebot" };
 			config::val<int> max_extrapolate_ticks{ 8, "ragebot", "max extrapolate ticks" };
+			/// Auto extrapolation ignores the manual tick cap and follows the
+			/// full server-visible gap (clamped to the 1..18 tick range).
+			xui::setting extrapolation_auto{ true, {}, "auto extrapolation", "ragebot" };
+			/// Stops extrapolating early when the predicted path is fully
+			/// blocked (wall/entity), so the pose never ends up inside cover.
+			xui::setting extrapolation_correct{ true, {}, "extrapolation correction", "ragebot" };
+			/// Extrapolate airborne targets too (falling/jumping players get
+			/// gravity-corrected predictions instead of being skipped).
+			xui::setting extrapolation_air{ true, {}, "air extrapolation", "ragebot" };
 		} m_lagcomp{};
 
 		struct zeusbot
@@ -255,6 +317,11 @@ namespace settings {
 		{
 			xui::setting revolver{ true, {}, "auto revolver", "autos" };
 			xui::setting scope{ true, {}, "auto scope", "autos" };
+			/// Air auto-stop for non-sniper weapons: rage requests a stop while
+			/// airborne (the airstrafe system executes the deceleration). The
+			/// stop is only requested while the shift key is held, pairing with
+			/// the airstrafe shift air-stop.
+			xui::setting air_stop{ false, {}, "air stop on shift", "autos" };
 		} m_autos{};
 
 		struct knifebot
@@ -586,6 +653,20 @@ namespace settings {
 			};
 
 			std::array<overlay, 2> m_overlay{ { overlay{ "esp enemy" }, overlay{ "esp team", false } } };
+
+			// Ragebot diagnostics on the enemy body: extrapolated pose and
+			// the backtrack history trail.
+			struct backtrack_display
+			{
+				xui::setting enabled{ false, {}, "backtrack display", "esp" };
+				config::col color{ { 80, 160, 255, 255 }, "esp", "backtrack color" };
+			} m_backtrack_display{};
+
+			struct extrapolation_display
+			{
+				xui::setting enabled{ false, {}, "extrapolation display", "esp" };
+				config::col color{ { 255, 200, 60, 255 }, "esp", "extrapolation color" };
+			} m_extrapolation_display{};
 
 			struct chams
 			{
@@ -1092,13 +1173,21 @@ namespace settings {
 		{
 			std::int16_t ct_def{};
 			std::int16_t t_def{};
+			xui::setting ct_custom_enabled{ false, {}, "custom model (ct)", "changer" };
+			xui::setting t_custom_enabled{ false, {}, "custom model (t)", "changer" };
+			std::string ct_custom_model{};
+			std::string t_custom_model{};
 
 			nlohmann::json serialize( ) const override
 			{
 				return nlohmann::json
 				{
 					{ "ct", ct_def },
-					{ "t", t_def }
+					{ "t", t_def },
+					{ "ct_custom_enabled", ct_custom_enabled.value },
+					{ "t_custom_enabled", t_custom_enabled.value },
+					{ "ct_custom_model", ct_custom_model },
+					{ "t_custom_model", t_custom_model }
 				};
 			}
 
@@ -1111,6 +1200,10 @@ namespace settings {
 
 				ct_def = j.value( "ct", static_cast< std::int16_t >( 0 ) );
 				t_def = j.value( "t", static_cast< std::int16_t >( 0 ) );
+				ct_custom_enabled.value = j.value( "ct_custom_enabled", false );
+				t_custom_enabled.value = j.value( "t_custom_enabled", false );
+				ct_custom_model = j.value( "ct_custom_model", std::string{ } );
+				t_custom_model = j.value( "t_custom_model", std::string{ } );
 			}
 		};
 
@@ -1132,16 +1225,13 @@ namespace settings {
 			config::col color{ { 255, 255, 0, 255 }, "misc", "scoreboard weapons color" };
 		} m_scoreboard_weapons{};
 
+		xui::setting auto_accept{ false, {}, "auto accept", "misc" };
+
 		struct name_changer
 		{
-			enum class mode_type : std::uint8_t { clantag, override_name };
-			enum class animation_type : std::uint8_t { typewriter, none };
-
-			xui::setting enabled{ false, {}, "name changer", "name changer" };
-			config::enm<mode_type> mode{ mode_type::clantag, "name changer", "mode" };
-			config::enm<animation_type> animation{ animation_type::typewriter, "name changer", "animation" };
-			config::val<float> speed{ 0.25f, "name changer", "speed" };
-			config::str text{ "a clantag", "name changer", "text" };
+			xui::setting clantag{ false, {}, "clantag", "name changer" };
+			xui::setting override_name{ false, {}, "override name", "name changer" };
+			config::str name{ "Player", "name changer", "name" };
 		} m_name_changer{};
 
 		struct projectile_trajectory
@@ -1231,7 +1321,10 @@ namespace settings {
 			config::val<float> fov{ 115.0f, "camera", "fov" };
 
 			xui::setting scoped_fov_override{ false, {}, "scoped fov override", "camera" };
+			// Two zoom stages for snipers: first zoom (level 1) and second
+			// zoom (level 2) each get their own FOV override.
 			config::val<float> scoped_fov{ 40.0f, "camera", "scoped fov" };
+			config::val<float> scoped_fov_2{ 40.0f, "camera", "scoped fov 2" };
 
 			xui::setting thirdperson{ true, { VK_MBUTTON, xui::bind_mode::toggle }, "thirdperson", "camera" };
 			config::val<float> thirdperson_distance{ 85.0f, "camera", "thirdperson distance" };
@@ -1277,10 +1370,10 @@ namespace settings {
 
 			struct hat
 			{
-				enum class hat_type : std::uint8_t { kasa, bucket };
+				enum class hat_type : std::uint8_t { bucket, halo };
 
 				xui::setting enabled{ false, {}, "hat", "hat" };
-				config::enm<hat_type> type{ hat_type::kasa, "hat", "type" };
+				config::enm<hat_type> type{ hat_type::halo, "hat", "type" };
 				config::col color{ { 255, 171, 234, 160 }, "hat", "color" };
 				config::col secondary_color{ { 173, 192, 255, 160 }, "hat", "secondary color" };
 				xui::setting glow{ true, {}, "glow", "hat" };
@@ -1326,11 +1419,13 @@ namespace settings {
 			config::bools<5> grenades{ { true, true, true, false, false }, "autobuy", "grenades" };
 		} m_autobuy{};
 
-		xui::setting get_praised_by_a_femboy_in_chat{ true, {}, "get praised by a femboy in chat", "misc" };
 		xui::setting preserve_killfeed{ true, {}, "preserve killfeed", "misc" };
 		xui::setting reveal_radar{ true, {}, "reveal radar", "misc" };
 		xui::setting disable_game_logs{ true, {}, "disable game logs", "misc" };
-		config::val<int> menu_key{ VK_DELETE, "misc", "menu key" };
+		config::val<int> menu_key{ VK_INSERT, "misc", "menu key" };
+		// Persisted menu window size (drag the bottom-right corner to resize).
+		config::val<float> menu_width{ 700.0f, "misc", "menu width" };
+		config::val<float> menu_height{ 450.0f, "misc", "menu height" };
 
 		struct watermark_cfg
 		{
@@ -1388,19 +1483,25 @@ namespace settings {
 		xui::setting edgejump{ false, { 'E', xui::bind_mode::hold_on}, "edgejump", "movement" };
 		xui::setting edgestop{ false, { 'N', xui::bind_mode::hold_on}, "edgestop", "movement" };
 		xui::setting edgebug{ false, {}, "edgebug", "movement" };
-		/// 0..4 — matches jmp table order around \c loc_C80A3A in dump (mode dword selects case before the active path).
+		/// 0..4 閳?matches jmp table order around \c loc_C80A3A in dump (mode dword selects case before the active path).
 		config::val<int> edgebug_mode{ 1, "movement", "edgebug mode" };
-		/// Analog of \c xmmword_E22CA4+0xC — extra subtick duck cycles (each cycle = press+release pair).
+		/// Analog of \c xmmword_E22CA4+0xC 閳?extra subtick duck cycles (each cycle = press+release pair).
 		config::val<int> edgebug_passes{ 1, "movement", "edgebug passes" };
 		/// Adds jump up/down subticks like jumpbug after duck sequence (not in every dump path; optional).
 		xui::setting edgebug_include_jump_steps{ false, {}, "edgebug jump steps", "movement" };
 		xui::setting slowwalk{ false, { 'P', xui::bind_mode::hold_on}, "slowwalk", "movement" };
 		config::val<float> slowwalk_speed{ 33.0f, "movement", "slowwalk speed" };
-
+		// Mini jump (celerity parity): while grounded with jump held, duck
+		// on every grounded tick so the takeoff is a duck-jump - lower
+		// hop, quieter landing.
+		xui::setting mini_jump{ false, {}, "mini jump", "movement" };
 		struct test_strafer
 		{
 			xui::setting enabled{ false, {}, "test strafer", "movement" };
 		} m_test_strafer{};
+
+		xui::setting m_strafe_debug{ false, {}, "strafe debug", "movement" };
+
 
 		struct velocity_debug
 		{
@@ -1431,7 +1532,8 @@ namespace settings {
 
 			xui::setting wind{ true, {}, "wind", "weather" };
 			config::val<float> wind_strength{ 3.0f, "weather", "wind strength" };
-			config::val<float> wind_frequency{ 4.5f, "weather", "wind frequency" };
+			config::val<float> wind_direction{ 0.0f, "weather", "wind direction" };
+			config::val<float> wind_turbulence{ 1.0f, "weather", "wind turbulence" };
 		} m_weather{};
 
 		struct scene
@@ -1439,7 +1541,7 @@ namespace settings {
 			struct skyboxing
 			{
 				xui::setting custom_skybox{ true, {}, "skybox material", "scene" };
-				config::val<int> selected_skybox{ 60, "scene", "selected skybox" };
+				config::val<int> selected_skybox{ 0, "scene", "selected skybox" };
 
 				xui::setting custom_color{ true, {}, "skybox color", "scene" };
 				config::col skybox_color{ { 249, 103, 206, 255 }, "scene", "skybox color value" };
@@ -1462,10 +1564,6 @@ namespace settings {
 
 			xui::setting gamma{ true, {}, "gamma", "scene" };
 			config::val<float> gamma_value{ 2.2f, "scene", "gamma value" };
-
-			xui::setting wetness{ true, {}, "wetness", "scene" };
-			config::val<float> wetness_density{ 1.8f, "scene", "wetness density" };
-			config::val<float> wetness_speed{ 0.8f, "scene", "wetness speed" };
 
 			xui::setting dof{ true, {}, "depth of field", "scene" };
 			config::val<float> dof_near_blurry{ 0.0f, "scene", "dof near blurry" };

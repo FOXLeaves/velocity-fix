@@ -1,66 +1,84 @@
 #include <pch/pch.hpp>
+#include <utilities/diag.hpp>
 #include <utilities/memory/memory.hpp>
+#include <protection/patterns.hpp>
 #include <protection/game_addresses.hpp>
 #include "../logging.hpp"
 
 namespace logging::console {
 
-	namespace detail {
+	namespace {
 
-		std::uintptr_t log_direct_color {};
-		int log_general {};
+		std::uintptr_t s_log_a1{};
+		std::uint32_t s_log_channel{};
+		std::int32_t s_log_severity{};
+		std::uintptr_t s_log_metadata{};
 
-		static inline void lerp_color (const std::uint8_t* from, const std::uint8_t* to, float t, std::uint8_t* out) {
-			for (auto i = 0; i < 4; ++i) {
-				out [i] = static_cast<std::uint8_t> (from [i] + (to [i] - from [i]) * t);
-			}
-		}
-
-	} // namespace detail
+	}
 
 	bool initialize () {
-		detail::log_direct_color = memory::get_module_export (MODULE_BASE ("tier0.dll"), static_cast<std::uint16_t> (947)); // LoggingSystem_Log(int,LoggingSeverity_t,Color,char const *,...)	000000018012EA10	947
-		if (!detail::log_direct_color) {
-			return false;
-		}
+		// note: this used to resolve tier0's LoggingSystem_Log by hardcoded
+		// ordinal, which is stale on current cs2 builds and crashed the game
+		// whenever anything was printed. Logging now goes to the structured
+		// diagnostics file next to the DLL, the debugger output, and the
+		// in-game developer console through the engine log pipeline (the
+		// console color follows the severity level).
 
-		detail::log_general = *reinterpret_cast<int*>(MODULE_EXPORT ("tier0.dll:LOG_GENERAL"));
+		// The engine maps console severity level 4 to purple; patch the
+		// color-table entry to green so kill logs render green (hit =
+		// yellow level 2, miss = red level 3).
+		const auto color_entry = PATTERN( patterns::severity4_color );
+		if ( color_entry )
+		{
+			__try
+			{
+				DWORD old_protect{};
+				auto* const slot = reinterpret_cast< std::uint8_t* >( color_entry + 6 );
+				if ( VirtualProtect( slot, 4, PAGE_READWRITE, &old_protect ) )
+				{
+					*reinterpret_cast< std::uint32_t* >( slot ) = 0xFF00FF00u; // RGBA green
+					VirtualProtect( slot, 4, old_protect, &old_protect );
+				}
+			}
+			__except ( EXCEPTION_EXECUTE_HANDLER ) { }
+		}
 
 		return true;
 	}
 
-	void print_raw (const char* text) {
-		if (!detail::log_direct_color) {
+	void cache_engine_log_context (std::uintptr_t a1, std::uint32_t channel, std::int32_t severity, std::uintptr_t metadata) {
+		s_log_a1 = a1;
+		s_log_channel = channel;
+		s_log_severity = severity;
+		s_log_metadata = metadata;
+	}
+
+	void print_raw (const char* text, std::int32_t severity) {
+		if ( !text ) {
 			return;
 		}
 
+		const bool was_emitting = emitting;
 		emitting = true;
+		diag::write( diag::level::info, text );
 
-		constexpr auto prefix {"[velocity] "};
-		constexpr auto prefix_len {11ull};
-
-		constexpr std::uint8_t pink [4] {252, 217, 240, 255};
-		constexpr std::uint8_t blue [4] {173, 192, 255, 255};
-		constexpr std::uint8_t blite [4] {220, 225, 240, 255};
-
-		char buf [2] {0, 0};
-
-		for (auto i = 0ull; i < prefix_len; ++i) {
-			const auto t = prefix_len > 1 ? static_cast<float>(i) / (prefix_len - 1) : 0.f;
-
-			std::uint8_t color [4];
-			detail::lerp_color (pink, blue, t, color);
-
-			buf [0] = prefix [i];
-			memory::call<int> (detail::log_direct_color, detail::log_general, 2, *reinterpret_cast<int*>(&color), buf);
+		// Mirror into the in-game developer console through the engine log
+		// pipeline (raw call - the context was captured from the log_internal
+		// hook, so the message lands in the channel the game prints to).
+		// A trailing newline keeps consecutive hit/miss lines separated.
+		if ( s_log_a1 ) {
+			__try {
+				std::string line{ text };
+				line += '\n';
+				memory::call<std::intptr_t>(
+					PATTERN( patterns::log_internal ),
+					s_log_a1, s_log_channel, severity, s_log_metadata,
+					line.c_str( ), nullptr );
+			}
+			__except ( EXCEPTION_EXECUTE_HANDLER ) { }
 		}
 
-		char msg [2048];
-		std::snprintf (msg, sizeof (msg), "%s\n", text);
-
-		memory::call<int> (detail::log_direct_color, detail::log_general, 2, *reinterpret_cast<int*>(const_cast<std::uint8_t*>(blite)), msg);
-
-		emitting = false;
+		emitting = was_emitting;
 	}
 
 } // namespace logging::console

@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
 #include <core/systems/systems.hpp>
@@ -63,7 +63,7 @@ namespace features::changer {
 		this->process_hud_clear( );
 
 		const auto local = systems::g_local.get( );
-		if ( !local.is_alive || systems::g_local.is_in_cinematic( ) || !local.pawn || !local.controller )
+		if ( !local.pawn || !local.controller )
 		{
 			return;
 		}
@@ -270,26 +270,22 @@ namespace features::changer {
 	void knives::rebuild_paint( std::uintptr_t weapon, std::uintptr_t active_weapon, std::uintptr_t pawn, const econ_item_system::paint_kit* pk )
 	{
 		const auto is_legacy = pk && pk->legacy_model;
-		if ( is_legacy )
-		{
-			memory::call<void>(PATTERN (patterns::weapon_update_mesh), weapon );
-		}
-		else
-		{
-			int empty_mask[ 3 ]{ 0, 0, 0 };
-			memory::call<void>(PATTERN (patterns::weapon_update_skin), weapon, &empty_mask );
-		}
+		const auto mesh_group = is_legacy ? std::uint64_t{ 2 } : std::uint64_t{ 1 };
 
 		if ( weapon == active_weapon )
 		{
 			this->update_view_model( pawn, pk );
 		}
 
-		memory::write<bool>( weapon + 0x18b8, false );
-		memory::call<void>(PATTERN (patterns::weapon_set_mesh_group_mask), weapon + 0x608, true );
-		memory::call_vfunc<void>( weapon, 11, 1 );
-		memory::call_vfunc<void>( weapon, 110, 1 );
-		memory::call<void>(PATTERN (patterns::weapon_update_composite_material), weapon, static_cast< char >( 0 ) );
+		const auto weapon_scene_node = memory::read<std::uintptr_t>( weapon + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
+		if ( weapon_scene_node )
+		{
+			memory::call<void>( PATTERN( patterns::weapon_set_mesh_group_mask ), weapon_scene_node, mesh_group );
+		}
+
+		memory::call<void>( PATTERN( patterns::weapon_update_composite_material ), weapon + 0x608, true );
+		memory::call_vfunc<void>( weapon, 10, 1 );
+		memory::call<void>( PATTERN( patterns::weapon_update_skin ), weapon, true );
 	}
 
 	void knives::update_view_model( std::uintptr_t pawn, const econ_item_system::paint_kit* pk )
@@ -300,18 +296,14 @@ namespace features::changer {
 			return;
 		}
 
-		memory::call<void>(PATTERN (patterns::weapon_set_mesh_group_mask), view_model + 0x608, true );
+		const auto view_model_scene_node = memory::read<std::uintptr_t>( view_model + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
+		if ( !view_model_scene_node )
+		{
+			return;
+		}
 
 		const auto is_legacy = pk && pk->legacy_model;
-		if ( is_legacy )
-		{
-			memory::call<void>(PATTERN (patterns::weapon_update_mesh), view_model );
-		}
-		else
-		{
-			int empty_mask[ 3 ]{ 0, 0, 0 };
-			memory::call<void>(PATTERN (patterns::weapon_update_skin), view_model, &empty_mask );
-		}
+		memory::call<void>( PATTERN( patterns::weapon_set_mesh_group_mask ), view_model_scene_node, is_legacy ? std::uint64_t{ 2 } : std::uint64_t{ 1 } );
 	}
 
 	std::uintptr_t knives::find_hud_model_weapon( std::uintptr_t pawn )
@@ -355,68 +347,21 @@ namespace features::changer {
 
 	void knives::clear_hud_icon( std::uintptr_t iv )
 	{
-		const auto cached = memory::read<std::uintptr_t>( iv + 0x200 );
-		if ( cached )
+		const auto invalidate = PATTERN( patterns::econ_item_view_invalidate_description );
+		if ( iv && invalidate )
 		{
-			memory::write<std::uintptr_t>( iv + 0x200, 0 );
+			memory::call<void>( invalidate, iv );
 		}
-
-		const auto hud = memory::call<std::uintptr_t>(PATTERN (patterns::find_hud_element), "HudWeaponSelection" );
-		if ( !hud )
-		{
-			return;
-		}
-
-		const auto widget = hud - 0x98;
-		const auto row_count = memory::read<int>( widget + 80 );
-
-		if ( row_count <= 0 )
-		{
-			return;
-		}
-
-		const auto row_array = memory::read<std::uintptr_t>( widget + 88 );
-		if ( !row_array )
-		{
-			return;
-		}
-
-		const auto row_panel = memory::read<std::uintptr_t>( row_array + 8 );
-		if ( !row_panel || !memory::read<std::uintptr_t>( row_panel ) )
-		{
-			return;
-		}
-
-		memory::call<void>(PATTERN (patterns::hud_weapon_selection_update), widget, 0, 0 );
 	}
 
 	void knives::schedule_hud_clear( std::uintptr_t iv )
 	{
-		if ( this->m_pending_hud_iv )
-		{
-			this->clear_hud_icon( this->m_pending_hud_iv );
-		}
-
 		this->clear_hud_icon( iv );
-
-		this->m_pending_hud_iv = iv;
-		this->m_hud_clear_time = std::chrono::steady_clock::now( );
+		this->m_pending_hud_iv = 0;
 	}
 
 	void knives::process_hud_clear( )
 	{
-		if ( !this->m_pending_hud_iv )
-		{
-			return;
-		}
-
-		const auto elapsed = std::chrono::steady_clock::now( ) - this->m_hud_clear_time;
-		if ( elapsed < std::chrono::milliseconds( 250 ) )
-		{
-			return;
-		}
-
-		this->clear_hud_icon( this->m_pending_hud_iv );
 		this->m_pending_hud_iv = 0;
 	}
 

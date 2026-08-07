@@ -2,6 +2,7 @@
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
 #include <utilities/logging/logging.hpp>
+#include <utilities/diag.hpp>
 #include <core/systems/systems.hpp>
 #include <core/features/features.hpp>
 #include <protection/game_addresses.hpp>
@@ -9,62 +10,6 @@
 namespace features::combat {
 
 	namespace detail {
-
-		class record_trace_scope
-		{
-		public:
-			explicit record_trace_scope( shared::lagcomp::record* record ) noexcept
-				: m_record( record )
-			{
-				if ( !record || !record->valid || !record->game_scene_node )
-				{
-					return;
-				}
-
-				this->m_abs_origin = memory::read<math::vector3>( record->game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
-				this->m_abs_rotation = memory::read<math::vector3>( record->game_scene_node + SCHEMA( "CGameSceneNode", "m_angAbsRotation"_hash ) );
-
-				memory::write<math::vector3>( record->game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ), record->origin );
-				memory::write<math::vector3>( record->game_scene_node + SCHEMA( "CGameSceneNode", "m_angAbsRotation"_hash ), record->rotation );
-
-				if ( !record->is_applied )
-				{
-					record->apply( );
-					this->m_applied_bones = true;
-				}
-
-				this->m_active = true;
-			}
-
-			~record_trace_scope( )
-			{
-				if ( !this->m_active || !this->m_record )
-				{
-					return;
-				}
-
-				if ( this->m_applied_bones )
-				{
-					this->m_record->restore( );
-				}
-
-				if ( this->m_record->game_scene_node )
-				{
-					memory::write<math::vector3>( this->m_record->game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ), this->m_abs_origin );
-					memory::write<math::vector3>( this->m_record->game_scene_node + SCHEMA( "CGameSceneNode", "m_angAbsRotation"_hash ), this->m_abs_rotation );
-				}
-			}
-
-			record_trace_scope( const record_trace_scope& ) = delete;
-			record_trace_scope& operator=( const record_trace_scope& ) = delete;
-
-		private:
-			shared::lagcomp::record* m_record{};
-			math::vector3 m_abs_origin{};
-			math::vector3 m_abs_rotation{};
-			bool m_active{ false };
-			bool m_applied_bones{ false };
-		};
 
 		struct bullet_trace_record
 		{
@@ -77,6 +22,25 @@ namespace features::combat {
 			std::uint8_t can_penetrate;
 			std::uint8_t pad[ 3 ];
 		};
+
+		// Engine calls on the hot path (spread, inaccuracy, autowall) receive
+		// parameters whose layout can drift across game updates. A mismatch
+		// raises a divide-by-zero or access violation inside engine code;
+		// swallow it here and return a safe fallback so one bad update cannot
+		// take the whole process down. The lambda closure is POD, so this
+		// function is safe to use with SEH.
+		template <typename Fn>
+		auto guarded( Fn&& fn ) -> decltype( fn( ) )
+		{
+			__try
+			{
+				return fn( );
+			}
+			__except ( EXCEPTION_EXECUTE_HANDLER )
+			{
+				return {};
+			}
+		}
 
 	} // namespace detail
 
@@ -98,11 +62,19 @@ namespace features::combat {
 		};
 	}
 
-	shared::penetration::run_context shared::penetration::prepare_target( std::uintptr_t target_pawn, lagcomp::record* record ) const
+	shared::penetration::run_context shared::penetration::prepare_target( std::uintptr_t target_pawn, lagcomp::record* record, const systems::hitboxes::set* external_hitboxes ) const
 	{
 		run_context ctx{};
 		ctx.target_pawn = target_pawn;
 		ctx.record = record;
+		if ( external_hitboxes && external_hitboxes->count > 0 )
+		{
+			ctx.hitboxes = *external_hitboxes;
+		}
+		else if ( record && record->game_scene_node )
+		{
+			ctx.hitboxes = systems::g_hitboxes.query( record->game_scene_node );
+		}
 
 		ctx.target_armor = memory::read<int>( target_pawn + SCHEMA( "C_CSPlayerPawn", "m_ArmorValue"_hash ) );
 		ctx.target_team = memory::read<int>( target_pawn + SCHEMA( "C_BaseEntity", "m_iTeamNum"_hash ) );
@@ -130,53 +102,139 @@ namespace features::combat {
 		return ctx;
 	}
 
-	bool shared::penetration::run( const math::vector3& start, const math::vector3& end, const run_context& ctx, std::uintptr_t local_pawn, int local_team, result& out, int target_hitgroup ) const
+	bool shared::penetration::run( const math::vector3& start, const math::vector3& end, const run_context& ctx, std::uintptr_t local_pawn, int local_team, result& out ) const
 	{
+		return detail::guarded( [ & ]( ) -> bool
+		{
 		if ( this->m_weapon_data.damage <= 0.0f )
 		{
 			return false;
 		}
 
 		const auto direction = ( end - start ).normalized( );
-		const auto trace_end = direction * this->m_weapon_data.range;
+		const auto trace_delta = direction * this->m_weapon_data.range;
 
 		auto filter = systems::g_tracing.make_filter( local_pawn, 0x1c300b, 3, 15 );
-		auto trace = std::make_unique<systems::tracing::trace_data>( );
+		// Rage scanning calls this hundreds of times in a frame. Reuse the large
+		// trace buffer per worker instead of allocating and freeing 7 KB per
+		// point; the buffer is zeroed every call to match the old (known-good)
+		// behaviour - setup_trace may not fully re-initialize the hit arrays.
+		thread_local systems::tracing::trace_data trace_storage{};
+		trace_storage = {};
+		auto* trace = &trace_storage;
 		trace->array_pointer = &trace->elements;
+		trace->hit_array_pointer = &trace->hit_elements;
 
 		g_shared.m_current_autowall_record = ctx.record;
-		g_shared.m_autowall_target_pawn = ctx.target_pawn;
 		g_shared.m_autowalling = true;
 
-		detail::record_trace_scope trace_scope{ ctx.record };
-		systems::g_tracing.setup_trace( trace.get( ), start, trace_end, filter, 4, true );
+		// The hitbox-transform hook supplies this thread's record directly.
+		// Do not swap the live entity pose: Present may read it concurrently.
+		// The marker is intentionally dropped BEFORE trace_bullet (matching
+		// the old known-good build): keeping it up through the engine call
+		// made the hook rewrite transforms mid-trace, which turned scan_player
+		// into an access-violation storm (0xC0000005 in client.dll trace code).
+		// trace_bullet therefore resolves against the live pose, exactly like
+		// the server does.
+		systems::g_tracing.setup_trace( trace, start, trace_delta, filter, 4, true );
 
 		g_shared.m_autowalling = false;
-		g_shared.m_autowall_target_pawn = 0;
 		g_shared.m_current_autowall_record = nullptr;
 
-		const auto trace_ptr = reinterpret_cast< std::uintptr_t >( trace.get( ) );
-		const auto num_hits = memory::read<int>( trace_ptr + 0x1820 );
-		const auto hit_array = memory::read<std::uintptr_t>( trace_ptr + 0x1828 );
+		const auto num_hits = trace->num_hits;
+		const auto hit_array = reinterpret_cast< std::uintptr_t >( trace->hit_array_pointer );
 
-		if ( num_hits <= 0 )
+		if ( num_hits <= 0 || num_hits > 64 )
 		{
+			// A garbage hit count from a drifted engine signature would walk
+			// the hit array out of bounds below.
 			out = {};
 			return false;
 		}
 
-		const auto surface_array = memory::read<std::uintptr_t>( trace_ptr + 0x8 );
+		const auto surface_array = reinterpret_cast< std::uintptr_t >( trace->array_pointer );
 
-		memory::call<void> (PATTERN (patterns::trace_bullet), trace_ptr, this->m_weapon_data.damage, this->m_weapon_data.penetration, this->m_weapon_data.range_modifier, 4, local_team, static_cast<std::uintptr_t>(0));
+		// Penetration budget of 4, matching the old known-good build (the
+		// server's own budget is a separate quantity; the old build worked
+		// with 4, so the value is not what makes walls disagree).
+		memory::call<void> (PATTERN (patterns::trace_bullet), trace, this->m_weapon_data.damage, this->m_weapon_data.penetration, this->m_weapon_data.range_modifier, 4, local_team, static_cast<std::uintptr_t>(0));
+
+		auto actual_hitbox{ -1 };
+		auto closest_hitbox_fraction{ 1.0f };
+		if ( ctx.record )
+		{
+			for ( const auto& hitbox : ctx.hitboxes )
+			{
+				if ( hitbox.bone < 0 || hitbox.bone >= ctx.record->bone_count )
+				{
+					continue;
+				}
+
+				const auto& bone = ctx.record->bones[ hitbox.bone ];
+				auto fraction{ 1.0f };
+				auto intersects{ false };
+
+				if ( hitbox.radius > 0.001f )
+				{
+					const auto capsule_start = bone.rotation.rotate_vector( hitbox.mins ) + bone.position;
+					const auto capsule_end = bone.rotation.rotate_vector( hitbox.maxs ) + bone.position;
+					intersects = g_shared.ray_vs_capsule( start, trace_delta, capsule_start, capsule_end, hitbox.radius, fraction );
+				}
+				else
+				{
+					auto inverse = bone.rotation;
+					inverse.x = -inverse.x;
+					inverse.y = -inverse.y;
+					inverse.z = -inverse.z;
+
+					const auto local_origin = inverse.rotate_vector( start - bone.position );
+					const auto local_delta = inverse.rotate_vector( trace_delta );
+					auto entry{ 0.0f };
+					auto exit{ 1.0f };
+
+					const auto intersect_axis = [ & ]( float origin, float delta, float minimum, float maximum )
+						{
+							if ( std::fabsf( delta ) < 1.0e-8f )
+							{
+								return origin >= minimum && origin <= maximum;
+							}
+
+							auto first = ( minimum - origin ) / delta;
+							auto second = ( maximum - origin ) / delta;
+							if ( first > second ) std::swap( first, second );
+							entry = std::max( entry, first );
+							exit = std::min( exit, second );
+							return entry <= exit;
+						};
+
+					intersects = intersect_axis( local_origin.x, local_delta.x, hitbox.mins.x, hitbox.maxs.x ) &&
+						intersect_axis( local_origin.y, local_delta.y, hitbox.mins.y, hitbox.maxs.y ) &&
+						intersect_axis( local_origin.z, local_delta.z, hitbox.mins.z, hitbox.maxs.z );
+					fraction = entry;
+				}
+
+				if ( intersects && fraction < closest_hitbox_fraction )
+				{
+					closest_hitbox_fraction = fraction;
+					actual_hitbox = hitbox.index;
+				}
+			}
+		}
 
 		auto penetrated{ false };
+
+		if ( !hit_array || !surface_array )
+		{
+			out = {};
+			return false;
+		}
 
 		for ( auto i = 0; i < num_hits; ++i )
 		{
 			auto hit = reinterpret_cast< detail::bullet_trace_record* >( hit_array + i * sizeof( detail::bullet_trace_record ) );
 			const auto damage = *reinterpret_cast< float* >( reinterpret_cast< std::uintptr_t >( hit ) + 8 );
 
-			if ( damage <= 0.0f )
+			if ( !std::isfinite( damage ) || damage <= 0.0f )
 			{
 				break;
 			}
@@ -193,51 +251,48 @@ namespace features::combat {
 				continue;
 			}
 
-			const auto trace_holder = surface_array + static_cast< std::size_t >( 0x30 ) * ( hit->enter_contact_ix & 0x7fff );
-			const auto physics_body_flag = memory::read<std::uint8_t>( trace_holder + 0x2b );
+			const auto trace_holder = surface_array + sizeof( systems::tracing::trace_array_element ) * ( hit->enter_contact_ix & 0x7fff );
+			const auto hit_handle = memory::read<std::uint32_t>( trace_holder + 0x2c );
 
-			if ( physics_body_flag == 1 )
+			// Entity handles carry a serial in the high bits; a large value is
+			// legal, so only the invalid sentinels are rejected here (an
+			// earlier range check killed every hit and silenced the ragebot).
+			if ( hit_handle == 0 || hit_handle == 0xffffffffu )
 			{
-				const auto hit_handle = memory::read<std::uint32_t>( trace_holder + 0x24 );
-				const auto hit_entity = systems::g_entities.lookup( hit_handle );
-
-				if ( !hit_entity || hit_entity != ctx.target_pawn )
-				{
-					continue;
-				}
-
-				const auto physics_body = memory::read<std::uintptr_t>( trace_holder + 0x10 );
-				auto hitgroup = target_hitgroup;
-				auto hitbox{ -1 };
-
-				if ( physics_body )
-				{
-					hitgroup = memory::read<int>( physics_body + 0x38 );
-					hitbox = memory::read<std::uint16_t>( physics_body + 0x48 );
-				}
-
-				if ( hitgroup < 0 )
-				{
-					hitgroup = 1;
-				}
-
-				out.hitgroup = hitgroup;
-				out.hitbox = hitbox;
-				out.penetrated = penetrated;
-				out.damage = damage;
-
-				this->scale_damage( out.hitgroup, ctx.target_armor, ctx.has_helmet, ctx.target_team, ctx.armor_ratio, ctx.headshot_multiplier, ctx.scales, out.damage );
-
-				return true;
+				continue;
 			}
+
+			const auto hit_entity = systems::g_entities.lookup( hit_handle );
+
+			if ( !hit_entity || hit_entity != ctx.target_pawn )
+			{
+				continue;
+			}
+
+			if ( actual_hitbox < 0 )
+			{
+				continue;
+			}
+
+			out.hitbox = actual_hitbox;
+			out.hitgroup = systems::g_hitboxes.hitgroup_from_hitbox( actual_hitbox );
+			out.penetrated = penetrated;
+			out.damage = damage;
+
+			this->scale_damage( out.hitgroup, ctx.target_armor, ctx.has_helmet, ctx.target_team, ctx.armor_ratio, ctx.headshot_multiplier, ctx.scales, out.damage );
+
+			return true;
 		}
 
 		out = {};
 		return false;
+		} );
 	}
 
 	bool shared::penetration::can( const math::vector3& start, const math::vector3& direction, float& out_damage, const systems::local::snapshot& local ) const
 	{
+		return detail::guarded( [ & ]( ) -> bool
+		{
 		out_damage = 0.0f;
 
 		if ( this->m_weapon_data.damage <= 0.0f || this->m_weapon_data.penetration <= 0.0f )
@@ -246,69 +301,61 @@ namespace features::combat {
 		}
 
 		const auto local_team = memory::read<int>( local.pawn + SCHEMA( "C_BaseEntity", "m_iTeamNum"_hash ) );
-		const auto trace_end = direction * this->m_weapon_data.range;
+		const auto trace_delta = direction * this->m_weapon_data.range;
 
 		auto filter = systems::g_tracing.make_filter( local.pawn, 0x1c300b, 3, 15 );
-		auto trace = std::make_unique<systems::tracing::trace_data>( );
+		thread_local systems::tracing::trace_data trace_storage{};
+		trace_storage = {};
+		auto* trace = &trace_storage;
 		trace->array_pointer = &trace->elements;
+		trace->hit_array_pointer = &trace->hit_elements;
 
-		systems::g_tracing.setup_trace( trace.get( ), start, trace_end, filter, 4, true );
+		systems::g_tracing.setup_trace( trace, start, trace_delta, filter, 4, true );
 
-		const auto trace_ptr = reinterpret_cast< std::uintptr_t >( trace.get( ) );
-		const auto num_hits = memory::read<int>( trace_ptr + 0x1820 );
+		const auto num_hits = trace->num_hits;
 
-		if ( num_hits <= 0 )
+		// A garbage hit count from a drifted engine call would walk the hit
+		// array out of bounds below - the crosshair draw ran this every tick
+		// and crashed on such a value.
+		if ( num_hits <= 0 || num_hits > 64 )
 		{
 			return false;
 		}
 
-		const auto hit_array = memory::read<std::uintptr_t>( trace_ptr + 0x1828 );
-		const auto surface_array = memory::read<std::uintptr_t>( trace_ptr + 0x8 );
+		const auto hit_array = reinterpret_cast< std::uintptr_t >( trace->hit_array_pointer );
+		if ( !hit_array )
+		{
+			return false;
+		}
 
-		memory::call<void> (PATTERN (patterns::trace_bullet), trace_ptr, this->m_weapon_data.damage, this->m_weapon_data.penetration, this->m_weapon_data.range_modifier, 4, local_team, static_cast<std::uintptr_t>(0));
-
-		auto penetrated_solid{ false };
-		auto last_pen_damage{ 0.0f };
+		memory::call<void> (PATTERN (patterns::trace_bullet), trace, this->m_weapon_data.damage, this->m_weapon_data.penetration, this->m_weapon_data.range_modifier, 4, local_team, static_cast<std::uintptr_t>(0));
 
 		for ( auto i = 0; i < num_hits; ++i )
 		{
 			auto hit = reinterpret_cast< detail::bullet_trace_record* >( hit_array + i * sizeof( detail::bullet_trace_record ) );
-			const auto damage = *reinterpret_cast< float* >( reinterpret_cast< std::uintptr_t >( hit ) + 8 );
+			const auto damage = hit->damage_applied;
 
-			if ( damage <= 0.0f )
+			if ( !std::isfinite( damage ) || damage <= 0.0f )
 			{
 				break;
 			}
 
-			if ( ( hit->can_penetrate & 1 ) == 0 )
+			if ( ( hit->can_penetrate & 1 ) != 0 )
 			{
-				continue;
+				// Match run(): bit 0 marks a penetration record and an exit
+				// fraction of 1 means the bullet did not make it through.
+				if ( hit->exit_fraction == 1.0f )
+				{
+					break;
+				}
+
+				out_damage = damage;
+				return true;
 			}
-
-			const auto trace_holder = surface_array + static_cast< std::size_t >( 0x30 ) * ( hit->enter_contact_ix & 0x7fff );
-			const auto physics_body_flag = memory::read<std::uint8_t>( trace_holder + 0x2b );
-
-			if ( physics_body_flag != 0 )
-			{
-				continue;
-			}
-
-			if ( *reinterpret_cast< float* >( reinterpret_cast< std::uintptr_t >( hit ) + 4 ) == 1.0f )
-			{
-				break;
-			}
-
-			penetrated_solid = true;
-			last_pen_damage = damage;
 		}
 
-		if ( !penetrated_solid || last_pen_damage < 1.0f )
-		{
-			return false;
-		}
-
-		out_damage = last_pen_damage;
-		return true;
+		return false;
+		} );
 	}
 
 	float shared::penetration::get_max_damage( int hitgroup, int target_armor, bool has_helmet, int target_team ) const
@@ -399,48 +446,50 @@ namespace features::combat {
 		}
 
 		this->bone_count = memory::read<int>( this->game_scene_node + SCHEMA( "CSkeletonInstance", "m_modelState"_hash ) + 0x8c );
-		if ( this->bone_count <= 0 || this->bone_count > 128 )
+		if ( this->bone_count <= 0 )
 		{
-			this->bone_count = 128;
+			return false;
 		}
+		this->bone_count = std::min( this->bone_count, 128 );
 
 		const auto abs_origin = memory::read<math::vector3>( this->game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
 		const auto abs_rotation = memory::read<math::vector3>( this->game_scene_node + SCHEMA( "CGameSceneNode", "m_angAbsRotation"_hash ) );
+		if ( !std::isfinite( abs_origin.x ) || !std::isfinite( abs_origin.y ) || !std::isfinite( abs_origin.z ) )
+		{
+			return false;
+		}
 
-		this->origin = memory::read<math::vector3>( this->game_scene_node + SCHEMA( "CGameSceneNode", "m_vecOrigin"_hash ) );
-		this->rotation = memory::read<math::vector3>( this->game_scene_node + SCHEMA( "CGameSceneNode", "m_angRotation"_hash ) );
-
-		memory::write<math::vector3>( this->game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ), this->origin );
-		memory::write<math::vector3>( this->game_scene_node + SCHEMA( "CGameSceneNode", "m_angAbsRotation"_hash ), this->rotation );
+		// Network origin is encoded. Records and bones must stay in the same
+		// evaluated world-space coordinate system.
+		this->origin = abs_origin;
+		this->rotation = abs_rotation;
 
 		this->simulation_time = memory::read<float>( pawn + SCHEMA( "C_BaseEntity", "m_flSimulationTime"_hash ) );
 
 		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
-		const auto backup_tick_count = memory::read<int>( global_vars + 0x44 );
-		const auto current_time = memory::read<float>( global_vars + 0x30 );
-		const auto backup_simulation_time = this->simulation_time;
+		if ( !global_vars )
+		{
+			return false;
+		}
 
-		memory::write<int>( global_vars + 0x44, cstypes::time_to_ticks( current_time ) );
-		memory::write<float>( pawn + SCHEMA( "C_BaseEntity", "m_flSimulationTime"_hash ), current_time );
+		const auto backup_current_time = memory::read<float>( global_vars + 0x30 );
+		const auto backup_tick_count = memory::read<int>( global_vars + 0x44 );
+		memory::write<float>( global_vars + 0x30, this->simulation_time );
+		memory::write<int>( global_vars + 0x44, cstypes::time_to_ticks( this->simulation_time ) );
 
 		memory::call<void>(PATTERN (patterns::game_scene_node_set_mesh_group), this->game_scene_node, 0xfffff );
 		memory::call<void>(PATTERN (patterns::game_scene_node_set_skeleton), this->game_scene_node, 0x100 );
 
 		memory::write<int>( global_vars + 0x44, backup_tick_count );
-		memory::write<float>( pawn + SCHEMA( "C_BaseEntity", "m_flSimulationTime"_hash ), backup_simulation_time );
+		memory::write<float>( global_vars + 0x30, backup_current_time );
 
 		this->bone_cache = memory::read<std::uintptr_t>( this->game_scene_node + SCHEMA( "CSkeletonInstance", "m_modelState"_hash ) + 0x80 );
 		if ( !this->bone_cache )
 		{
-			memory::write<math::vector3>( this->game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ), abs_origin );
-			memory::write<math::vector3>( this->game_scene_node + SCHEMA( "CGameSceneNode", "m_angAbsRotation"_hash ), abs_rotation );
 			return false;
 		}
 
 		std::memcpy( this->bones, reinterpret_cast< void* >( this->bone_cache ), sizeof( systems::bones::data ) * this->bone_count );
-
-		memory::write<math::vector3>( this->game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ), abs_origin );
-		memory::write<math::vector3>( this->game_scene_node + SCHEMA( "CGameSceneNode", "m_angAbsRotation"_hash ), abs_rotation );
 
 		this->tick = cstypes::time_to_ticks( this->simulation_time );
 		this->valid = true;
@@ -455,25 +504,30 @@ namespace features::combat {
 			return false;
 		}
 
-		const auto local_pawn = systems::g_local.get( ).pawn;
-		const auto net_channel = memory::call<std::uintptr_t>(PATTERN (patterns::get_net_channel), 0, 0 );
 		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
 
-		if ( !local_pawn || !net_channel || !global_vars )
+		if ( !global_vars )
 		{
 			return false;
 		}
 
-		const auto max_unlag = [ ] { auto v = CONVAR ("sv_maxunlag")->get<float>(  ); auto p = CONVAR ("sv_maxunlag_player")->get<float>( ); return p > 0.0f ? std::min( v, p ) : v; }( );
+		// Latency and max-unlag change at most once per tick; use the budget
+		// cached by shared::update instead of querying the net channel vfunc
+		// for every record in every scan.
+		const auto budget = g_shared.latency_budget( );
+		if ( !std::isfinite( budget ) )
+		{
+			return false;
+		}
+
 		const auto current_time = memory::read<float>( global_vars + 0x30 );
-		const auto interp = memory::call<float>(PATTERN (patterns::get_interp_amount), local_pawn );
-		const auto one_way = memory::call_vfunc<float>( net_channel, 10, 0 );
-		//const auto budget = std::min( one_way + interp, max_unlag - one_way );
 
-		//return this->simulation_time >= current_time - budget;
+		// A non-positive budget (high latency vs sv_maxunlag) would void
+		// every record and leave an empty backtrack - never hit anything.
+		// Keep at least the freshest record (bt 0t) usable in that case.
+		const auto effective_budget = budget > 0.0f ? budget : 0.05f;
 
-		const auto budget = max_unlag - one_way;
-		return budget > 0.0f && this->simulation_time >= current_time - budget;
+		return this->simulation_time >= current_time - effective_budget;
 	}
 
 	void shared::lagcomp::record::apply( )
@@ -511,10 +565,15 @@ namespace features::combat {
 
 	void shared::lagcomp::run( )
 	{
+		std::unique_lock records_lock( this->m_records_mtx );
+
 		const auto local = systems::g_local.get( );
 		if ( !local.is_alive )
 		{
 			this->m_records.clear( );
+
+			std::lock_guard extrap_lock( this->m_extrap_cache_mtx );
+			this->m_extrap_cache.clear( );
 			return;
 		}
 
@@ -532,7 +591,7 @@ namespace features::combat {
 				continue;
 			}
 
-			const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+			const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 			const auto pawn = systems::g_entities.lookup( pawn_handle );
 
 			if ( !pawn || pawn == local.pawn )
@@ -551,6 +610,11 @@ namespace features::combat {
 
 		std::erase_if( this->m_records, [ & ]( const auto& pair ) { return !active.contains( pair.first ); } );
 
+		{
+			std::lock_guard extrap_lock( this->m_extrap_cache_mtx );
+			std::erase_if( this->m_extrap_cache, [ & ]( const auto& pair ) { return !active.contains( pair.first ); } );
+		}
+
 		struct pending_record
 		{
 			std::uintptr_t pawn{};
@@ -566,6 +630,9 @@ namespace features::combat {
 			if ( health <= 0 )
 			{
 				this->m_records.erase( pawn );
+
+				std::lock_guard extrap_lock( this->m_extrap_cache_mtx );
+				this->m_extrap_cache.erase( pawn );
 				continue;
 			}
 
@@ -601,6 +668,14 @@ namespace features::combat {
 
 		for ( auto& [pawn, records] : this->m_records )
 		{
+			// Bound the per-player history: records beyond the server unlag
+			// window can never be used, and unbounded growth only costs
+			// memory and scan time.
+			if ( records.size( ) > 64 )
+			{
+				records.resize( 64 );
+			}
+
 			for ( auto& rec : records )
 			{
 				rec.was_valid = rec.is_valid( );
@@ -610,6 +685,8 @@ namespace features::combat {
 
 	shared::lagcomp::record* shared::lagcomp::get_oldest_valid( std::uintptr_t pawn )
 	{
+		std::shared_lock records_lock( this->m_records_mtx );
+
 		auto it = this->m_records.find( pawn );
 		if ( it == this->m_records.end( ) || it->second.empty( ) )
 		{
@@ -627,8 +704,55 @@ namespace features::combat {
 		return nullptr;
 	}
 
+	std::vector<shared::lagcomp::display_point> shared::lagcomp::get_display_points( std::uintptr_t pawn ) const
+	{
+		std::vector<display_point> out;
+
+		std::shared_lock records_lock( this->m_records_mtx );
+
+		const auto it = this->m_records.find( pawn );
+		if ( it == this->m_records.end( ) || it->second.empty( ) )
+		{
+			return out;
+		}
+
+		out.reserve( it->second.size( ) );
+		math::vector3 last_origin{};
+		bool have_last_origin{ false };
+		for ( const auto& rec : it->second )
+		{
+			// Skip stationary duplicates: a target that never moved yields
+			// per-tick records at the same spot - showing them all just
+			// stacks identical ghosts on top of each other.
+			if ( have_last_origin && ( rec.origin - last_origin ).length_sqr( ) < 1.0f )
+			{
+				continue;
+			}
+
+			last_origin = rec.origin;
+			have_last_origin = true;
+
+			display_point pt{};
+			pt.origin = rec.origin;
+			pt.tick = rec.tick;
+			pt.valid = rec.valid || rec.was_valid;
+			pt.extrapolated = rec.extrapolated;
+
+			for ( auto b = 0; b < 27 && b < rec.bone_count; ++b )
+			{
+				pt.bones[ b ] = rec.bones[ b ].position;
+			}
+
+			out.push_back( pt );
+		}
+
+		return out;
+	}
+
 	shared::lagcomp::record* shared::lagcomp::get_oldest_was_valid( std::uintptr_t pawn )
 	{
+		std::shared_lock records_lock( this->m_records_mtx );
+
 		auto it = this->m_records.find( pawn );
 		if ( it == this->m_records.end( ) || it->second.empty( ) )
 		{
@@ -646,8 +770,40 @@ namespace features::combat {
 		return nullptr;
 	}
 
+	std::optional<shared::lagcomp::visual_record> shared::lagcomp::get_oldest_was_valid_visual( std::uintptr_t pawn ) const
+	{
+		std::shared_lock records_lock( this->m_records_mtx );
+
+		const auto it = this->m_records.find( pawn );
+		if ( it == this->m_records.end( ) )
+		{
+			return std::nullopt;
+		}
+
+		for ( auto rit = it->second.rbegin( ); rit != it->second.rend( ); ++rit )
+		{
+			if ( !rit->was_valid )
+			{
+				continue;
+			}
+
+			visual_record out{};
+			out.origin = rit->origin;
+			for ( auto i = 0; i < 27; ++i )
+			{
+				out.bones[ i ] = rit->bones[ i ];
+			}
+
+			return out;
+		}
+
+		return std::nullopt;
+	}
+
 	std::vector<shared::lagcomp::record*> shared::lagcomp::get_valid_records( std::uintptr_t pawn )
 	{
+		std::shared_lock records_lock( this->m_records_mtx );
+
 		std::vector<record*> result;
 
 		auto it = this->m_records.find( pawn );
@@ -710,7 +866,7 @@ namespace features::combat {
 		}
 
 		{
-			const auto net_client = memory::read<std::uintptr_t>( addresses::globals::net_client );
+			const auto net_client = addresses::globals::network_client_service;
 			if ( !net_client )
 			{
 				return;
@@ -840,6 +996,51 @@ namespace features::combat {
 		return out;
 	}
 
+	math::vector3 shared::shoot_history::position_at( int tick, float frac ) const
+	{
+		if ( this->m_count <= 0 )
+		{
+			return {};
+		}
+
+		// Entries are ordered oldest -> newest (snapshot fills 0..count-1
+		// from the engine ring tail).
+		const auto& first = this->m_entries[ 0 ];
+		const auto& last = this->m_entries[ this->m_count - 1 ];
+
+		if ( tick <= first.tick )
+		{
+			return first.position;
+		}
+
+		if ( tick >= last.tick )
+		{
+			return last.position;
+		}
+
+		for ( auto i = 0; i + 1 < this->m_count; ++i )
+		{
+			const auto& a = this->m_entries[ i ];
+			const auto& b = this->m_entries[ i + 1 ];
+
+			const auto b_after = b.tick > tick || ( b.tick == tick && b.fraction >= frac );
+			if ( !b_after )
+			{
+				continue;
+			}
+
+			const auto ta = static_cast< float >( a.tick ) + a.fraction;
+			const auto tb = static_cast< float >( b.tick ) + b.fraction;
+			const auto target = static_cast< float >( tick ) + frac;
+			const auto span = tb - ta;
+			const auto t = span > 0.0001f ? std::clamp( ( target - ta ) / span, 0.0f, 1.0f ) : 0.0f;
+
+			return a.position + ( b.position - a.position ) * t;
+		}
+
+		return last.position;
+	}
+
 	void shared::update( )
 	{
 		this->m_ctx = {};
@@ -848,6 +1049,24 @@ namespace features::combat {
 		if ( !local.pawn )
 		{
 			return;
+		}
+
+		// Refresh the lag-comp validity budget once per tick instead of once
+		// per record. is_valid() consumes this figure for every scanned record.
+		this->m_latency_budget = -1.0f;		{
+			const auto net_channel = memory::call<std::uintptr_t>(PATTERN (patterns::get_net_channel), 0, 0 );
+			if ( net_channel )
+			{
+				const auto server_limit = CONVAR ("sv_maxunlag")->get<float>( );
+				const auto player_limit = CONVAR ("sv_maxunlag_player")->get<float>( );
+				const auto max_unlag = player_limit > 0.0f ? std::min( server_limit, player_limit ) : server_limit;
+				const auto latency = memory::call_vfunc<float>( net_channel, 10, 0 );
+
+				if ( std::isfinite( max_unlag ) && std::isfinite( latency ) )
+				{
+					this->m_latency_budget = max_unlag - std::max( latency, 0.0f );
+				}
+			}
 		}
 
 		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
@@ -893,7 +1112,7 @@ namespace features::combat {
 		this->m_ctx.num_bullets = memory::read<int>( this->m_ctx.weapon_vdata + SCHEMA( "CCSWeaponBaseVData", "m_nNumBullets"_hash ) );
 		this->m_ctx.recoil_index = memory::read<float>( this->m_ctx.weapon + SCHEMA( "C_CSWeaponBase", "m_flRecoilIndex"_hash ) );
 		this->m_ctx.weapon_max_speed = memory::read<float>( this->m_ctx.weapon_vdata + SCHEMA( "CCSWeaponBaseVData", "m_flMaxSpeed"_hash ) );
-		this->m_ctx.is_jump_scouting = !( systems::g_prediction.pre( ).flags & cstypes::entity_flags::on_ground ) != 0 && this->m_ctx.item_def_idx == cstypes::item_definition_index::weapon_ssg_08 && this->m_ctx.is_scoped;
+		this->m_ctx.is_jump_scouting = ( systems::g_prediction.pre( ).flags & cstypes::entity_flags::on_ground ) == 0 && this->m_ctx.item_def_idx == cstypes::item_definition_index::weapon_ssg_08 && this->m_ctx.is_scoped;
 		this->m_ctx.valid = true;
 
 		this->m_pen.prepare( this->m_ctx.weapon_vdata, this->m_ctx.weapon );
@@ -911,25 +1130,47 @@ namespace features::combat {
 
 	std::uint32_t shared::get_spread_seed( const math::vector3& angles, int tick ) const
 	{
-		return memory::call<std::uint32_t>(PATTERN (patterns::get_tick_view_angles), nullptr, &angles, tick );
+		return detail::guarded( [ & ]( ) -> std::uint32_t
+			{
+				return memory::call<std::uint32_t>(PATTERN (patterns::get_tick_view_angles), nullptr, &angles, tick );
+			} );
 	}
 
+	// Engine signature (kept in sync with patterns::weapon_calculate_spread):
+	//   void CalculateSpread( int16_t item_index, int num_bullets, int seed2,
+	//                         uint32_t seed, float accuracy, float spread,
+	//                         float recoil_index, float* x, float* y )
+	// The seed offset of +1 mirrors the engine's FireBullets convention
+	// (RandomSeed( seed + 1 )). The seed arrives as a uint32 (often larger
+	// than INT_MAX - it wraps to a negative int in this signature and is
+	// widened back with the uint32 cast); no range gate may reject it.
 	math::vector2 shared::calculate_spread( int seed, float accuracy, float spread, float recoil_index, int item_def_idx, int num_bullets ) const
 	{
-		math::vector2 out{};
+		return detail::guarded( [ & ]( ) -> math::vector2
+			{
+				math::vector2 out{};
 
-		memory::call<void>(PATTERN (patterns::weapon_calculate_spread), static_cast< std::int16_t >( item_def_idx ), num_bullets, 0, static_cast< std::uint32_t >( seed + 1 ), accuracy, spread, recoil_index, &out.x, &out.y );
+				memory::call<void>(PATTERN (patterns::weapon_calculate_spread), static_cast< std::int16_t >( item_def_idx ), num_bullets, 0, static_cast< std::uint32_t >( seed + 1 ), accuracy, spread, recoil_index, &out.x, &out.y );
 
-		return out;
+				if ( !std::isfinite( out.x ) || !std::isfinite( out.y ) )
+				{
+					return {};
+				}
+
+				return out;
+			} );
 	}
 
 	math::vector3 shared::get_aim_punch( std::uintptr_t local_pawn ) const
 	{
-		math::vector3 out{};
+		return detail::guarded( [ & ]( ) -> math::vector3
+			{
+				math::vector3 out{};
 
-		memory::call<void>(PATTERN (patterns::get_aim_punch), memory::read<std::uintptr_t>( local_pawn + SCHEMA( "C_CSPlayerPawn", "m_pAimPunchServices"_hash ) ), &out, 0u );
+				memory::call<void>(PATTERN (patterns::get_aim_punch), memory::read<std::uintptr_t>( local_pawn + SCHEMA( "C_CSPlayerPawn", "m_pAimPunchServices"_hash ) ), &out, 0u );
 
-		return out;
+				return out;
+			} );
 	}
 
 	float shared::calculate_hitchance( const math::vector3& shoot_position, const math::vector3& aim_angle, const systems::hitboxes::entry& hitbox, const systems::bones::data& bone, float inaccuracy, float spread, int samples ) const
@@ -937,6 +1178,9 @@ namespace features::combat {
 		const auto total = spread + inaccuracy;
 		if ( total < 0.0001f )
 		{
+			// Matches the old build: a zero cone is treated as perfect. The
+			// no-spread path forces hitchance to 1.0 anyway, so gating this
+			// on the scoped state only broke unscoped no-spread shots.
 			return 1.0f;
 		}
 
@@ -947,96 +1191,135 @@ namespace features::combat {
 
 		const auto capsule_start = bone.rotation.rotate_vector( hitbox.mins ) + bone.position;
 		const auto capsule_end = bone.rotation.rotate_vector( hitbox.maxs ) + bone.position;
+		const auto is_capsule = hitbox.radius > 0.001f;
+		auto inverse_rotation = bone.rotation;
+		inverse_rotation.x = -inverse_rotation.x;
+		inverse_rotation.y = -inverse_rotation.y;
+		inverse_rotation.z = -inverse_rotation.z;
+		const auto box_ray_origin = inverse_rotation.rotate_vector( shoot_position - bone.position );
+
+		const auto ray_vs_box = [ & ]( const math::vector3& ray_direction )
+		{
+			const auto direction = inverse_rotation.rotate_vector( ray_direction );
+			auto entry{ 0.0f };
+			auto exit{ 1.0f };
+
+			const auto intersect_axis = [ & ]( float origin, float delta, float minimum, float maximum )
+			{
+				if ( std::fabs( delta ) < 1.0e-8f )
+				{
+					return origin >= minimum && origin <= maximum;
+				}
+
+				auto first = ( minimum - origin ) / delta;
+				auto second = ( maximum - origin ) / delta;
+				if ( first > second )
+				{
+					std::swap( first, second );
+				}
+
+				entry = std::max( entry, first );
+				exit = std::min( exit, second );
+				return entry <= exit;
+			};
+
+			return intersect_axis( box_ray_origin.x, direction.x, hitbox.mins.x, hitbox.maxs.x ) &&
+				intersect_axis( box_ray_origin.y, direction.y, hitbox.mins.y, hitbox.maxs.y ) &&
+				intersect_axis( box_ray_origin.z, direction.z, hitbox.mins.z, hitbox.maxs.z );
+		};
 
 		math::vector3 forward{}, left{}, up{};
 		math::helpers::angle_vectors_left( aim_angle, &forward, &left, &up );
+
+		// Every candidate in a scan uses the same weapon state. The engine spread
+		// function is much more expensive than the capsule test, so calculate each
+		// deterministic seed once and reuse it for all candidate points.
+		struct spread_cache
+		{
+			std::uintptr_t weapon{};
+			float inaccuracy{};
+			float spread{};
+			float recoil_index{};
+			int item_def_idx{};
+			int num_bullets{};
+			int count{};
+			bool initialized{};
+			std::array<math::vector2, 512> values{};
+		};
+
+		thread_local spread_cache cache{};
+		if ( !cache.initialized || cache.weapon != this->m_ctx.weapon || cache.inaccuracy != inaccuracy || cache.spread != spread ||
+			cache.recoil_index != this->m_ctx.recoil_index || cache.item_def_idx != this->m_ctx.item_def_idx ||
+			cache.num_bullets != this->m_ctx.num_bullets )
+		{
+			cache.weapon = this->m_ctx.weapon;
+			cache.inaccuracy = inaccuracy;
+			cache.spread = spread;
+			cache.recoil_index = this->m_ctx.recoil_index;
+			cache.item_def_idx = this->m_ctx.item_def_idx;
+			cache.num_bullets = this->m_ctx.num_bullets;
+			cache.count = 0;
+			cache.initialized = true;
+		}
+
+		const auto cached_samples = std::min( samples, static_cast< int >( cache.values.size( ) ) );
+		for ( auto i = cache.count; i < cached_samples; ++i )
+		{
+			cache.values[ i ] = this->calculate_spread( i, inaccuracy, spread, this->m_ctx.recoil_index, this->m_ctx.item_def_idx, this->m_ctx.num_bullets );
+		}
+		cache.count = std::max( cache.count, cached_samples );
 
 		auto hits{ 0 };
 
 		for ( auto i = 0; i < samples; ++i )
 		{
-			const auto calculated_spread = this->calculate_spread( i, inaccuracy, spread, this->m_ctx.recoil_index, this->m_ctx.item_def_idx, this->m_ctx.num_bullets );
+			const auto calculated_spread = i < cached_samples
+				? cache.values[ i ]
+				: this->calculate_spread( i, inaccuracy, spread, this->m_ctx.recoil_index, this->m_ctx.item_def_idx, this->m_ctx.num_bullets );
 			const auto direction = forward + ( left * calculated_spread.x ) + ( up * calculated_spread.y );
 			const auto ray_end = direction.normalized( ) * 8192.0f;
 
-			auto fraction{ 1.0f };
-			if ( this->ray_vs_capsule( shoot_position, ray_end, capsule_start, capsule_end, hitbox.radius, fraction ) )
+			auto hit{ false };
+			if ( is_capsule )
 			{
-				++hits;
+				auto fraction{ 1.0f };
+				hit = this->ray_vs_capsule( shoot_position, ray_end, capsule_start, capsule_end, hitbox.radius, fraction );
+			}
+			else
+			{
+				hit = ray_vs_box( ray_end );
 			}
 
-			const auto remaining = samples - ( i + 1 );
-			if ( hits + remaining < samples / 10 )
+			if ( hit )
 			{
-				break;
+				++hits;
 			}
 		}
 
 		return static_cast< float >( hits ) / static_cast< float >( samples );
 	}
 
-	float shared::calculate_hitchance_fast( const math::vector3& shoot_position, const math::vector3& aim_angle, const systems::hitboxes::entry& hitbox, const systems::bones::data& bone, float inaccuracy, float spread ) const
-	{
-		const auto total = inaccuracy + spread;
-		if ( total < 0.0001f )
-		{
-			return 1.0f;
-		}
-
-		const auto cap_start = bone.rotation.rotate_vector( hitbox.mins ) + bone.position;
-		const auto cap_end = bone.rotation.rotate_vector( hitbox.maxs ) + bone.position;
-		const auto cap_mid = ( cap_start + cap_end ) * 0.5f;
-		const auto to_target = cap_mid - shoot_position;
-
-		math::vector3 forward{}, left{}, up{};
-		math::helpers::angle_vectors_left( aim_angle, &forward, &left, &up );
-
-		const auto plane_dist = to_target.dot( forward );
-		if ( plane_dist < 1.0f )
-		{
-			return 1.0f;
-		}
-
-		const auto cap_a_rel = cap_start - shoot_position;
-		const auto cap_b_rel = cap_end - shoot_position;
-
-		const auto proj_a_l = cap_a_rel.dot( left ) / plane_dist;
-		const auto proj_a_u = cap_a_rel.dot( up ) / plane_dist;
-		const auto proj_b_l = cap_b_rel.dot( left ) / plane_dist;
-		const auto proj_b_u = cap_b_rel.dot( up ) / plane_dist;
-
-		const auto center_l = ( proj_a_l + proj_b_l ) * 0.5f;
-		const auto center_u = ( proj_a_u + proj_b_u ) * 0.5f;
-
-		const auto dl = proj_b_l - proj_a_l;
-		const auto du = proj_b_u - proj_a_u;
-		const auto half_axis = std::sqrt( dl * dl + du * du ) * 0.5f;
-		const auto angular_radius = hitbox.radius / plane_dist;
-
-		const auto semi_major = half_axis + angular_radius;
-		const auto semi_minor = angular_radius;
-		const auto offset = std::sqrt( center_l * center_l + center_u * center_u );
-
-		const auto r_major = semi_major / total;
-		const auto r_minor = semi_minor / total;
-		const auto r_offset = offset / total;
-
-		const auto coverage = r_major * r_minor;
-		const auto center_weight = 1.0f / ( 1.0f + 8.0f * r_offset * r_offset );
-
-		auto hc = coverage * center_weight;
-		hc = std::sqrt( hc );
-		hc *= 1.8f;
-
-		return std::clamp( hc, 0.0f, 1.0f );
-	}
-
 	math::vector3 shared::find_spread_correction( const math::vector3& aim_angle, int tick ) const
 	{
+		// Restored from the previous build: full 360 deg / 0.5 deg sweep
+		// (720 probes). The focused +/-6 deg grid that replaced it missed
+		// the seed bucket on some weapons (large spread compensation, yaw-
+		// dependent buckets) and returned an empty correction - which
+		// silently dropped every no-spread shot and made the feature look
+		// broken. The full sweep always finds the bucket the coarse grid
+		// could jump over.
 		for ( auto i = 0; i < 720; i++ )
 		{
 			const auto test_angles = math::vector3{ static_cast< float >( i ) / 2.0f, aim_angle.y, 0.0f };
 			const auto seed = this->get_spread_seed( test_angles, tick );
+
+			// The engine call is SEH-guarded and returns 0 on failure;
+			// skip rather than build a correction on a garbage seed.
+			if ( seed == 0 )
+			{
+				continue;
+			}
+
 			const auto spread = this->calculate_spread( seed, this->m_ctx.inaccuracy, this->m_ctx.spread, this->m_ctx.recoil_index, this->m_ctx.item_def_idx, this->m_ctx.num_bullets );
 
 			auto adj_angle = aim_angle;
@@ -1202,36 +1485,101 @@ namespace features::combat {
 
 	float shared::get_spread( ) const
 	{
-		return memory::call_vfunc<float>( this->m_ctx.weapon, 376 );
+		static const auto get_spread = PATTERN( patterns::get_spread );
+		return detail::guarded( [ & ]( ) -> float
+			{
+				// The engine reads the weapon's live spread. A drift or a stale
+				// weapon pointer must not feed NaN into the spread math
+				// downstream, so non-finite results collapse to zero.
+				const auto value = memory::call<float>( get_spread, this->m_ctx.weapon );
+				return std::isfinite( value ) && value >= 0.0f ? value : 0.0f;
+			} );
 	}
 
 	float shared::get_inaccuracy( bool update_accuracy_penalty ) const
 	{
-		const auto accuracy_state_begin = SCHEMA( "C_CSWeaponBase", "m_flTurningInaccuracyDelta"_hash );
-		const auto accuracy_state_size = SCHEMA( "C_CSWeaponBase", "m_flRecoilIndex"_hash ) + sizeof( float ) - accuracy_state_begin;
-
-		std::uint8_t backup[ 40 ];
-		std::memcpy( backup, reinterpret_cast< const void* >( this->m_ctx.weapon + accuracy_state_begin ), accuracy_state_size );
-
-		if ( update_accuracy_penalty )
+		const auto weapon = this->m_ctx.weapon;
+		if ( !weapon )
 		{
-			memory::call<void>(PATTERN (patterns::weapon_update_accuracy), this->m_ctx.weapon );
+			return 0.0f;
 		}
 
-		const auto inaccuracy = memory::call_vfunc<float> (this->m_ctx.weapon, 413, nullptr, nullptr);
+		// weapon_update_accuracy rewrites the accuracy state (turning, move,
+		// air and recoil penalties) before the getter runs. When the update is
+		// requested, the touched byte range is snapshotted and restored around
+		// the engine calls, so the cheat observes a realistic value without
+		// permanently mutating the weapon. The getter alone never mutates
+		// anything, so the no-spread fast path (update_accuracy_penalty ==
+		// false) skips the snapshot entirely.
+		if ( !update_accuracy_penalty )
+		{
+			return detail::guarded( [ & ]( ) -> float
+				{
+					static const auto get_inaccuracy = PATTERN( patterns::get_inaccuracy );
+					const auto value = memory::call<float>(
+						get_inaccuracy, weapon,
+						static_cast<float*>( nullptr ), static_cast<float*>( nullptr ) );
+					return std::isfinite( value ) ? value : 0.0f;
+				} );
+		}
 
-		std::memcpy( reinterpret_cast< void* >( this->m_ctx.weapon + accuracy_state_begin ), backup, accuracy_state_size );
+		const auto accuracy_state_begin = SCHEMA( "C_CSWeaponBase", "m_flTurningInaccuracyDelta"_hash );
+		const auto accuracy_state_end = SCHEMA( "C_CSWeaponBase", "m_flRecoilIndex"_hash );
+		if ( accuracy_state_begin <= 0 || accuracy_state_end < accuracy_state_begin )
+		{
+			return 0.0f;
+		}
 
-		return inaccuracy;
+		const auto accuracy_state_size = static_cast< std::size_t >( accuracy_state_end - accuracy_state_begin ) + sizeof( float );
+		if ( accuracy_state_size > 0x100 )
+		{
+			return 0.0f;
+		}
+
+		// accuracy_state_size is bounded by 0x100 above; a stack buffer avoids
+		// a heap allocation on every invocation (several per tick). The engine
+		// calls sit in their own guard so the restore always runs even when an
+		// engine-side exception was swallowed, and the whole sequence is
+		// guarded again so a bad weapon pointer cannot take the process down.
+		std::array<std::uint8_t, 0x100> backup{};
+		return detail::guarded( [ & ]( ) -> float
+			{
+				std::memcpy( backup.data( ), reinterpret_cast< const void* >( weapon + accuracy_state_begin ), accuracy_state_size );
+
+				const auto inaccuracy = detail::guarded( [ & ]( ) -> float
+					{
+						memory::call<void>(PATTERN (patterns::weapon_update_accuracy), weapon );
+
+						static const auto get_inaccuracy = PATTERN( patterns::get_inaccuracy );
+						const auto value = memory::call<float>(
+							get_inaccuracy, weapon,
+							static_cast<float*>( nullptr ), static_cast<float*>( nullptr ) );
+						return std::isfinite( value ) ? value : 0.0f;
+					} );
+
+				std::memcpy( reinterpret_cast< void* >( weapon + accuracy_state_begin ), backup.data( ), accuracy_state_size );
+
+				return inaccuracy;
+			} );
 	}
 
 	float shared::get_inaccuracy_at_velocity( std::uintptr_t local_pawn, const math::vector3& velocity ) const
 	{
 		const auto accuracy_state_begin = SCHEMA( "C_CSWeaponBase", "m_flTurningInaccuracyDelta"_hash );
-		const auto accuracy_state_size = SCHEMA( "C_CSWeaponBase", "m_flRecoilIndex"_hash ) + sizeof( float ) - accuracy_state_begin;
+		const auto accuracy_state_end = SCHEMA( "C_CSWeaponBase", "m_flRecoilIndex"_hash );
+		if ( !this->m_ctx.weapon || !local_pawn || accuracy_state_begin <= 0 || accuracy_state_end < accuracy_state_begin )
+		{
+			return 0.0f;
+		}
 
-		std::uint8_t backup[ 40 ];
-		std::memcpy( backup, reinterpret_cast< const void* >( this->m_ctx.weapon + accuracy_state_begin ), accuracy_state_size );
+		const auto accuracy_state_size = static_cast< std::size_t >( accuracy_state_end - accuracy_state_begin ) + sizeof( float );
+		if ( accuracy_state_size > 0x100 )
+		{
+			return 0.0f;
+		}
+
+		std::array<std::uint8_t, 0x100> backup{};
+		std::memcpy( backup.data( ), reinterpret_cast< const void* >( this->m_ctx.weapon + accuracy_state_begin ), accuracy_state_size );
 
 		const auto old_velocity = memory::read<math::vector3>( local_pawn + SCHEMA( "C_BaseEntity", "m_vecAbsVelocity"_hash ) );
 		const auto old_eflags = memory::read<std::uint32_t>( local_pawn + SCHEMA( "C_BaseEntity", "m_iEFlags"_hash ) );
@@ -1239,14 +1587,22 @@ namespace features::combat {
 		memory::write( local_pawn + SCHEMA( "C_BaseEntity", "m_iEFlags"_hash ), old_eflags & ~0x1000u );
 		memory::write( local_pawn + SCHEMA( "C_BaseEntity", "m_vecAbsVelocity"_hash ), velocity );
 
-		memory::call<void>(PATTERN (patterns::weapon_update_accuracy), this->m_ctx.weapon );
+		// The engine call is guarded; the pawn fields and weapon accuracy state
+		// are restored afterwards regardless of whether it succeeded.
+		const auto inaccuracy = detail::guarded( [ & ]( ) -> float
+			{
+				memory::call<void>(PATTERN (patterns::weapon_update_accuracy), this->m_ctx.weapon );
 
-		const auto inaccuracy = memory::call_vfunc<float> (this->m_ctx.weapon, 413, nullptr, nullptr);
+				static const auto get_inaccuracy = PATTERN( patterns::get_inaccuracy );
+				return memory::call<float>(
+					get_inaccuracy, this->m_ctx.weapon,
+					static_cast<float*>( nullptr ), static_cast<float*>( nullptr ) );
+			} );
 
 		memory::write( local_pawn + SCHEMA( "C_BaseEntity", "m_vecAbsVelocity"_hash ), old_velocity );
 		memory::write( local_pawn + SCHEMA( "C_BaseEntity", "m_iEFlags"_hash ), old_eflags );
 
-		std::memcpy( reinterpret_cast< void* >( this->m_ctx.weapon + accuracy_state_begin ), backup, accuracy_state_size );
+		std::memcpy( reinterpret_cast< void* >( this->m_ctx.weapon + accuracy_state_begin ), backup.data( ), accuracy_state_size );
 
 		return inaccuracy;
 	}
@@ -1260,17 +1616,6 @@ namespace features::combat {
 
 	bool shared::can_shoot( systems::input::usercmd* cmd, std::uintptr_t local_controller, bool check_next_attack ) const
 	{
-		if ( check_next_attack )
-		{
-			if ( this->m_ctx.item_def_idx != cstypes::item_definition_index::weapon_r8_revolver )
-			{
-				if ( cmd->buttons.value & ( cstypes::command_buttons::in_attack | cstypes::command_buttons::in_second_attack ) )
-				{
-					return false;
-				}
-			}
-		}
-
 		if ( this->m_ctx.weapon_type != cstypes::weapon_type::knife )
 		{
 			if ( memory::read<bool>( this->m_ctx.weapon + SCHEMA( "C_CSWeaponBase", "m_bInReload"_hash ) ) )
@@ -1290,15 +1635,76 @@ namespace features::combat {
 		}
 
 		const auto tick_base = memory::read<int>( local_controller + SCHEMA( "CBasePlayerController", "m_nTickBase"_hash ) );
+		const auto base_cmd = cmd->csgo_user_cmd.base( );
+		const auto client_tick = base_cmd ? base_cmd->client_tick( ) : tick_base;
 		const auto next_primary = memory::read<int>( this->m_ctx.weapon + SCHEMA( "C_BasePlayerWeapon", "m_nNextPrimaryAttackTick"_hash ) );
+
+		// A garbage cooldown (negative schema field after a game update)
+		// must never unlock continuous fire. A zero field happens on
+		// weapon switch / respawn transitions where the cooldown has not
+		// been stamped yet - treat it as "ready" and let the weapon-cycle
+		// branch below rate-limit instead of blocking the shot entirely
+		// (the old `<= 0` gate caused the occasional no-shots).
+		if ( next_primary < 0 || next_primary - client_tick >= 256 )
+		{
+			return false;
+		}
 
 		if ( this->m_ctx.weapon_type == cstypes::weapon_type::knife )
 		{
 			const auto next_secondary = memory::read<int>( this->m_ctx.weapon + SCHEMA( "C_BasePlayerWeapon", "m_nNextSecondaryAttackTick"_hash ) );
-			return tick_base >= this->m_last_shoot_tick + 2 && ( tick_base >= next_primary || tick_base >= next_secondary );
+			return tick_base >= this->m_last_shoot_tick + 2 && ( client_tick >= next_primary || client_tick >= next_secondary );
 		}
 
-		return tick_base >= this->m_last_shoot_tick + 2 && tick_base >= next_primary;
+		// The +1 gap only guards against same-tick re-entry; the real fire
+		// rate is bound by the server-side next-primary cooldown.
+		const auto min_shot_gap = 1;
+
+		// When next_primary lags (local prediction did not advance it, e.g.
+		// our simulation restores the field), client_tick >= next_primary is
+		// always true and the bot fires every tick - double-shots that the
+		// server rejects and that show up as extra misses. Fall back to the
+		// weapon cycle as the rate limit in that case.
+		if ( client_tick - next_primary > 8 )
+		{
+			const auto cycle_time = this->m_ctx.weapon_vdata
+				? memory::read<float>( this->m_ctx.weapon_vdata + SCHEMA( "CCSWeaponBaseVData", "m_flCycleTime"_hash ) )
+				: 0.1f;
+			const auto cycle_ticks = std::max( 2, static_cast< int >( std::ceil( cycle_time / cstypes::tick_interval ) ) );
+			return tick_base >= this->m_last_shoot_tick + cycle_ticks && client_tick >= next_primary;
+		}
+
+		return tick_base >= this->m_last_shoot_tick + min_shot_gap && client_tick >= next_primary;
+	}
+
+	void shared::note_seed_shot( bool hit )
+	{
+		++this->m_seed_window_total;
+		if ( hit )
+		{
+			++this->m_seed_window_hits;
+		}
+
+		// Sliding-window decay: every 32 confirmed results halve the older
+		// half so the verdict follows the current server (and mode) instead
+		// of stale history.
+		if ( this->m_seed_window_total >= 32 )
+		{
+			this->m_seed_window_total = 16 + ( this->m_seed_window_total - 16 ) / 2;
+			this->m_seed_window_hits /= 2;
+		}
+
+		// Not enough data yet - keep the current verdict.
+		if ( this->m_seed_window_total < 10 )
+		{
+			return;
+		}
+
+		// Seed verification only admits shots the predicted seed lands, so
+		// a trustworthy seed shows a near-100% hit rate. A sustained rate
+		// far below that means the predicted seed does not match the
+		// server's - stop gating on it.
+		this->m_seed_synced = this->m_seed_window_hits * 2 >= this->m_seed_window_total;
 	}
 
 	bool shared::is_max_accuracy( float inaccuracy ) const
@@ -1312,7 +1718,12 @@ namespace features::combat {
 		{
 			if ( this->m_ctx.weapon_type == cstypes::weapon_type::sniper )
 			{
-				if ( !this->m_ctx.is_scoped )
+				// SSG 08 is accurate enough unscoped to land a headshot
+				// (its unscoped spread floor is small), so it skips the
+				// scope gate - otherwise the unscoped force path never
+				// triggers and a visible head is never fired on.
+				const auto is_ssg = this->m_ctx.item_def_idx == cstypes::item_definition_index::weapon_ssg_08;
+				if ( !is_ssg && !this->m_ctx.is_scoped )
 				{
 					return false;
 				}

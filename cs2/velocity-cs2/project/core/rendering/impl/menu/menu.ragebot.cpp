@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <core/settings.hpp>
 
 #include "../../rendering.hpp"
@@ -7,9 +7,9 @@ namespace rendering {
 
 	namespace detail {
 
-		constexpr const char* hitbox_names[ ]{ "head", "chest", "stomach", "arms", "legs", "paws" };
-		constexpr const char* pitch_items[ ]{ "none", "down", "up" };
-		constexpr const char* autoyaw_items[ ]{ "none", "crosshair", "distance", "health" };
+		constexpr const char* hitbox_names[ ]{ "头部", "胸部", "腹部", "手臂", "腿部", "爪子" };
+		constexpr const char* pitch_items[ ]{ "无", "向下", "向上" };
+		constexpr const char* aa_yaw_items[ ]{ "背向", "真实视角" };
 
 	} // namespace detail
 
@@ -22,6 +22,7 @@ namespace rendering {
 		auto& dp = s.m_duckpeek;
 		auto& zb = s.m_zeusbot;
 		auto& kb = s.m_knifebot;
+		auto& autos = s.m_autos;
 		auto& lg = s.m_lagcomp;
 
 		auto& wg = rb.groups[ this->m_subtab ];
@@ -38,30 +39,71 @@ namespace rendering {
 
 		if ( xui::begin_child( "##ragebot_aimbot", col_w ) )
 		{
-			xui::checkbox( "enabled", rb.enabled );
-			xui::checkbox( "silent", wg.silent );
-			xui::checkbox( "no spread", wg.no_spread );
-			xui::checkbox( "double tap", wg.doubletap );
-			xui::checkbox( "force shot in air", wg.force_shot_air );
-			xui::checkbox( "force shot on ground", wg.force_shot );
-			xui::checkbox( "extrapolation", lg.extrapolation);
-			xui::slider_float( "max fov", wg.max_fov, 1.0f, 180.0f, "%.0f°" );
+			xui::checkbox( "启用", rb.enabled );
+			xui::checkbox( "vac绕过", rb.vac_bypass );
+			xui::checkbox( "双击 (DT)", rb.m_double_tap.enabled );
+			if ( xui::begin_popup( "##dt_popup", 240.0f ) )
+			{
+				xui::checkbox( "充能预览##dt", rb.m_double_tap.preview );
+				xui::checkbox( "快速拉栓##dt", rb.m_double_tap.quick_bolt );
+				xui::color_picker( "充能中颜色##dt", rb.m_double_tap.charging_color );
+				xui::color_picker( "充能完成颜色##dt", rb.m_double_tap.ready_color );
+				xui::color_picker( "充能失败颜色##dt", rb.m_double_tap.failed_color );
+				xui::end_popup( );
+			}
+			xui::checkbox( "自动开镜", s.m_autos.scope );
+			xui::checkbox( "静默", wg.silent );
+			static const char* no_spread_items[ ] = { "强制", "种子" };
+			xui::checkbox( "无扩散", wg.no_spread );
+			if ( xui::begin_popup( "##nospread_popup", 200.0f ) )
+			{
+				xui::combo( "模式##nospread", wg.no_spread_mode.value, no_spread_items, 2 );
+				xui::end_popup( );
+			}
+			xui::checkbox( "空中强制开枪", wg.force_shot_air );
+			if ( xui::begin_popup( "##forceair_popup", 200.0f ) )
+			{
+				xui::slider_int( "命中率##forceair", wg.force_hitchance_air, 0, 100, "%d%%" );
+				xui::end_popup( );
+			}
+			xui::checkbox( "地面强制开枪", wg.force_shot );
+			if ( xui::begin_popup( "##force_popup", 200.0f ) )
+			{
+				xui::slider_int( "命中率##force", wg.force_hitchance, 0, 100, "%d%%" );
+				xui::end_popup( );
+			}
+			xui::checkbox( "外推", lg.extrapolation);
+			if ( xui::begin_popup( "##extrapolation_popup", 230.0f ) )
+			{
+				xui::checkbox( "自动外推##ext", lg.extrapolation_auto );
+				xui::slider_int( "外推tick##ext", lg.max_extrapolate_ticks, 1, 18, "%d" );
+				xui::checkbox( "路径矫正##ext", lg.extrapolation_correct );
+				xui::checkbox( "空中目标外推##ext", lg.extrapolation_air );
+				xui::end_popup( );
+			}
+			xui::checkbox( "回溯", lg.backtrack );
+			if ( xui::begin_popup( "##backtrack_popup", 230.0f ) )
+			{
+				xui::slider_int( "最高回溯##bt", lg.max_backtrack_ticks, 1, 12, "%d tick" );
+				xui::end_popup( );
+			}
+			xui::slider_float( "最大视角", wg.max_fov, 1.0f, 180.0f, "%.0f°" );
 
-			xui::slider_int( "hit chance", wg.hitchance, 25, 100, "%d%%" );
-			xui::slider_int( "min damage", wg.min_damage, 5, 125, "%d" );
-			/*xui::slider_int( "max backtrack", s.m_lagcomp.max_backtrack_ticks, 1, 16, "%d tick(s)" );*/
+			xui::slider_int( "命中率", wg.hitchance, 25, 100, "%d%%" );
+			xui::slider_int( "最低伤害", wg.min_damage, 5, 101, wg.min_damage.value >= 101 ? "致命" : "%d" );
+			/*xui::slider_int( "最大回溯", s.m_lagcomp.max_backtrack_ticks, 1, 13, "%d tick(s)" );*/
 
-			xui::checkbox( "hit chance override", wg.hitchance_override );
+			xui::checkbox( "命中率覆盖", wg.hitchance_override );
 			if ( xui::begin_popup( "##hitchance_popup", 220.0f ) )
 			{
-				xui::slider_int( "value##hc", wg.hitchance_override_value, 0, 100, "%d%%" );
+				xui::slider_int( "数值##hc", wg.hitchance_override_value, 0, 100, "%d%%" );
 				xui::end_popup( );
 			}
 
-			xui::checkbox( "min damage override", wg.min_damage_override );
+			xui::checkbox( "最低伤害覆盖", wg.min_damage_override );
 			if ( xui::begin_popup( "##mindamage_popup", 220.0f ) )
 			{
-				xui::slider_int( "value##md", wg.min_damage_override_value, 0, 130, "%d" );
+				xui::slider_int( "数值##md", wg.min_damage_override_value, 0, 130, "%d" );
 				xui::end_popup( );
 			}
 
@@ -70,11 +112,21 @@ namespace rendering {
 
 		if ( xui::begin_child( "##ragebot_extras", col_w, 190.0f, true ) )
 		{
-			xui::checkbox( "force b-aim", wg.body_aim );
-		xui::checkbox( "dynamic point scale", wg.dynamic_pointscale );
-		xui::checkbox( "debug multipoints", wg.debug_multipoints );
-		xui::slider_float( "point scale", wg.pointscale, 0.0f, 100.0f, "%.0f%%" );
-		xui::multicombo( "hitboxes", wg.hitboxes, detail::hitbox_names, 6 );
+			xui::checkbox( "强制身体瞄准", wg.body_aim );
+		xui::checkbox( "动态点缩放", wg.dynamic_pointscale );
+		xui::checkbox( "调试多点", wg.debug_multipoints );
+		xui::slider_float( "点缩放", wg.pointscale, 0.0f, 100.0f, "%.0f%%" );
+		xui::checkbox( "头部额外多点", wg.extra_head_points );
+		if ( wg.extra_head_points.value )
+		{
+			xui::slider_int( "头部额外多点缩放", wg.extra_head_scale, 0, 100, "%d%%" );
+		}
+		xui::checkbox( "身体额外多点", wg.extra_body_points );
+		if ( wg.extra_body_points.value )
+		{
+			xui::slider_int( "身体额外多点缩放", wg.extra_body_scale, 0, 100, "%d%%" );
+		}
+		xui::multicombo( "命中盒", wg.hitboxes, detail::hitbox_names, 6 );
 
 			xui::end_child( );
 		}
@@ -83,24 +135,23 @@ namespace rendering {
 
 		if ( xui::begin_child( "##ragebot_antiaim", col_w ) )
 		{
-			xui::checkbox( "anti aim", aa.enabled );
+			xui::checkbox( "反瞄准", aa.enabled );
 
-			xui::combo( "pitch", aa.pitch.value, detail::pitch_items, 3 );
-			xui::combo( "autoyaw", aa.autoyaw.value, detail::autoyaw_items, 4 );
+			xui::combo( "俯仰", aa.pitch.value, detail::pitch_items, 3 );
+			xui::combo( "偏航", aa.yaw.value, detail::aa_yaw_items, 2 );
 
-			xui::checkbox( "compensate roll", aa.auto_yaw_adjust );
-			xui::checkbox( "force back to targets", aa.at_targets );
-			xui::checkbox( "force left", aa.manual_left );
-			xui::checkbox( "force right", aa.manual_right );
-			xui::checkbox( "hide onshot", aa.hide_shots );
-			xui::checkbox( "avoid backstab", aa.avoid_backstab );
-			xui::checkbox( "direction indicator", aa.direction_indicator );
+			xui::checkbox( "补偿横滚", aa.auto_yaw_adjust );
+			xui::checkbox( "强制左", aa.manual_left );
+			xui::checkbox( "强制右", aa.manual_right );
+			xui::checkbox( "开枪隐藏", aa.hide_shots );
+			xui::checkbox( "避免背刺", aa.avoid_backstab );
+			xui::checkbox( "方向指示器", aa.direction_indicator );
 
 			if ( xui::begin_popup( "##aa_indicator", 220.0f ) )
 			{
-				xui::color_picker( "color##aa_ind", aa.direction_indicator_color );
-				xui::checkbox( "glow##aa_ind", aa.direction_indicator_glow );
-				xui::slider_float( "glow strength##aa_ind", aa.direction_indicator_glow_strength, 0.1f, 1.0f, "%.2f" );
+				xui::color_picker( "颜色##aa_ind", aa.direction_indicator_color );
+				xui::checkbox( "发光##aa_ind", aa.direction_indicator_glow );
+				xui::slider_float( "发光强度##aa_ind", aa.direction_indicator_glow_strength, 0.1f, 1.0f, "%.2f" );
 				xui::end_popup( );
 			}
 
@@ -109,18 +160,21 @@ namespace rendering {
 
 		if ( xui::begin_child( "##ragebot_otherbots", col_w ) )
 		{
-			xui::checkbox( "zeusbot", zb.enabled );
+			xui::checkbox( "自动左轮", autos.revolver );
+			xui::checkbox( "空中急停(shift)", autos.air_stop );
+
+			xui::checkbox( "电击枪机器人", zb.enabled );
 			if ( xui::begin_popup( "##zb_settings", 220.0f ) )
 			{
-				xui::slider_float( "max fov##zb", zb.max_fov, 1, 180, "%.0f°" );
-				xui::checkbox( "drop after##zb", zb.drop_after );
+				xui::slider_float( "最大视角##zb", zb.max_fov, 1, 180, "%.0f°" );
+				xui::checkbox( "使用后丢弃##zb", zb.drop_after );
 				xui::end_popup( );
 			}
 
-			xui::checkbox( "knifebot", kb.enabled );
+			xui::checkbox( "刀机器人", kb.enabled );
 			if ( xui::begin_popup( "##kb_settings", 220.0f ) )
 			{
-				xui::slider_float( "max fov##kb", kb.max_fov, 1, 180, "%.0f°" );
+				xui::slider_float( "最大视角##kb", kb.max_fov, 1, 180, "%.0f°" );
 				xui::end_popup( );
 			}
 
@@ -129,15 +183,15 @@ namespace rendering {
 
 		if ( xui::begin_child( "##ragebot_peek", col_w ) )
 		{
-			xui::checkbox( "quick peek", qp.enabled );
+			xui::checkbox( "快速探身", qp.enabled );
 			if ( xui::begin_popup( "##qp_colors", 220.0f ) )
 			{
-				xui::color_picker( "base color##qp", qp.color );
-				xui::color_picker( "retracting color##qp", qp.retrack_color );
+				xui::color_picker( "基础颜色##qp", qp.color );
+				xui::color_picker( "收回颜色##qp", qp.retrack_color );
 				xui::end_popup( );
 			}
 
-			xui::checkbox( "duck peek", dp.enabled );
+			xui::checkbox( "下蹲探身", dp.enabled );
 
 			xui::end_child( );
 		}

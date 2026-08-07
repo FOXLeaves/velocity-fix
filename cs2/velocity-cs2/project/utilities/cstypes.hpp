@@ -356,6 +356,13 @@ namespace cstypes {
 		const void* binding;
 	};
 
+	struct key_values3
+	{
+		std::uint64_t metadata;
+		std::uint64_t payload;
+	};
+	static_assert( sizeof( key_values3 ) == 0x10 );
+
 	struct kv3_id
 	{
 		const char* format;

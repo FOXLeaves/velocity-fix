@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include <pch/pch.hpp>
+#include <utilities/diag.hpp>
 #include "xui.hpp"
 #include <algorithm>
 #include <chrono>
@@ -948,10 +949,10 @@ namespace xui {
 		{
 			switch ( m )
 			{
-			case bind_mode::toggle:   return "toggle";
-			case bind_mode::hold_on:  return "hold on";
-			case bind_mode::hold_off: return "hold off";
-			default:                  return "unknown";
+			case bind_mode::toggle:   return "切换";
+			case bind_mode::hold_on:  return "按住开启";
+			case bind_mode::hold_off: return "按住关闭";
+			default:                  return "未知";
 			}
 		}
 
@@ -1508,7 +1509,7 @@ namespace xui {
 	{
 		if ( key == 0 )
 		{
-			return "none";
+			return "无";
 		}
 
 		if ( key >= 0x41 && key <= 0x5A )
@@ -1529,42 +1530,42 @@ namespace xui {
 
 		switch ( key )
 		{
-		case VK_LBUTTON: return "lmb";
-		case VK_RBUTTON: return "rmb";
-		case VK_MBUTTON: return "mmb";
-		case VK_XBUTTON1: return "mb4";
-		case VK_XBUTTON2: return "mb5";
-		case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: return "shift";
-		case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: return "ctrl";
-		case VK_MENU: case VK_LMENU: case VK_RMENU: return "alt";
-		case VK_SPACE: return "space";
-		case VK_RETURN: return "enter";
-		case VK_ESCAPE: return "esc";
-		case VK_TAB: return "tab";
-		case VK_CAPITAL: return "caps";
-		case VK_INSERT: return "insert";
-		case VK_DELETE: return "delete";
-		case VK_HOME: return "home";
-		case VK_END: return "end";
-		case VK_PRIOR: return "pgup";
-		case VK_NEXT: return "pgdn";
-		case VK_LEFT: return "left";
-		case VK_RIGHT: return "right";
-		case VK_UP: return "up";
-		case VK_DOWN: return "down";
-		case VK_F1: return "f1";
-		case VK_F2: return "f2";
-		case VK_F3: return "f3";
-		case VK_F4: return "f4";
-		case VK_F5: return "f5";
-		case VK_F6: return "f6";
-		case VK_F7: return "f7";
-		case VK_F8: return "f8";
-		case VK_F9: return "f9";
-		case VK_F10: return "f10";
-		case VK_F11: return "f11";
-		case VK_F12: return "f12";
-		default: return "unknown";
+		case VK_LBUTTON: return "鼠标左键";
+		case VK_RBUTTON: return "鼠标右键";
+		case VK_MBUTTON: return "鼠标中键";
+		case VK_XBUTTON1: return "鼠标侧键4";
+		case VK_XBUTTON2: return "鼠标侧键5";
+		case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: return "Shift";
+		case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: return "Ctrl";
+		case VK_MENU: case VK_LMENU: case VK_RMENU: return "Alt";
+		case VK_SPACE: return "空格";
+		case VK_RETURN: return "回车";
+		case VK_ESCAPE: return "Esc";
+		case VK_TAB: return "Tab";
+		case VK_CAPITAL: return "大写锁定";
+		case VK_INSERT: return "插入";
+		case VK_DELETE: return "删除";
+		case VK_HOME: return "主页";
+		case VK_END: return "结尾";
+		case VK_PRIOR: return "上翻页";
+		case VK_NEXT: return "下翻页";
+		case VK_LEFT: return "左";
+		case VK_RIGHT: return "右";
+		case VK_UP: return "上";
+		case VK_DOWN: return "下";
+		case VK_F1: return "F1";
+		case VK_F2: return "F2";
+		case VK_F3: return "F3";
+		case VK_F4: return "F4";
+		case VK_F5: return "F5";
+		case VK_F6: return "F6";
+		case VK_F7: return "F7";
+		case VK_F8: return "F8";
+		case VK_F9: return "F9";
+		case VK_F10: return "F10";
+		case VK_F11: return "F11";
+		case VK_F12: return "F12";
+		default: return "未知";
 		}
 	}
 
@@ -1577,6 +1578,26 @@ namespace xui {
 	void begin( )
 	{
 		auto& c = get_ctx( );
+
+		// ESP overlays and widgets render before the UI and may leave entries
+		// on the global font stack (e.g. an early return between push and pop).
+		// Force the UI back onto the primary font so menu text can never be
+		// silently switched to a glyph-poor font (which drops CJK characters).
+		static bool font_diag_logged{ false };
+		if ( !font_diag_logged )
+		{
+			font_diag_logged = true;
+			const auto pf = xdraw::primary_font( );
+			diag::writef(
+				diag::level::info,
+				"[xui] font_stack=%zu primary_size=%.1f ascent=%.1f line_height=%.1f",
+				xdraw::font_stack_size( ),
+				pf ? pf->size : 0.0f,
+				pf ? pf->ascent : 0.0f,
+				pf ? pf->line_height : 0.0f );
+		}
+
+		xdraw::reset_font_stack( );
 
 		{
 			auto& dc = get_double_click( );
@@ -2371,7 +2392,7 @@ namespace xui {
 
 				dl.push_clip( popup.x, popup.y, popup.w, animated_h );
 
-				const auto key_text = this->m_listening ? "..." : ( this->m_setting ? vk_name( this->m_setting->bind.key ) : "none" );
+				const auto key_text = this->m_listening ? "..." : ( this->m_setting ? vk_name( this->m_setting->bind.key ) : "无" );
 				const auto mode_text = this->m_setting ? binds::mode_name( this->m_setting->bind.mode ) : "toggle";
 
 				for ( int i = 0; i < k_item_count; ++i )

@@ -17,6 +17,11 @@ namespace fnv1a {
 
 	inline std::uint32_t runtime_hash( const char* str ) noexcept
 	{
+		if ( !str )
+		{
+			return 0;
+		}
+
 		std::uint32_t hash{ 2166136261u };
 
 		while ( *str )

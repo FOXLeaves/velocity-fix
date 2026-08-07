@@ -1,32 +1,67 @@
 #include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
+#include <utilities/logging/logging.hpp>
 #include <utilities/threadpool/threadpool.hpp>
+#include <utilities/game_path.hpp>
 #include "../changer.hpp"
 
 namespace features::changer {
 
 	bool econ_item_system::initialize( )
 	{
-		const auto system = memory::read<std::uintptr_t>( addresses::globals::item_system );
-		if ( !system )
+		std::uintptr_t schema{};
+		auto schema_ready{ false };
+		constexpr auto max_attempts{ 300 };
+		constexpr auto retry_delay{ std::chrono::milliseconds( 100 ) };
+
+		// Early injection can precede the schema's item-definition and paint-kit
+		// tables. Wait until both are populated, then parse exactly once.
+		for ( auto attempt = 0; attempt < max_attempts; ++attempt )
 		{
-			return false;
+			const auto system = memory::call<std::uintptr_t>( addresses::globals::item_system );
+			schema = system
+				? memory::safe_read<std::uintptr_t>( system + 0x8 ).value_or( 0 )
+				: 0;
+
+			if ( schema )
+			{
+				const auto item_count = memory::safe_read<int>( schema + 0x128 ).value_or( 0 );
+				const auto item_array = memory::safe_read<std::uintptr_t>( schema + 0x130 ).value_or( 0 );
+				const auto paint_count = memory::safe_read<int>( schema + 0x2F0 ).value_or( 0 );
+				const auto paint_nodes = memory::safe_read<std::uintptr_t>( schema + 0x2F8 ).value_or( 0 );
+
+				if ( item_count > 0 && item_count <= 10000 && item_array
+					&& paint_count > 0 && paint_count <= 10000 && paint_nodes )
+				{
+					schema_ready = true;
+					break;
+				}
+			}
+
+			if ( attempt == 0 )
+			{
+				logging::console::print( xs( "[econ] waiting for item schema" ) );
+			}
+
+			std::this_thread::sleep_for( retry_delay );
 		}
 
-		const auto schema = memory::read<std::uintptr_t>( system + 0x8 );
-		if ( !schema )
+		if ( !schema_ready )
 		{
+			logging::console::print( xs( "[econ] timed out waiting for item schema" ) );
 			return false;
 		}
 
 		if ( !this->parse_item_defs( schema ) )
 		{
+			logging::console::print( xs( "[econ] failed to parse item definitions" ) );
 			return false;
 		}
 
 		if ( !this->parse_paint_kits( schema ) )
 		{
+			logging::console::print( xs( "[econ] failed to parse paint kits" ) );
 			return false;
 		}
 
@@ -35,6 +70,7 @@ namespace features::changer {
 
 		if ( !this->build_vpk_index( ) )
 		{
+			logging::console::print( xs( "[econ] failed to build VPK index" ) );
 			return false;
 		}
 
@@ -154,10 +190,10 @@ namespace features::changer {
 
 	bool econ_item_system::parse_item_defs( std::uintptr_t schema )
 	{
-		const auto count = memory::read<int>( schema + 0xF8 );
-		const auto array = memory::read<std::uintptr_t>( schema + 0x100 );
+		const auto count = memory::read<int>( schema + 0x128 );
+		const auto array = memory::read<std::uintptr_t>( schema + 0x130 );
 
-		if ( !array || count <= 0 )
+		if ( !array || count <= 0 || count > 10000 )
 		{
 			return false;
 		}
@@ -166,7 +202,7 @@ namespace features::changer {
 
 		for ( auto i = 0; i < count; i++ )
 		{
-			const auto entry_base = array + static_cast< std::uintptr_t >( 24 * i );
+			const auto entry_base = array + static_cast< std::uintptr_t >( 32 * i );
 			const auto def_index = memory::read<int>( entry_base + 16 );
 
 			if ( def_index < -1 )
@@ -174,7 +210,7 @@ namespace features::changer {
 				continue;
 			}
 
-			const auto def_ptr = memory::read<std::uintptr_t>( entry_base + 8 );
+			const auto def_ptr = memory::read<std::uintptr_t>( entry_base + 24 );
 			if ( !def_ptr )
 			{
 				continue;
@@ -186,14 +222,10 @@ namespace features::changer {
 			item.used_by_classes = memory::read<std::uint32_t>( def_ptr + 0x368 );
 			item.rarity = memory::read<std::uint8_t>( def_ptr + 0x42 );
 
-			if ( const auto cls_ptr = memory::read<std::uintptr_t>( def_ptr + 0x248 ); cls_ptr )
-			{
-				item.item_class = memory::read_string( cls_ptr );
-			}
-
 			if ( const auto name_ptr = memory::read<std::uintptr_t>( def_ptr + 0x260 ); name_ptr )
 			{
 				item.name = memory::read_string( name_ptr );
+				item.item_class = item.name;
 			}
 
 			if ( const auto model_ptr = memory::read<std::uintptr_t>( def_ptr + 0x148 ); model_ptr )
@@ -229,18 +261,17 @@ namespace features::changer {
 			this->m_item_defs.push_back( std::move( item ) );
 		}
 
-		return true;
+		return !this->m_item_defs.empty( );
 	}
 
 	bool econ_item_system::parse_paint_kits( std::uintptr_t schema )
 	{
-		const auto map_base = schema + 0x2E8;
-		const auto tree_base = map_base + 0x08;
+		const auto tree_base = schema + 0x2F0;
 
 		const auto count = memory::read<int>( tree_base + 0x00 );
 		const auto nodes = memory::read<std::uintptr_t>( tree_base + 0x08 );
 
-		if ( !nodes || count <= 0 )
+		if ( !nodes || count <= 0 || count > 10000 )
 		{
 			return false;
 		}
@@ -282,7 +313,7 @@ namespace features::changer {
 			this->m_paint_kits.push_back( std::move( pk ) );
 		}
 
-		return true;
+		return !this->m_paint_kits.empty( );
 	}
 
 	void econ_item_system::build_indices( )
@@ -349,27 +380,20 @@ namespace features::changer {
 
 		this->m_vpk_indexed = true;
 
-		static const char* search_paths[ ]
+		const auto csgo_directory = game_path::csgo_directory( );
+		if ( !csgo_directory )
 		{
-			"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Counter-Strike Global Offensive\\game\\csgo\\pak01_dir.vpk",
-			"H:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\game\\csgo\\pak01_dir.vpk",
-			"E:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\game\\csgo\\pak01_dir.vpk"
-		};
-
-		std::ifstream file;
-		for ( const auto& path : search_paths )
-		{
-			file.open( path, std::ios::binary );
-			if ( file.is_open( ) )
-			{
-				break;
-			}
+			return false;
 		}
+
+		std::ifstream file( *csgo_directory / L"pak01_dir.vpk", std::ios::binary );
 
 		if ( !file.is_open( ) )
 		{
 			return false;
 		}
+
+		this->m_vpk_directory = *csgo_directory;
 
 #pragma pack( push, 1 )
 		struct vpk_header
@@ -702,10 +726,10 @@ namespace features::changer {
 
 		if ( !stream.is_open( ) )
 		{
-			char archive_name[ 256 ];
-			std::snprintf( archive_name, sizeof( archive_name ), xs( "%spak01_%03d.vpk" ), xs( "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Counter-Strike Global Offensive\\game\\csgo\\" ), entry.archive_index );
+			char archive_name[ 32 ];
+			std::snprintf( archive_name, sizeof( archive_name ), xs( "pak01_%03d.vpk" ), entry.archive_index );
 
-			stream.open( archive_name, std::ios::binary );
+			stream.open( this->m_vpk_directory / archive_name, std::ios::binary );
 			if ( !stream.is_open( ) )
 			{
 				return {};

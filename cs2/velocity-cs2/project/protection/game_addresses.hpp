@@ -96,57 +96,38 @@ namespace protection::addresses {
     (::protection::addresses ::address_holder<hash_value, addr_type, ::protection::addresses ::fixed_string{ str_value }>::entry)
 
 #ifndef PATTERN
-#if !defined(DEV)
-#define PATTERN(entry)     ::protection::addresses::decode(entry)
-#else
 #define PATTERN(entry) \
     ([]() -> std::uintptr_t { \
         static const auto val = memory::resolve_pattern((entry).data.data); \
         return val; \
     }())
 #endif
-#endif
 
 #ifndef INTERFACE_
-#if !defined(DEV)
-#define INTERFACE_(str)  ::protection::addresses::decode(ADDRESS_IMPL(::protection::addresses::hash(str), ::protection::addresses::address_type::interface_,  str))
-#else
 #define INTERFACE_(str) \
     []() -> std::uintptr_t { \
         static const auto val = memory::get_module_interface(str); \
         return val; \
     }()
 #endif
-#endif
 
 #ifndef CONVAR
-#if !defined (DEV)
-#define CONVAR(str)       ::protection::addresses ::decode(ADDRESS_IMPL(::protection::addresses ::hash(str), ::protection::addresses ::address_type::convar,        str))
-#else
 #define CONVAR(str) \
     []() -> c_convar* { \
         static const auto val = addresses::globals::cvar->find(::protection::addresses::hash(str)); \
         return val; \
     }()
 #endif
-#endif
 
 #ifndef MODULE_BASE
-#if !defined(DEV)
-#define MODULE_BASE(str)  ::protection::addresses::decode(ADDRESS_IMPL(::protection::addresses::hash(str), ::protection::addresses::address_type::module_base,   str))
-#else
 #define MODULE_BASE(str) \
     []() -> std::uintptr_t { \
         static const auto val = memory::get_module_base(str); \
         return val; \
     }()
 #endif
-#endif
 
 #ifndef MODULE_EXPORT
-#if !defined(DEV)
-#define MODULE_EXPORT(str) ::protection::addresses::decode(ADDRESS_IMPL(::protection::addresses::hash(str), ::protection::addresses::address_type::module_export, str))
-#else
 #define MODULE_EXPORT(str) \
     ([]() -> std::uintptr_t { \
         static std::uintptr_t val{}; \
@@ -155,7 +136,6 @@ namespace protection::addresses {
         } \
         return val; \
     }())
-#endif
 #endif
 
 #include <protection/patterns.hpp>

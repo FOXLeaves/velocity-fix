@@ -15,6 +15,7 @@ namespace features {
 		inline misc g_misc{};
 		inline rage g_rage{};
 		inline legit g_legit{};
+		inline vac_bypass g_vac_bypass{};
 
 	} // namespace esp
 
@@ -75,6 +76,7 @@ namespace features {
 		inline edgestop g_edgestop{};
 		inline edgebug g_edgebug{};
 		inline slowwalk g_slowwalk{};
+		inline mini_jump g_mini_jump{};
 
 	} // namespace movement
 
@@ -89,6 +91,7 @@ namespace features {
 	namespace changer {
 
 		inline econ_item_system g_econ_item_system{};
+		inline custom_models g_custom_models{};
 		inline agents g_agents{};
 		inline gloves g_gloves{};
 		inline guns g_guns{};

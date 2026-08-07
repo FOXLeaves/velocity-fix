@@ -884,48 +884,80 @@ namespace config {
 
 	namespace registry {
 
-		inline constexpr wchar_t k_root_key[ ]{ L"Software\\velokitty\\configs" };
+		inline constexpr wchar_t k_root_dir[ ]{ L"C:\\cat" };
+
+		// Config names are user-typed; sanitize any path-breaking characters
+		// so a name can never escape the config directory.
+		[[nodiscard]] inline std::wstring file_path( std::wstring_view name )
+		{
+			std::wstring path = k_root_dir;
+			path += L'\\';
+
+			for ( const auto ch : name )
+			{
+				path += ( ch == L'\\' || ch == L'/' || ch == L':' || ch == L'*' || ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|' ) ? L'_' : ch;
+			}
+
+			path += L".cfg";
+			return path;
+		}
+
+		[[nodiscard]] inline bool ensure_dir( )
+		{
+			return CreateDirectoryW( k_root_dir, nullptr ) != FALSE || GetLastError( ) == ERROR_ALREADY_EXISTS;
+		}
 
 		inline bool save( std::wstring_view name )
 		{
-			HKEY hkey{};
-			if ( RegCreateKeyExW( HKEY_CURRENT_USER, k_root_key, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hkey, nullptr ) != ERROR_SUCCESS )
+			if ( !ensure_dir( ) )
 			{
 				return false;
 			}
 
 			const auto json_str = to_json( ).dump( -1 );
 			const auto compressed = compress::deflate( json_str );
-			const auto result = RegSetValueExW( hkey, name.data( ), 0, REG_BINARY, compressed.data( ), static_cast< DWORD >( compressed.size( ) ) );
+			if ( compressed.empty( ) )
+			{
+				return false;
+			}
 
-			RegCloseKey( hkey );
-			return result == ERROR_SUCCESS;
+			const auto path = file_path( name );
+			HANDLE file = CreateFileW( path.c_str( ), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr );
+			if ( file == INVALID_HANDLE_VALUE )
+			{
+				return false;
+			}
+
+			DWORD written{};
+			const auto ok = WriteFile( file, compressed.data( ), static_cast< DWORD >( compressed.size( ) ), &written, nullptr ) && written == compressed.size( );
+			CloseHandle( file );
+			return ok;
 		}
 
 		inline bool load( std::wstring_view name )
 		{
-			HKEY hkey{};
-			if ( RegOpenKeyExW( HKEY_CURRENT_USER, k_root_key, 0, KEY_QUERY_VALUE, &hkey ) != ERROR_SUCCESS )
+			const auto path = file_path( name );
+			HANDLE file = CreateFileW( path.c_str( ), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr );
+			if ( file == INVALID_HANDLE_VALUE )
 			{
 				return false;
 			}
 
-			DWORD size{};
-			if ( RegQueryValueExW( hkey, name.data( ), nullptr, nullptr, nullptr, &size ) != ERROR_SUCCESS || size == 0 )
+			LARGE_INTEGER size{};
+			if ( !GetFileSizeEx( file, &size ) || size.QuadPart <= 0 || size.QuadPart > 16 * 1024 * 1024 )
 			{
-				RegCloseKey( hkey );
+				CloseHandle( file );
 				return false;
 			}
 
-			std::vector<std::uint8_t> buf( size );
-
-			if ( RegQueryValueExW( hkey, name.data( ), nullptr, nullptr, buf.data( ), &size ) != ERROR_SUCCESS )
+			std::vector<std::uint8_t> buf( static_cast< std::size_t >( size.QuadPart ) );
+			DWORD read{};
+			const auto ok = ReadFile( file, buf.data( ), static_cast< DWORD >( buf.size( ) ), &read, nullptr ) && read == buf.size( );
+			CloseHandle( file );
+			if ( !ok )
 			{
-				RegCloseKey( hkey );
 				return false;
 			}
-
-			RegCloseKey( hkey );
 
 			const auto json_str = compress::inflate( buf.data( ), buf.size( ) );
 			if ( !json_str )
@@ -948,42 +980,41 @@ namespace config {
 
 		inline bool remove( std::wstring_view name )
 		{
-			HKEY hkey{};
-			if ( RegOpenKeyExW( HKEY_CURRENT_USER, k_root_key, 0, KEY_SET_VALUE, &hkey ) != ERROR_SUCCESS )
-			{
-				return false;
-			}
-
-			const auto result = RegDeleteValueW( hkey, name.data( ) );
-			RegCloseKey( hkey );
-			return result == ERROR_SUCCESS;
+			return DeleteFileW( file_path( name ).c_str( ) ) != FALSE;
 		}
 
 		inline std::vector<std::wstring> list( )
 		{
 			std::vector<std::wstring> names;
 
-			HKEY hkey{};
-			if ( RegOpenKeyExW( HKEY_CURRENT_USER, k_root_key, 0, KEY_QUERY_VALUE, &hkey ) != ERROR_SUCCESS )
+			std::wstring pattern = k_root_dir;
+			pattern += L"\\*.cfg";
+
+			WIN32_FIND_DATAW data{};
+			HANDLE find = FindFirstFileW( pattern.c_str( ), &data );
+			if ( find == INVALID_HANDLE_VALUE )
 			{
 				return names;
 			}
 
-			wchar_t name_buf[ 256 ]{};
-			DWORD index{};
-
-			while ( true )
+			do
 			{
-				DWORD name_len{ 256 };
-				if ( RegEnumValueW( hkey, index++, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr ) != ERROR_SUCCESS )
+				if ( data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY )
 				{
-					break;
+					continue;
 				}
 
-				names.emplace_back( name_buf, name_len );
+				std::wstring file_name = data.cFileName;
+				const auto ext = file_name.rfind( L".cfg" );
+				if ( ext != std::wstring::npos && ext == file_name.size( ) - 4 )
+				{
+					file_name.erase( ext );
+					names.emplace_back( std::move( file_name ) );
+				}
 			}
+			while ( FindNextFileW( find, &data ) );
 
-			RegCloseKey( hkey );
+			FindClose( find );
 			std::sort( names.begin( ), names.end( ) );
 			return names;
 		}

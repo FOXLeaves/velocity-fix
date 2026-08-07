@@ -5,4 +5,5 @@
     <Platform Name="x64" />
   </Configurations>
   <Project Path="velocity-cs2/velocity-cs2.vcxproj" Id="d30ae6e8-620d-42e0-b3f4-804cafe20f44" />
+  <Project Path="injector/injector.vcxproj" Id="6c3e9a21-4b7d-4e5a-9f3c-1d2e8a5b6c7d" />
 </Solution>

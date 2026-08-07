@@ -33,7 +33,7 @@ namespace addresses::globals {
 		particle_manager       = PATTERN (patterns::particle_manager);
 		game_event_manager     = PATTERN (patterns::game_event_manager);
 		game_trace_manager     = PATTERN (patterns::game_trace_manager);
-		render_game_system     = PATTERN (patterns::render_game_system);
+		render_game_system_storage = PATTERN (patterns::render_game_system_storage);
 		material_manager       = PATTERN (patterns::material_manager);
 		game_entity_system     = PATTERN (patterns::game_entity_system);
 		weapon_recoil_data     = PATTERN (patterns::weapon_recoil_data);
@@ -43,7 +43,6 @@ namespace addresses::globals {
 		prediction_player      = PATTERN (patterns::prediction_player);
 		planted_c4             = PATTERN (patterns::planted_c4);
 		item_system            = PATTERN (patterns::item_system);
-		net_client             = PATTERN (patterns::net_client);
 		frame_input_ring_idx   = PATTERN (patterns::frame_input_ring_idx);
 		frame_input_ring_base  = PATTERN (patterns::frame_input_ring_base);
 		prediction_state       = PATTERN (patterns::prediction_state);
@@ -51,35 +50,43 @@ namespace addresses::globals {
 		if (const auto ptr = MODULE_EXPORT("tier0.dll:g_pMemAlloc"))
 			mem_alloc = *reinterpret_cast<std::uintptr_t*>(ptr);
 
-		{
-			const auto storage = PATTERN (patterns::swap_chain_storage);
-			if (!storage) {
-				return false;
-			}
+		const std::pair<std::string_view, std::uintptr_t> required_globals[] {
+			{ "csgo_input", csgo_input },
+			{ "entity_list", entity_list },
+			{ "local_player_controller", local_player_controller },
+			{ "global_vars", global_vars },
+			{ "view_matrix", view_matrix },
+			{ "game_rules", game_rules },
+			{ "light_data_queue", light_data_queue },
+			{ "particle_manager", particle_manager },
+			{ "game_event_manager", game_event_manager },
+			{ "game_trace_manager", game_trace_manager },
+			{ "render_game_system_storage", render_game_system_storage },
+			{ "mem_alloc", mem_alloc },
+			{ "material_manager", material_manager },
+			{ "game_entity_system", game_entity_system },
+			{ "weapon_recoil_data", weapon_recoil_data },
+			{ "hud", hud },
+			{ "prediction_seed", prediction_seed },
+			{ "simulation_player", simulation_player },
+			{ "prediction_player", prediction_player },
+			{ "planted_c4", planted_c4 },
+			{ "item_system", item_system },
+			{ "network_client_service", network_client_service },
+			{ "frame_input_ring_idx", frame_input_ring_idx },
+			{ "frame_input_ring_base", frame_input_ring_base },
+			{ "prediction_state", prediction_state },
+		};
 
-			const auto first = memory::read<std::uintptr_t> (storage);
-			if (!first) {
-				return false;
+		auto initialized = true;
+		for (const auto& [name, address] : required_globals) {
+			if (!address) {
+				logging::console::print (xs ("[error] global address not initialized | {}"), name);
+				initialized = false;
 			}
-
-			const auto second = memory::read<std::uintptr_t> (first);
-			if (!second) {
-				return false;
-			}
-
-			swap_chain = memory::read<std::uintptr_t> (second + 0x170);
 		}
 
-		if (
-			!csgo_input || !entity_list || !local_player_controller || !global_vars || !view_matrix || !game_rules || !light_data_queue || !particle_manager ||
-			!game_event_manager || !game_trace_manager || !render_game_system || !mem_alloc || !swap_chain || !material_manager || !game_entity_system ||
-			!weapon_recoil_data || !hud || !prediction_seed || !simulation_player || !prediction_player || !planted_c4 || !item_system || !net_client ||
-			!frame_input_ring_idx || !frame_input_ring_base || !prediction_state
-			) {
-			return false;
-		}
-
-		return true;
+		return initialized;
 	}
 
 } // namespace addresses::globals

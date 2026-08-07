@@ -1,7 +1,6 @@
 #include <pch/pch.hpp>
 #include <core/systems/systems.hpp>
 #include <core/features/features.hpp>
-#include <utilities/bootstrap/bootstrap.hpp>
 
 #include "../rendering.hpp"
 
@@ -14,13 +13,7 @@ namespace rendering {
 			return true;
 		}
 
-		if ( !bootstrap::try_load_rpak( ) )
-		{
-			return false;
-		}
-
 		g_fonts.initialize( );
-		g_menu.finalize_textures_after_rpack( );
 
 		this->m_ui_assets_ready = true;
 		return true;
@@ -48,7 +41,7 @@ namespace rendering {
 		this->create_rtv( swap_chain );
 		this->setup_zdraw( this->m_window );
 
-		g_menu.initialize_graphics_before_rpack( );
+		g_menu.initialize_graphics( );
 		this->try_bind_ui_assets( );
 
 		this->m_initialized = true;
@@ -90,6 +83,7 @@ namespace rendering {
 		}
 
 		this->try_bind_ui_assets( );
+		features::misc::g_dlight.on_present( );
 
 		m_context->OMSetRenderTargets( 1, &this->m_rtv, nullptr );
 
@@ -99,7 +93,6 @@ namespace rendering {
 
 			if ( this->m_ui_assets_ready && systems::g_local.get( ).is_valid( ) && systems::g_view.has_camera( ) )
 			{
-				features::misc::g_dlight.on_present( );
 				features::misc::g_impacts.on_render_early( dl );
 				features::combat::g_misc.antiaim( ).on_render( dl );
 				features::movement::g_edgebug.on_render( dl );

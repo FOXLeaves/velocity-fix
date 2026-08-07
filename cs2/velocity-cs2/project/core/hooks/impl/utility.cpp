@@ -4,8 +4,52 @@
 #include <utilities/hooking/hooking.hpp>
 #include <utilities/logging/logging.hpp>
 #include <core/settings.hpp>
+#include <core/resources/particles/effects.hpp>
+#include <core/resources/particles/weather.hpp>
 #include <protection/game_addresses.hpp>
 #include "../hooks.hpp"
+
+namespace {
+
+	std::span<const unsigned char> find_embedded_particle( const std::string& filename )
+	{
+		if ( filename.find( xs( "snow" ) ) != std::string::npos )
+		{
+			return std::span<const unsigned char>{ resources::particles::weather::snow };
+		}
+		if ( filename.find( xs( "rain" ) ) != std::string::npos )
+		{
+			return std::span<const unsigned char>{ resources::particles::weather::rain };
+		}
+		if ( filename.find( xs( "kill" ) ) != std::string::npos )
+		{
+			return std::span<const unsigned char>{ resources::particles::effects::killstars };
+		}
+		if ( filename.find( xs( "stars" ) ) != std::string::npos )
+		{
+			return std::span<const unsigned char>{ resources::particles::weather::stars };
+		}
+		if ( filename.find( xs( "tracer" ) ) != std::string::npos )
+		{
+			return std::span<const unsigned char>{ resources::particles::effects::tracer };
+		}
+		if ( filename.find( xs( "sparks" ) ) != std::string::npos )
+		{
+			return std::span<const unsigned char>{ resources::particles::effects::sparks };
+		}
+		if ( filename.find( xs( "fade" ) ) != std::string::npos )
+		{
+			return std::span<const unsigned char>{ resources::particles::effects::fade };
+		}
+		if ( filename.find( xs( "halo" ) ) != std::string::npos )
+		{
+			return std::span<const unsigned char>{ resources::particles::effects::halo };
+		}
+
+		return {};
+	}
+
+} // namespace
 
 namespace hooks {
 
@@ -13,7 +57,7 @@ namespace hooks {
 	{
 		if ( !hooking::manager::create( {
 			{ &m_service_read, &service_read, xs( "service_read" ), PATTERN (patterns::service_read) },
-			{ &m_log_internal, &log_internal, xs( "log_internal" ),PATTERN (patterns::log_internal) }
+			{ &m_log_internal, &log_internal, xs( "log_internal" ), PATTERN (patterns::log_internal) }
 			} ) )
 		{
 			return false;
@@ -36,82 +80,42 @@ namespace hooks {
 		std::string filename;
 		if ( len > 0 && len < 512 )
 		{
-			char buf[ 512 ]{};
+			char buffer[ 512 ]{};
 
 			if ( flags_len & 0x40000000 )
 			{
-				std::memcpy( buf, reinterpret_cast< void* >( a1 - 208 ), std::min( len, 512u - 1 ) );
+				std::memcpy( buffer, reinterpret_cast< void* >( a1 - 208 ), std::min( len, 511u ) );
 			}
 			else
 			{
-				const auto str_ptr = memory::read<std::uintptr_t>( a1 - 208 );
-				if ( str_ptr )
+				const auto string = memory::read<std::uintptr_t>( a1 - 208 );
+				if ( string )
 				{
-					std::memcpy( buf, reinterpret_cast< void* >( str_ptr ), std::min( len, 512u - 1 ) );
+					std::memcpy( buffer, reinterpret_cast< void* >( string ), std::min( len, 511u ) );
 				}
 			}
 
-			filename = buf;
+			filename = buffer;
 		}
 
 		if ( filename.find( xs( "particles/embedded/" ) ) != std::string::npos )
 		{
-			std::uint32_t resource_id{ 0 };
+			const auto particle = find_embedded_particle( filename );
+			const auto async_filesystem = memory::read<std::uintptr_t>( a1 + 24 );
 
-			if ( filename.find( xs( "snow" ) ) != std::string::npos )
+			if ( !particle.empty( ) && async_filesystem )
 			{
-				resource_id = rpack::particles::weather::snow;
-			}
-			else if ( filename.find( xs( "rain" ) ) != std::string::npos )
-			{
-				resource_id = rpack::particles::weather::rain;
-			}
-			else if ( filename.find( xs( "stars" ) ) != std::string::npos )
-			{
-				resource_id = rpack::particles::weather::stars;
-			}
-			else if ( filename.find( xs( "kill" ) ) != std::string::npos )
-			{
-				resource_id = rpack::particles::effects::killstars;
-			}
-			else if ( filename.find( xs( "tracer" ) ) != std::string::npos )
-			{
-				resource_id = rpack::particles::effects::tracer;
-			}
-			else if ( filename.find( xs( "sparks" ) ) != std::string::npos )
-			{
-				resource_id = rpack::particles::effects::sparks;
-			}
-			else if ( filename.find( xs( "fade" ) ) != std::string::npos )
-			{
-				resource_id = rpack::particles::effects::fade;
-			}
-			else if ( filename.find( xs( "halo" ) ) != std::string::npos )
-			{
-				resource_id = rpack::particles::effects::halo;
-			}
-
-			if ( resource_id != 0 )
-			{
-				const auto data = rpack::reader::data( resource_id );
-				const auto size = rpack::reader::size( resource_id );
-
-				if ( data && size )
+				const auto buffer = memory::call_vfunc<std::uintptr_t>( async_filesystem, 22, particle.size( ), filename.c_str( ) );
+				if ( buffer )
 				{
-					const auto async_fs = memory::read<std::uintptr_t>( a1 + 24 );
-					const auto buffer = memory::call_vfunc<std::uintptr_t>( async_fs, 22, size, filename.c_str( ) );
+					std::memcpy( reinterpret_cast< void* >( buffer ), particle.data( ), particle.size( ) );
 
-					if ( buffer )
-					{
-						std::memcpy( reinterpret_cast< void* >( buffer ), data, size );
+					memory::write<std::uintptr_t>( a1 + 56, buffer );
+					memory::write<std::uintptr_t>( a1 + 64, particle.size( ) );
+					memory::write<std::uintptr_t>( a1 + 72, particle.size( ) );
+					memory::call<void>( PATTERN (patterns::filesystem_close), a1 - 224, 0 );
 
-						memory::write<std::uintptr_t>( a1 + 56, buffer );
-						memory::write<std::uintptr_t>( a1 + 64, size );
-						memory::write<std::uintptr_t>( a1 + 72, size );
-						memory::call<void>(PATTERN (patterns::filesystem_close), a1 - 224, 0 );
-
-						return 0;
-					}
+					return 0;
 				}
 			}
 		}
@@ -121,7 +125,18 @@ namespace hooks {
 
 	std::intptr_t __fastcall utility::log_internal( std::uintptr_t a1, std::uint32_t channel, std::int32_t severity, std::uintptr_t metadata, const char* message, std::intptr_t* args )
 	{
-if ( settings::g_misc.disable_game_logs && !logging::console::emitting )
+		// Cache the live engine log context so logging::console::print_raw
+		// can mirror cheat messages into the in-game developer console
+		// through the same channel (and logger instance) the game uses.
+		logging::console::cache_engine_log_context( a1, channel, severity, metadata );
+
+		// Drop the engine's voice-listener teardown spam.
+		if ( message && std::strstr( message, "PostSpawnGroupUnload" ) )
+		{
+			return 0;
+		}
+
+		if ( settings::g_misc.disable_game_logs && !logging::console::emitting )
 		{
 			return 0;
 		}

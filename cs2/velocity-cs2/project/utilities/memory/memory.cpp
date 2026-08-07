@@ -155,7 +155,6 @@ namespace memory {
 
 	} // namespace detail
 
-#if defined (DEV)
 	std::uintptr_t get_module_base (std::string_view module_name) {
 		return reinterpret_cast<std::uintptr_t>(GetModuleHandleA (std::string (module_name).c_str ()));
 	}
@@ -451,7 +450,6 @@ done_scanning:
 
 		return result;
 	}
-#endif
 
 	std::uintptr_t get_module_export (std::uintptr_t module_base, std::uint16_t ordinal) {
 		return reinterpret_cast<std::uintptr_t>(GetProcAddress (reinterpret_cast<HMODULE>(module_base), MAKEINTRESOURCEA (ordinal)));

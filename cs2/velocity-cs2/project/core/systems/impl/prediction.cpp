@@ -1,6 +1,7 @@
 #include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
+#include <utilities/diag.hpp>
 #include <utilities/logging/logging.hpp>
 #include <core/features/features.hpp>
 #include <protection/game_addresses.hpp>
@@ -23,13 +24,13 @@ namespace systems {
 			void save( std::uintptr_t address )
 			{
 				auto value = memory::read<T>( address );
-				this->m_entries.emplace_back( entry{ address, sizeof( T ), {} } );
+				this->m_entries.emplace_back( entry{ address, std::vector<std::uint8_t>( sizeof( T ) ) } );
 				std::memcpy( this->m_entries.back( ).data.data( ), &value, sizeof( T ) );
 			}
 
 			void save_raw( std::uintptr_t address, std::size_t size )
 			{
-				this->m_entries.emplace_back( entry{ address, size, {} } );
+				this->m_entries.emplace_back( entry{ address, std::vector<std::uint8_t>( size ) } );
 				std::memcpy( this->m_entries.back( ).data.data( ), reinterpret_cast< void* >( address ), size );
 			}
 
@@ -37,7 +38,7 @@ namespace systems {
 			{
 				for ( auto it = this->m_entries.rbegin( ); it != this->m_entries.rend( ); ++it )
 				{
-					std::memcpy( reinterpret_cast< void* >( it->address ), it->data.data( ), it->size );
+					std::memcpy( reinterpret_cast< void* >( it->address ), it->data.data( ), it->data.size( ) );
 				}
 
 				this->m_entries.clear( );
@@ -47,8 +48,7 @@ namespace systems {
 			struct entry
 			{
 				std::uintptr_t address{};
-				std::size_t size{};
-				std::array<std::uint8_t, 64> data{};
+				std::vector<std::uint8_t> data{};
 			};
 
 			std::vector<entry> m_entries;
@@ -72,12 +72,36 @@ namespace systems {
 		if ( game_scene_node )
 		{
 			this->m_prestate.origin = memory::read<math::vector3>( game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
-			this->m_prestate.networked_origin = memory::read<math::vector3>( game_scene_node + SCHEMA( "CGameSceneNode", "m_vecOrigin"_hash ) );
+			// m_vecOrigin is an encoded network-origin object, not a vector3.
+			// Use the evaluated position anywhere a plain world-space vector is needed.
+			this->m_prestate.networked_origin = this->m_prestate.origin;
 		}
 	}
 
-	void prediction::simulate( input::usercmd* cmd, const systems::local::snapshot& local, const std::function<void( )>& fn )
+	bool prediction::simulate( input::usercmd* cmd, const systems::local::snapshot& local, const std::function<void( )>& fn )
 	{
+		std::lock_guard simulation_lock( this->m_simulation_mtx );
+
+		static const auto prediction_set_state = PATTERN( patterns::prediction_set_state );
+		static const auto prediction_set_pawn = PATTERN( patterns::prediction_set_pawn );
+		static const auto prediction_setup_move = PATTERN( patterns::prediction_setup_move );
+		static const auto prediction_process_movement = PATTERN( patterns::prediction_process_movement );
+		static const auto prediction_finish_move = PATTERN( patterns::prediction_finish_move );
+		static const auto prediction_reset_pawn = PATTERN( patterns::prediction_reset_pawn );
+
+		if ( !prediction_set_state || !prediction_set_pawn || !prediction_setup_move ||
+			!prediction_process_movement || !prediction_finish_move || !prediction_reset_pawn )
+		{
+			static bool logged = false;
+			if ( !logged )
+			{
+				logging::console::print( xs( "[prediction] disabled: required helper unavailable" ) );
+				logged = true;
+			}
+
+			return false;
+		}
+
 		const auto get_active_weapon = [ ]( std::uintptr_t pawn ) -> std::pair<std::uintptr_t, std::uintptr_t>
 			{
 				const auto weapon_services = memory::read<std::uintptr_t>( pawn + SCHEMA( "C_BasePlayerPawn", "m_pWeaponServices"_hash ) );
@@ -102,13 +126,33 @@ namespace systems {
 
 		if ( !game_scene_node || !movement_services || !aim_punch_services || !weapon )
 		{
-			return;
+			return false;
 		}
 
-		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
+		const auto global_vars = memory::safe_read<std::uintptr_t>( addresses::globals::global_vars ).value_or( 0 );
 		const auto cmd_ptr = reinterpret_cast< std::uintptr_t >( cmd );
-		const auto old_slot = memory::read<std::uintptr_t>( addresses::globals::source2client_prediction + 56 );
-		const auto pred_state = memory::read<std::uintptr_t>( addresses::globals::prediction_state );
+		const auto old_slot = memory::safe_read<std::uintptr_t>( addresses::globals::source2client_prediction + 56 ).value_or( 0 );
+		const auto pred_state = memory::safe_read<std::uintptr_t>( addresses::globals::prediction_state ).value_or( 0 );
+
+		if ( !global_vars || !pred_state )
+		{
+			return false;
+		}
+
+		const auto encoded_origin_offset = SCHEMA( "CGameSceneNode", "m_vecOrigin"_hash );
+		const auto rotation_offset = SCHEMA( "CGameSceneNode", "m_angRotation"_hash );
+		const auto encoded_origin_size = rotation_offset - encoded_origin_offset;
+		if ( encoded_origin_offset <= 0 || encoded_origin_size <= 0 || encoded_origin_size > 0x80 )
+		{
+			static bool logged = false;
+			if ( !logged )
+			{
+				logging::console::print( xs( "[prediction] disabled: invalid encoded origin layout" ) );
+				logged = true;
+			}
+
+			return false;
+		}
 
 		detail::state_guard guard;
 
@@ -141,7 +185,7 @@ namespace systems {
 		guard.save<float>( local.pawn + SCHEMA( "C_BaseEntity", "m_flWaterLevel"_hash ) );
 
 		guard.save<math::vector3>( game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
-		guard.save<math::vector3>( game_scene_node + SCHEMA( "CGameSceneNode", "m_vecOrigin"_hash ) );
+		guard.save_raw( game_scene_node + encoded_origin_offset, static_cast< std::size_t >( encoded_origin_size ) );
 
 		guard.save<float>( local.pawn + SCHEMA( "C_CSPlayerPawn", "m_flVelocityModifier"_hash ) );
 		guard.save<int>( local.pawn + SCHEMA( "C_CSPlayerPawn", "m_iShotsFired"_hash ) );
@@ -242,7 +286,22 @@ namespace systems {
 		guard.save<float>( movement_services + SCHEMA( "CPlayer_MovementServices_Humanoid", "m_flStepSoundTime"_hash ) );
 		guard.save<int>( movement_services + SCHEMA( "CPlayer_MovementServices_Humanoid", "m_nStepside"_hash ) );
 		guard.save<std::uint32_t>( movement_services + SCHEMA( "CPlayer_MovementServices_Humanoid", "m_surfaceProps"_hash ) );
+		guard.save<std::uintptr_t>( movement_services + 408 );
 
+		static std::atomic_bool first_prediction_traced{};
+		const auto trace = !first_prediction_traced.exchange( true, std::memory_order_relaxed );
+		diag::exception_scope exception_scope{ "prediction" };
+		if ( trace )
+		{
+			diag::step( "prediction: state saved" );
+		}
+
+		// The engine calls inside the simulation can raise exceptions when the
+		// game layout drifts after an update (vfunc slots, structures). Swallow
+		// them so the restore path below still runs and the game keeps going.
+		auto simulation_failed{ false };
+
+		__try
 		{
 			if ( old_slot )
 			{
@@ -262,33 +321,89 @@ namespace systems {
 			memory::write( addresses::globals::prediction_player, local.pawn );
 			memory::write<int>( local.controller + SCHEMA( "CBasePlayerController", "m_nTickBase"_hash ), next_tick );
 
-			memory::call<void>(PATTERN (patterns::prediction_set_state), pred_state, std::uint8_t( 1 ) );
-
 			std::uintptr_t pawn_guard[ 1 ]{};
-			memory::call<void>(PATTERN (patterns::prediction_set_pawn), pawn_guard, local.pawn );
+			memory::call<void>( prediction_set_pawn, pawn_guard, local.pawn );
+			memory::call<void>( prediction_set_state, pred_state, std::uint8_t( 1 ) );
 
-			memory::call_vfunc<void>( movement_services, 43, cmd_ptr );  // SetupContext
+			memory::call_vfunc<void>( movement_services, 46, cmd_ptr );  // SetupContext
+			if ( trace )
+			{
+				diag::step( "prediction: context ready" );
+			}
 
-			const auto move_data = memory::call_vfunc<std::uintptr_t>( movement_services, 35 );
-			const bool fb_seedsync = memory::call_vfunc<bool>( movement_services, 45 );
+			const auto move_data = memory::call_vfunc<std::uintptr_t>( movement_services, 38 );
+			const bool fb_seedsync = memory::call_vfunc<bool>( movement_services, 48 );
 
-			memory::call<void>(PATTERN (patterns::prediction_setup_move), move_data, cmd_ptr, next_tick, fb_seedsync ? 1 : 0 );
-			memory::call_vfunc<void>( movement_services, 36, cmd_ptr, move_data );  // SetupMove
+			if ( !move_data )
+			{
+				memory::call<void>( prediction_set_state, pred_state, std::uint8_t( 0 ) );
+				memory::call<void>( prediction_reset_pawn, pawn_guard );
+				memory::call_vfunc<void>( movement_services, 47 );  // CleanupContext
+				return false;
+			}
+
+			memory::call<void>( prediction_setup_move, move_data, cmd_ptr, next_tick, fb_seedsync ? 1 : 0 );
+			memory::call_vfunc<void>( movement_services, 39, cmd_ptr, move_data );  // SetupMove
 			memory::write<std::uintptr_t>( movement_services + 408, 0 );
+			if ( trace )
+			{
+				diag::step( "prediction: move ready" );
+			}
 
-			memory::call<void>(PATTERN (patterns::prediction_process_movement), movement_services, cmd_ptr, move_data, 1 );
-			memory::call_vfunc<void>( movement_services, 40, cmd_ptr, move_data );  // PostThink_Weapon
-			memory::call<void>(PATTERN (patterns::prediction_finish_move), movement_services, cmd_ptr, move_data, 1 );
+			memory::call<void>( prediction_process_movement, movement_services, cmd_ptr, move_data, 1 );
+			if ( trace )
+			{
+				diag::step( "prediction: movement processed" );
+			}
+			memory::call_vfunc<void>( movement_services, 43, cmd_ptr, move_data );  // PostThink_Weapon
+			memory::call<void>( prediction_finish_move, movement_services, cmd_ptr, move_data, 1 );
+			if ( trace )
+			{
+				diag::step( "prediction: move finished" );
+			}
 
 			memory::write( addresses::globals::simulation_player, 0ull );
 
-			memory::call<void>(PATTERN (patterns::prediction_reset_pawn), pawn_guard );
-			memory::call<void>(PATTERN (patterns::prediction_set_state), pred_state, std::uint8_t( 0 ) );
+			memory::call<void>( prediction_set_state, pred_state, std::uint8_t( 0 ) );
+			memory::call<void>( prediction_reset_pawn, pawn_guard );
+			memory::call_vfunc<void>( movement_services, 47 );  // CleanupContext
+			if ( trace )
+			{
+				diag::step( "prediction: context cleaned" );
+				diag::step( "prediction: callback begin" );
+			}
 
 			fn( );
+			if ( trace )
+			{
+				diag::step( "prediction: callback end" );
+			}
+		}
+		__except ( EXCEPTION_EXECUTE_HANDLER )
+		{
+			simulation_failed = true;
+			if ( trace )
+			{
+				diag::step( "prediction: simulation exception swallowed" );
+			}
 		}
 
+		if ( trace )
+		{
+			diag::step( "prediction: restore begin" );
+		}
 		guard.restore( );
+		if ( trace )
+		{
+			diag::step( "prediction: restore end" );
+		}
+
+		if ( simulation_failed )
+		{
+			return false;
+		}
+
+		return true;
 	}
 
 } // namespace systems

@@ -739,43 +739,51 @@ namespace systems {
 
 	std::uintptr_t materials::load( const char* vmat_data, const char* name )
 	{
-		constexpr auto kv3_buffer_size{ 5000 };
-		constexpr auto utl_buffer_size{ 4096 };
 		constexpr auto kv3_id = cstypes::kv3_id{ "generic", 0x41B818518343427E, 0xB5F447C23C0CDF8C };
 
-		const auto vmat_len = std::strlen( vmat_data );
-		if ( vmat_len > utl_buffer_size - 96 )
+		if ( !vmat_data || !name )
 		{
 			return 0;
 		}
 
-		char kv3_buffer[ kv3_buffer_size ]{};
-		char utl_buffer[ utl_buffer_size ]{};
-
-		const auto kv3 = memory::call<void*>(PATTERN (patterns::kv3_alloc), kv3_buffer, 1, 6 );
-		if ( !kv3 )
+		const auto kv3_set_type = PATTERN( patterns::kv3_alloc );
+		const auto kv3_destroy = PATTERN( patterns::kv3_destroy );
+		const auto kv3_load = MODULE_EXPORT( "tier0.dll:?LoadKV3@@YA_NPEAVKeyValues3@@PEAVCUtlString@@PEBDAEBUKV3ID_t@@2I@Z" );
+		const auto material_create = PATTERN( patterns::material_create );
+		if ( !kv3_set_type || !kv3_destroy || !kv3_load || !material_create )
 		{
 			return 0;
 		}
 
-		memory::call<void>(MODULE_EXPORT ("tier0.dll:??0CUtlBuffer@@QEAA@HHW4BufferFlags_t@0@@Z"), utl_buffer, 0, static_cast< int >( vmat_len + 10 ), 1 );
-		memory::call<void>(MODULE_EXPORT ("tier0.dll:?PutString@CUtlBuffer@@QEAAXPEBD@Z"), utl_buffer, vmat_data );
-
-		if ( !memory::call<bool>(PATTERN (patterns::kv3_load), kv3, nullptr, utl_buffer, &kv3_id, "", 0 ) )
+		cstypes::key_values3 kv3{};
+		if ( memory::call<cstypes::key_values3*>( kv3_set_type, &kv3, 1u, 6u ) != &kv3 )
 		{
 			return 0;
 		}
 
 		cstypes::strong_handle handle{};
+		const auto loaded = memory::call<bool>( kv3_load, &kv3, nullptr, vmat_data, &kv3_id, nullptr, 0u );
+		if ( loaded )
+		{
+			memory::call<void*>( material_create, nullptr, &handle, name, &kv3, 0, true );
+		}
 
-		memory::call<void*>(PATTERN (patterns::material_create), nullptr/*addresses::globals::material_system*/, &handle, name, kv3, 0, 1 );
+		// CreateMaterial copies the parsed tree; release the parser-owned value.
+		memory::call<void>( kv3_destroy, &kv3, 0u );
 
-		if ( !handle.binding )
+		if ( !loaded || !handle.binding )
 		{
 			return 0;
 		}
 
-		return *reinterpret_cast< const std::uintptr_t* >( handle.binding );
+		const auto material = *reinterpret_cast< const std::uintptr_t* >( handle.binding );
+		if ( material )
+		{
+			std::scoped_lock lock( m_mtx );
+			m_handles.push_back( handle );
+		}
+
+		return material;
 	}
 
 	std::uintptr_t materials::get_or_create_clone( std::uintptr_t src_mat, clone_type type )

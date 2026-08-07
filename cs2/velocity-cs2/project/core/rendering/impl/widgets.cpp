@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <utilities/math/math.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
@@ -10,6 +10,180 @@
 #include <utilities/security/security.hpp>
 
 namespace rendering {
+
+	namespace {
+
+		// Localized bind names for the HUD keybinds widget (the settings
+		// registry keeps English names; the widget shows Chinese).
+		const char* translate_bind_name( const char* name )
+		{
+			if ( !name )
+			{
+				return name;
+			}
+
+			static const std::unordered_map<std::string_view, std::string_view> k_map{
+				{ "enabled", "启用" },
+				{ "anti aim", "反自瞄" },
+				{ "aimbot", "自瞄" },
+				{ "triggerbot", "扳机" },
+				{ "force left", "强制左" },
+				{ "force right", "强制右" },
+				{ "auto accept", "自动接受" },
+				{ "auto buy", "自动购买" },
+				{ "auto revolver", "自动左轮" },
+				{ "auto scope", "自动开镜" },
+				{ "autowall", "自动穿墙" },
+				{ "avoid backstab", "防止背刺" },
+				{ "backtrack", "回溯" },
+				{ "bhop", "连跳" },
+				{ "edgebug", "边缘Bug" },
+				{ "fastladder", "快速爬梯" },
+				{ "force shot in air", "空中强制射击" },
+				{ "force shot on ground", "地面强制射击" },
+				{ "hit chance override", "命中率覆盖" },
+				{ "jumpbug", "跳跃Bug" },
+				{ "min damage override", "最低伤害覆盖" },
+				{ "no spread", "无扩散" },
+				{ "silent", "静默" },
+				{ "standalone rcs", "独立压枪" },
+				{ "trigger head only", "仅头部扳机" },
+				{ "trigger seed mode", "扳机种子模式" },
+				{ "vac bypass", "VAC绕过" },
+				{ "zeusbot", "电击机器人" },
+				{ "air extrapolation", "空中目标外推" },
+				{ "air stop on shift", "Shift空中急停" },
+				{ "airstrafe", "空中加速" },
+				{ "ambient", "环境光" },
+				{ "armor", "护甲" },
+				{ "auto extrapolation", "自动外推" },
+				{ "backtrack display", "回溯显示" },
+				{ "bloom", "泛光" },
+				{ "bomb timer", "炸弹计时器" },
+				{ "bullet impacts", "弹痕" },
+				{ "bullet tracers", "弹道" },
+				{ "chams", "Chams" },
+				{ "chams layer", "Chams图层" },
+				{ "chat logs", "聊天日志" },
+				{ "chromatic aberration", "色差" },
+				{ "clantag", "战队标签" },
+				{ "console logs", "控制台日志" },
+				{ "crosshair overlay", "准星覆盖" },
+				{ "custom aspect ratio", "自定义宽高比" },
+				{ "custom fov", "自定义视野" },
+				{ "custom model (ct)", "自定义模型(CT)" },
+				{ "custom model (t)", "自定义模型(T)" },
+				{ "death effect", "死亡特效" },
+				{ "death sound", "死亡音效" },
+				{ "debug multipoints", "调试多点" },
+				{ "decoy", "诱饵弹" },
+				{ "defuser", "拆弹器" },
+				{ "depth of field", "景深" },
+				{ "direction indicator", "方向指示器" },
+				{ "direction indicator glow", "指示器发光" },
+				{ "disable game logs", "禁用游戏日志" },
+				{ "drop after", "延迟丢弃" },
+				{ "dynamic light", "动态光照" },
+				{ "dynamic point scale", "动态点缩放" },
+				{ "edgebug jump steps", "边缘Bug跳跃步数" },
+				{ "esp overlay", "ESP覆盖" },
+				{ "extra body points", "身体额外多点" },
+				{ "extra head points", "头部额外多点" },
+				{ "extrapolation", "外推" },
+				{ "extrapolation correction", "外推修正" },
+				{ "extrapolation display", "外推显示" },
+				{ "fade in", "淡入" },
+				{ "flashbang", "闪光弹" },
+				{ "fog", "雾" },
+				{ "force b-aim", "强制身体瞄准" },
+				{ "fully directional", "全方向" },
+				{ "gamma", "伽马" },
+				{ "glow", "发光" },
+				{ "hat", "帽子" },
+				{ "he grenade", "高爆手雷" },
+				{ "hide onshot", "隐藏单发" },
+				{ "hit effect", "命中特效" },
+				{ "hit logs", "命中日志" },
+				{ "hit marker", "命中标记" },
+				{ "hit sound", "命中音效" },
+				{ "inferno", "燃烧瓶" },
+				{ "item chams", "物品Chams" },
+				{ "item esp", "物品ESP" },
+				{ "item glow", "物品发光" },
+				{ "knifebot", "刀机器人" },
+				{ "lighting", "光照" },
+				{ "lower opacity", "降低不透明度" },
+				{ "miss logs", "未命中日志" },
+				{ "molotov", "燃烧瓶" },
+				{ "only when scoped", "仅开镜时" },
+				{ "override name", "覆盖名称" },
+				{ "penetration crosshair", "穿透准星" },
+				{ "per stat icon colors", "统计图标颜色" },
+				{ "pistol", "手枪" },
+				{ "preserve killfeed", "保留击杀信息" },
+				{ "projectile esp", "投掷物ESP" },
+				{ "projectile trajectory", "投掷物轨迹" },
+				{ "recoil control", "后坐力控制" },
+				{ "remove 3d skybox", "移除3D天空盒" },
+				{ "remove crosshair", "移除准星" },
+				{ "remove decals", "移除弹痕" },
+				{ "remove legs", "移除腿部" },
+				{ "remove overhead", "移除头顶" },
+				{ "remove recoil", "移除后坐力" },
+				{ "remove scope", "移除瞄准镜" },
+				{ "remove skybox fog", "移除天空盒雾" },
+				{ "remove smoke", "移除烟雾" },
+				{ "reset peak on land", "落地重置窥视" },
+				{ "reveal radar", "显示雷达" },
+				{ "rifle", "步枪" },
+				{ "scope overlay", "瞄准镜覆盖" },
+				{ "scoped fov override", "开镜视野覆盖" },
+				{ "scoped fov", "单次开镜缩放" },
+				{ "scoped fov 2", "二次开镜缩放" },
+				{ "scoreboard weapons", "记分板武器" },
+				{ "seed constraint", "种子约束" },
+				{ "shotgun", "霰弹枪" },
+				{ "show avatar", "显示头像" },
+				{ "show ping", "显示延迟" },
+				{ "show tick", "显示Tick" },
+				{ "show time", "显示时间" },
+				{ "show user", "显示玩家" },
+				{ "show velocity", "显示速度" },
+				{ "skybox color", "天空盒颜色" },
+				{ "skybox material", "天空盒材质" },
+				{ "smg", "冲锋枪" },
+				{ "smoke", "烟雾" },
+				{ "sniper", "狙击枪" },
+				{ "spectator list", "观战列表" },
+				{ "strafe debug", "加速调试" },
+				{ "straight throw", "直线投掷" },
+				{ "taser", "电击枪" },
+				{ "test strafer", "测试加速器" },
+				{ "utility", "投掷物" },
+				{ "velocity chart", "速度图表" },
+				{ "velocity counter", "速度计数" },
+				{ "velocity debug", "速度调试" },
+				{ "viewmodel adjust", "视角模型调整" },
+				{ "visualize fov", "可视化视野" },
+				{ "weather", "天气" },
+				{ "wetness", "湿润" },
+				{ "wind", "风" },
+				{ "correct yaw to compensate for the models inherit sideways roll", "侧倾视角修正" },
+				{ "duck peek", "蹲窥" },
+				{ "edgejump", "边缘跳" },
+				{ "edgestop", "边缘急停" },
+				{ "mini jump", "小跳" },
+				{ "quick peek", "快速窥视" },
+				{ "slowwalk", "慢走" },
+				{ "thirdperson", "第三人称" },
+				{ "world color", "世界颜色" },
+			};
+
+			const auto it = k_map.find( std::string_view{ name } );
+			return it != k_map.end( ) ? it->second.data( ) : name;
+		}
+
+	} // namespace
 
 	void widgets::draw( )
 	{
@@ -72,7 +246,7 @@ namespace rendering {
 
 		if ( local.controller )
 		{
-			const auto net_for_tick = memory::read<std::uintptr_t>( addresses::globals::net_client );
+			const auto net_for_tick = addresses::globals::network_client_service;
 			const auto tick_state   = net_for_tick ? memory::call_vfunc<std::uintptr_t>( net_for_tick, 23 ) : 0;
 			const auto server_tick  = tick_state   ? memory::read<int>( tick_state + 892 ) : 0;
 			const auto gv           = memory::read<std::uintptr_t>( addresses::globals::global_vars );
@@ -315,7 +489,7 @@ namespace rendering {
 				}
 
 				auto& e = entries[ count++ ];
-				e.name = setting->name.c_str( );
+				e.name = translate_bind_name( setting->name.c_str( ) );
 				e.mode = setting->bind.mode;
 
 				if ( setting == &active_group->min_damage_override )
@@ -381,14 +555,14 @@ namespace rendering {
 				}
 
 				auto& e = entries[ count++ ];
-				e.name = setting->name.c_str( );
+				e.name = translate_bind_name( setting->name.c_str( ) );
 				e.mode = setting->bind.mode;
 				e.value[ 0 ] = '\0';
 				e.has_value_pill = false;
 				continue;
 			}
 
-			if ( setting == &settings::g_combat.m_antiaim.enabled || setting == &settings::g_combat.m_antiaim.at_targets || setting == &settings::g_combat.m_antiaim.manual_left || setting == &settings::g_combat.m_antiaim.manual_right || setting == &settings::g_combat.m_antiaim.hide_shots || setting == &settings::g_combat.m_antiaim.avoid_backstab || setting == &settings::g_combat.m_antiaim.direction_indicator )
+			if ( setting == &settings::g_combat.m_antiaim.enabled || setting == &settings::g_combat.m_antiaim.manual_left || setting == &settings::g_combat.m_antiaim.manual_right || setting == &settings::g_combat.m_antiaim.hide_shots || setting == &settings::g_combat.m_antiaim.avoid_backstab || setting == &settings::g_combat.m_antiaim.direction_indicator )
 			{
 				if ( !settings::g_combat.m_antiaim.enabled.value )
 				{
@@ -397,7 +571,7 @@ namespace rendering {
 			}
 
 			auto& e = entries[ count++ ];
-			e.name = setting->name.c_str( );
+			e.name = translate_bind_name( setting->name.c_str( ) );
 			e.mode = setting->bind.mode;
 			e.value[ 0 ] = '\0';
 			e.has_value_pill = false;
@@ -425,7 +599,7 @@ namespace rendering {
 		static auto icon_w_px = 0, icon_h_px = 0;
 		static const auto kb_icon = xdraw::load_svg( R"(<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M2.78571 4.07143C2.53142 4.07143 2.28285 3.99602 2.07141 3.85475C1.85998 3.71347 1.69518 3.51267 1.59787 3.27774C1.50056 3.0428 1.4751 2.78429 1.52471 2.53488C1.57431 2.28548 1.69677 2.05639 1.87658 1.87658C2.05639 1.69677 2.28548 1.57431 2.53488 1.52471C2.78429 1.4751 3.0428 1.50056 3.27774 1.59787C3.51267 1.69518 3.71347 1.85998 3.85475 2.07141C3.99602 2.28285 4.07143 2.53142 4.07143 2.78571V9.21429C4.07143 9.46858 3.99602 9.71716 3.85475 9.92859C3.71347 10.14 3.51267 10.3048 3.27774 10.4021C3.0428 10.4994 2.78429 10.5249 2.53488 10.4753C2.28548 10.4257 2.05639 10.3032 1.87658 10.1234C1.69677 9.94361 1.57431 9.71452 1.52471 9.46512C1.4751 9.21571 1.50056 8.9572 1.59787 8.72226C1.69518 8.48733 1.85998 8.28653 2.07141 8.14525C2.28285 8.00398 2.53142 7.92857 2.78571 7.92857H9.21429C9.46858 7.92857 9.71716 8.00398 9.92859 8.14525C10.14 8.28653 10.3048 8.48733 10.4021 8.72226C10.4994 8.9572 10.5249 9.21571 10.4753 9.46512C10.4257 9.71452 10.3032 9.94361 10.1234 10.1234C9.94361 10.3032 9.71452 10.4257 9.46512 10.4753C9.21571 10.5249 8.9572 10.4994 8.72226 10.4021C8.48733 10.3048 8.28653 10.14 8.14525 9.92859C8.00398 9.71716 7.92857 9.46858 7.92857 9.21429V2.78571C7.92857 2.53142 8.00398 2.28285 8.14525 2.07141C8.28653 1.85998 8.48733 1.69518 8.72226 1.59787C8.9572 1.50056 9.21571 1.4751 9.46512 1.52471C9.71452 1.57431 9.94361 1.69677 10.1234 1.87658C10.3032 2.05639 10.4257 2.28548 10.4753 2.53488C10.5249 2.78429 10.4994 3.0428 10.4021 3.27774C10.3048 3.51267 10.14 3.71347 9.92859 3.85475C9.71716 3.99602 9.46858 4.07143 9.21429 4.07143H2.78571Z" stroke="#FFFFFF" stroke-linecap="round" stroke-linejoin="round"/></svg>)", 1.0f, &icon_w_px, &icon_h_px );
 
-		const auto [header_tw, header_th] = xdraw::measure_text( "keybinds" );
+		const auto [header_tw, header_th] = xdraw::measure_text( "按键绑定" );
 		const auto header_w = inner_pad + icon_size + inner_pad + header_tw + text_pad_x * 2.0f + inner_pad;
 		const auto header_inner_h = header_h - inner_pad * 2.0f;
 		const auto inner_h = row_h - inner_pad * 2.0f;
@@ -446,7 +620,7 @@ namespace rendering {
 		const auto htx = x + inner_pad + icon_size + inner_pad;
 		const auto htw = header_tw + text_pad_x * 2.0f;
 		draw_list.rect_filled( htx, base_ry + inner_pad, htw, header_inner_h, s.child_bg.alpha( static_cast< std::uint8_t >( s.child_bg.a * master_alpha ) ), xdraw::corner_radius{ inner_r } );
-		draw_list.text( htx + text_pad_x, base_ry + ( header_h - header_th ) * 0.5f + text_nudge, "keybinds", s.accent.alpha( static_cast< std::uint8_t >( s.accent.a * master_alpha ) ) );
+		draw_list.text( htx + text_pad_x, base_ry + ( header_h - header_th ) * 0.5f + text_nudge, "按键绑定", s.accent.alpha( static_cast< std::uint8_t >( s.accent.a * master_alpha ) ) );
 
 		for ( auto& [name, state] : row_states )
 			state.active_this_frame = false;

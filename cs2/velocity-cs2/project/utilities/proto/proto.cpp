@@ -75,10 +75,31 @@ namespace proto {
 
 	bool base_usercmd_pb::has_buttons_pb( ) const { return this->m_has_bits.test( 0x2u ); }
 	const in_button_state_pb* base_usercmd_pb::buttons_pb( ) const { return impl_ptr<const in_button_state_pb>( this->m_buttons_pb ); }
-	in_button_state_pb* base_usercmd_pb::mutable_buttons_pb( ) { this->m_has_bits.set( 0x2u ); return impl_ptr<in_button_state_pb>( this->m_buttons_pb ); }
+	in_button_state_pb* base_usercmd_pb::mutable_buttons_pb( )
+	{
+		// Never flag a field whose pointer is null: the engine walks the
+		// has-bits on Clear/serialize and dereferences the slot pointer,
+		// crashing when the bit is set but the pointer is 0.
+		if ( !this->m_buttons_pb )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x2u );
+		return impl_ptr<in_button_state_pb>( this->m_buttons_pb );
+	}
 	bool base_usercmd_pb::has_viewangles( ) const { return this->m_has_bits.test( 0x4u ); }
 	const msg_qangle* base_usercmd_pb::viewangles( ) const { return impl_ptr<const msg_qangle>( this->m_viewangles ); }
-	msg_qangle* base_usercmd_pb::mutable_viewangles( ) { this->m_has_bits.set( 0x4u ); return impl_ptr<msg_qangle>( this->m_viewangles ); }
+	msg_qangle* base_usercmd_pb::mutable_viewangles( )
+	{
+		if ( !this->m_viewangles )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x4u );
+		return impl_ptr<msg_qangle>( this->m_viewangles );
+	}
 	const repeated_ptr_field<subtick_move_step>& base_usercmd_pb::subtick_moves( ) const { return this->m_subtick_moves; }
 	repeated_ptr_field<subtick_move_step>* base_usercmd_pb::mutable_subtick_moves( ) { return &this->m_subtick_moves; }
 	int base_usercmd_pb::subtick_moves_size( ) const { return this->m_subtick_moves.size( ); }
@@ -123,31 +144,115 @@ namespace proto {
 
 	bool input_history_entry::has_view_angles( ) const { return this->m_has_bits.test( 0x1u ); }
 	const msg_qangle* input_history_entry::view_angles( ) const { return impl_ptr<const msg_qangle>( this->m_view_angles ); }
-	msg_qangle* input_history_entry::mutable_view_angles( ) { this->m_has_bits.set( 0x1u ); return impl_ptr<msg_qangle>( this->m_view_angles ); }
+	msg_qangle* input_history_entry::mutable_view_angles( )
+	{
+		// Same rule as base_usercmd_pb::mutable_*: a set has-bit with a
+		// null slot pointer makes the engine's CSGOInputHistoryEntryPB
+		// Clear()/serialize walk fault (it writes the slot unconditionally).
+		if ( !this->m_view_angles )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x1u );
+		return impl_ptr<msg_qangle>( this->m_view_angles );
+	}
 	bool input_history_entry::has_cl_interp( ) const { return this->m_has_bits.test( 0x2u ); }
 	const interpolation_info_cl* input_history_entry::cl_interp( ) const { return impl_ptr<const interpolation_info_cl>( this->m_cl_interp ); }
-	interpolation_info_cl* input_history_entry::mutable_cl_interp( ) { this->m_has_bits.set( 0x2u ); return impl_ptr<interpolation_info_cl>( this->m_cl_interp ); }
+	interpolation_info_cl* input_history_entry::mutable_cl_interp( )
+	{
+		if ( !this->m_cl_interp )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x2u );
+		return impl_ptr<interpolation_info_cl>( this->m_cl_interp );
+	}
 	bool input_history_entry::has_sv_interp0( ) const { return this->m_has_bits.test( 0x4u ); }
 	const interpolation_info* input_history_entry::sv_interp0( ) const { return impl_ptr<const interpolation_info>( this->m_sv_interp0 ); }
-	interpolation_info* input_history_entry::mutable_sv_interp0( ) { this->m_has_bits.set( 0x4u ); return impl_ptr<interpolation_info>( this->m_sv_interp0 ); }
+	interpolation_info* input_history_entry::mutable_sv_interp0( )
+	{
+		if ( !this->m_sv_interp0 )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x4u );
+		return impl_ptr<interpolation_info>( this->m_sv_interp0 );
+	}
 	bool input_history_entry::has_sv_interp1( ) const { return this->m_has_bits.test( 0x8u ); }
 	const interpolation_info* input_history_entry::sv_interp1( ) const { return impl_ptr<const interpolation_info>( this->m_sv_interp1 ); }
-	interpolation_info* input_history_entry::mutable_sv_interp1( ) { this->m_has_bits.set( 0x8u ); return impl_ptr<interpolation_info>( this->m_sv_interp1 ); }
+	interpolation_info* input_history_entry::mutable_sv_interp1( )
+	{
+		if ( !this->m_sv_interp1 )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x8u );
+		return impl_ptr<interpolation_info>( this->m_sv_interp1 );
+	}
 	bool input_history_entry::has_player_interp( ) const { return this->m_has_bits.test( 0x10u ); }
 	const interpolation_info* input_history_entry::player_interp( ) const { return impl_ptr<const interpolation_info>( this->m_player_interp ); }
-	interpolation_info* input_history_entry::mutable_player_interp( ) { this->m_has_bits.set( 0x10u ); return impl_ptr<interpolation_info>( this->m_player_interp ); }
+	interpolation_info* input_history_entry::mutable_player_interp( )
+	{
+		if ( !this->m_player_interp )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x10u );
+		return impl_ptr<interpolation_info>( this->m_player_interp );
+	}
 	bool input_history_entry::has_shoot_position( ) const { return this->m_has_bits.test( 0x20u ); }
 	const msg_vector* input_history_entry::shoot_position( ) const { return impl_ptr<const msg_vector>( this->m_shoot_position ); }
-	msg_vector* input_history_entry::mutable_shoot_position( ) { this->m_has_bits.set( 0x20u ); return impl_ptr<msg_vector>( this->m_shoot_position ); }
+	msg_vector* input_history_entry::mutable_shoot_position( )
+	{
+		if ( !this->m_shoot_position )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x20u );
+		return impl_ptr<msg_vector>( this->m_shoot_position );
+	}
 	bool input_history_entry::has_target_head_pos_check( ) const { return this->m_has_bits.test( 0x40u ); }
 	const msg_vector* input_history_entry::target_head_pos_check( ) const { return impl_ptr<const msg_vector>( this->m_target_head_pos_check ); }
-	msg_vector* input_history_entry::mutable_target_head_pos_check( ) { this->m_has_bits.set( 0x40u ); return impl_ptr<msg_vector>( this->m_target_head_pos_check ); }
+	msg_vector* input_history_entry::mutable_target_head_pos_check( )
+	{
+		if ( !this->m_target_head_pos_check )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x40u );
+		return impl_ptr<msg_vector>( this->m_target_head_pos_check );
+	}
 	bool input_history_entry::has_target_abs_pos_check( ) const { return this->m_has_bits.test( 0x80u ); }
 	const msg_vector* input_history_entry::target_abs_pos_check( ) const { return impl_ptr<const msg_vector>( this->m_target_abs_pos_check ); }
-	msg_vector* input_history_entry::mutable_target_abs_pos_check( ) { this->m_has_bits.set( 0x80u ); return impl_ptr<msg_vector>( this->m_target_abs_pos_check ); }
+	msg_vector* input_history_entry::mutable_target_abs_pos_check( )
+	{
+		if ( !this->m_target_abs_pos_check )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x80u );
+		return impl_ptr<msg_vector>( this->m_target_abs_pos_check );
+	}
 	bool input_history_entry::has_target_abs_ang_check( ) const { return this->m_has_bits.test( 0x100u ); }
 	const msg_qangle* input_history_entry::target_abs_ang_check( ) const { return impl_ptr<const msg_qangle>( this->m_target_abs_ang_check ); }
-	msg_qangle* input_history_entry::mutable_target_abs_ang_check( ) { this->m_has_bits.set( 0x100u ); return impl_ptr<msg_qangle>( this->m_target_abs_ang_check ); }
+	msg_qangle* input_history_entry::mutable_target_abs_ang_check( )
+	{
+		if ( !this->m_target_abs_ang_check )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x100u );
+		return impl_ptr<msg_qangle>( this->m_target_abs_ang_check );
+	}
 
 	bool input_history_entry::has_render_tick_count( ) const { return this->m_has_bits.test( 0x200u ); }
 	std::int32_t input_history_entry::render_tick_count( ) const { return this->m_render_tick_count; }
@@ -173,10 +278,27 @@ namespace proto {
 	std::int32_t input_history_entry::target_ent_index( ) const { return this->m_target_ent_index; }
 	void input_history_entry::set_target_ent_index( std::int32_t v ) { this->m_has_bits.set( 0x4000u ); this->m_target_ent_index = v; }
 
+	bool input_history_entry::has_attack_flags( ) const { return this->m_has_bits.test( 0x8000u ); }
+	std::int32_t input_history_entry::attack_flags( ) const { return this->m_attack_flags; }
+	void input_history_entry::set_attack_flags( std::int32_t v ) { this->m_has_bits.set( 0x8000u ); this->m_attack_flags = v; }
+
+	bool input_history_entry::has_attack_unk( ) const { return this->m_has_bits.test( 0x10000u ); }
+	std::int32_t input_history_entry::attack_unk( ) const { return this->m_attack_unk; }
+	void input_history_entry::set_attack_unk( std::int32_t v ) { this->m_has_bits.set( 0x10000u ); this->m_attack_unk = v; }
+
 	// csgo_usercmd_pb
 
 	bool csgo_usercmd_pb::has_base( ) const { return this->m_has_bits.test( 0x1u ); }
-	base_usercmd_pb* csgo_usercmd_pb::mutable_base( ) { this->m_has_bits.set( 0x1u ); return impl_ptr<base_usercmd_pb>( this->m_base ); }
+	base_usercmd_pb* csgo_usercmd_pb::mutable_base( )
+	{
+		if ( !this->m_base )
+		{
+			return nullptr;
+		}
+
+		this->m_has_bits.set( 0x1u );
+		return impl_ptr<base_usercmd_pb>( this->m_base );
+	}
 	const base_usercmd_pb* csgo_usercmd_pb::base( ) const { return impl_ptr<const base_usercmd_pb>( this->m_base ); }
 
 	int csgo_usercmd_pb::input_history_size( ) const { return this->m_input_history.size( ); }

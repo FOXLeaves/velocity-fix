@@ -299,35 +299,17 @@ namespace features::misc {
 				}
 			};
 
-		if ( cfg.type == settings::misc::hud::hat::hat_type::kasa )
+		// Angel halo: a single glowing ring floating above the head.
+		if ( cfg.type == settings::misc::hud::hat::hat_type::halo )
 		{
-			constexpr auto base_radius{ 10.0f };
-			constexpr auto rim_points{ 24 };
-			constexpr auto spokes{ 24 };
+			constexpr auto halo_radius{ 5.0f };
+			constexpr auto halo_segments{ 40 };
+			const auto halo_origin = hat_origin + up_world * 6.0f;
 
-			const auto peak_world = hat_origin + up_world * 7.0f;
-			const auto peak_sp = systems::g_view.project( peak_world );
-
-			if ( !systems::g_view.projection_valid( peak_sp ) )
+			math::vector2 pts[ halo_segments ];
+			if ( !project_ring( halo_origin, halo_radius, pts, halo_segments ) )
 			{
 				return;
-			}
-
-			const math::vector2 peak{ peak_sp.x, peak_sp.y };
-			math::vector2 base[ rim_points ];
-
-			for ( auto i = 0; i < rim_points; ++i )
-			{
-				const auto angle = ( static_cast< float >( i ) / static_cast< float >( rim_points ) ) * 2.0f * std::numbers::pi_v< float >;
-				const auto world_pt = hat_origin + right_world * ( std::cosf( angle ) * base_radius ) + forward_world * ( std::sinf( angle ) * base_radius );
-
-				const auto sp = systems::g_view.project( world_pt );
-				if ( !systems::g_view.projection_valid( sp ) )
-				{
-					return;
-				}
-
-				base[ i ] = { sp.x, sp.y };
 			}
 
 			if ( cfg.glow )
@@ -336,33 +318,14 @@ namespace features::misc {
 				const auto ga = static_cast< std::uint8_t >( static_cast< float >( primary_col.a ) * cfg.glow_strength );
 				const auto glow_col = xdraw::color{ primary_col.r, primary_col.g, primary_col.b, ga };
 
-				for ( auto i = 0; i < rim_points; ++i )
+				for ( auto i = 0; i < halo_segments; ++i )
 				{
-					const auto next = ( i + 1 ) % rim_points;
-					glow.line( base[ i ].x, base[ i ].y, base[ next ].x, base[ next ].y, glow_col, 3.0f );
-				}
-
-				const auto spoke_ga = static_cast< std::uint8_t >( static_cast< float >( secondary_col.a ) * cfg.glow_strength );
-				const auto spoke_glow_col = xdraw::color{ secondary_col.r, secondary_col.g, secondary_col.b, spoke_ga };
-
-				for ( auto i = 0; i < spokes; ++i )
-				{
-					const auto idx = ( i * rim_points ) / spokes;
-					glow.line( base[ idx ].x, base[ idx ].y, peak.x, peak.y, spoke_glow_col, 2.0f );
+					const auto next = ( i + 1 ) % halo_segments;
+					glow.line( pts[ i ].x, pts[ i ].y, pts[ next ].x, pts[ next ].y, glow_col, 8.0f );
 				}
 			}
 
-			for ( auto i = 0; i < rim_points; ++i )
-			{
-				const auto next = ( i + 1 ) % rim_points;
-				draw_list.line( base[ i ].x, base[ i ].y, base[ next ].x, base[ next ].y, primary_col, 1.2f );
-			}
-
-			for ( auto i = 0; i < spokes; ++i )
-			{
-				const auto idx = ( i * rim_points ) / spokes;
-				draw_list.line( base[ idx ].x, base[ idx ].y, peak.x, peak.y, secondary_col, 0.75f );
-			}
+			draw_ring( pts, halo_segments, primary_col, 3.8f );
 
 			return;
 		}
@@ -607,7 +570,7 @@ namespace features::misc {
 		std::snprintf( speed_buf, sizeof( speed_buf ), "%.0f", this->m_velocity_smoothed );
 
 		const auto [ speed_vw, speed_vh ] = xdraw::measure_text( speed_buf );
-		const auto [ speed_uw, speed_uh ] = xdraw::measure_text( " u/s" );
+		const auto [ speed_uw, speed_uh ] = xdraw::measure_text( " 单位/秒" );
 		const auto counter_pill_w = speed_vw + speed_uw + text_pad_x * 2.0f;
 		const auto counter_pill_h = speed_vh + inner_pad * 2.0f;
 
@@ -632,7 +595,7 @@ namespace features::misc {
 			const auto pill_y = content_y + inner_pad;
 			draw_list.rect_filled( pill_x, pill_y, counter_pill_w, counter_pill_h, s.child_bg, xdraw::corner_radius{ inner_r } );
 			draw_list.text( pill_x + text_pad_x, pill_y + ( counter_pill_h - speed_vh ) * 0.5f + text_nudge, speed_buf, accent );
-			draw_list.text( pill_x + text_pad_x + speed_vw, pill_y + ( counter_pill_h - speed_uh ) * 0.5f + text_nudge, " u/s", accent_dim );
+			draw_list.text( pill_x + text_pad_x + speed_vw, pill_y + ( counter_pill_h - speed_uh ) * 0.5f + text_nudge, " 单位/秒", accent_dim );
 			content_y += counter_block_h + stack_gap;
 		}
 

@@ -6,6 +6,7 @@
 #include <core/settings.hpp>
 #include <core/features/features.hpp>
 #include <protection/game_addresses.hpp>
+#include "../primitive_buffer.hpp"
 
 namespace features::esp::player {
 
@@ -63,7 +64,12 @@ namespace features::esp::player {
 				return false;
 			}
 
-			if ( !settings::g_misc.m_camera.thirdperson.value || !is_local_attachment( systems::g_local.get( ).view_pawn( ) ) )
+			// Dead/spectating: the observer's weapon attachment can alias the
+			// "local" viewmodel while in third-person observer mode; driving
+			// the engine generate-primitives path for it corrupts the engine
+			// primitive vector. Only touch viewmodel weapons while alive.
+			const auto& local = systems::g_local.get( );
+			if ( !local.is_alive || !settings::g_misc.m_camera.thirdperson.value || !is_local_attachment( local.view_pawn( ) ) )
 			{
 				return false;
 			}
@@ -76,6 +82,15 @@ namespace features::esp::player {
 		{
 			const auto& cfg = is_arms ? settings::g_esp.m_viewmodel.arms : settings::g_esp.m_viewmodel.weapon;
 			if ( !cfg.enabled.value )
+			{
+				return false;
+			}
+
+			// Dead/spectating: there is no local viewmodel; the engine may
+			// still invoke generate-primitives for these scene objects while
+			// third-person observing and the original path can corrupt the
+			// primitive vector.
+			if ( !systems::g_local.get( ).is_alive )
 			{
 				return false;
 			}
@@ -101,19 +116,18 @@ namespace features::esp::player {
 				const auto bt_scene_object = this->m_backtrack.get_scene_object( owner_entity );
 				if ( bt_scene_object )
 				{
-					const auto prev_count = memory::read<int>( primitive_buffer + 0xc );
+					const auto before = detail::read_primitive_buffer( primitive_buffer );
+					const auto prev_count = before ? before->count() : -1;
 
 					apply_config( chams_cfg.backtrack, bt_scene_object, true );
 
-					const auto new_count = memory::read<int>( primitive_buffer + 0xc );
-					const auto primitives_ptr = memory::read<std::uintptr_t>( primitive_buffer );
-
-					if ( primitives_ptr && new_count > prev_count )
+					const auto after = detail::read_primitive_buffer( primitive_buffer );
+					const auto new_count = after ? after->count() : -1;
+					if ( after && prev_count >= 0 && new_count > prev_count )
 					{
 						for ( auto i = prev_count; i < new_count; ++i )
 						{
-							const auto primitive = primitives_ptr + ( static_cast< std::size_t >( i ) * 0x68 );
-							memory::write<int>( primitive + 0x5c, -1 );
+							detail::mark_primitive_last( after->at( i ) );
 						}
 					}
 				}
@@ -142,16 +156,16 @@ namespace features::esp::player {
 					if (faded_cfg.overlay.enabled.value)
 						faded_cfg.overlay.color.value = fade (faded_cfg.overlay.color.value);
 
-					const auto prev_count = memory::read<int> (primitive_buffer + 0xc);
+					const auto before = detail::read_primitive_buffer( primitive_buffer );
+					const auto prev_count = before ? before->count() : -1;
 
 					apply_config (faded_cfg, os_obj, true);
 
-					const auto new_count = memory::read<int> (primitive_buffer + 0xc);
-					const auto prims_ptr = memory::read<std::uintptr_t> (primitive_buffer);
-
-					if (prims_ptr && new_count > prev_count) {
+					const auto after = detail::read_primitive_buffer( primitive_buffer );
+					const auto new_count = after ? after->count() : -1;
+					if ( after && prev_count >= 0 && new_count > prev_count ) {
 						for (auto i = prev_count; i < new_count; ++i)
-							memory::write<int> (prims_ptr + (static_cast<std::size_t> (i) * 0x68) + 0x5c, -1);
+							detail::mark_primitive_last( after->at( i ) );
 					}
 				}
 			}
@@ -201,9 +215,12 @@ namespace features::esp::player {
 		}
 
 		{
-			auto flags = memory::read<std::uint32_t>( scene_object + 0x78 );
-			flags &= ~( 1 << 3 );
-			memory::write( scene_object + 0x78, flags );
+			const auto flags = memory::safe_read<std::uint8_t>( scene_object + 0x78 );
+			if ( flags ) {
+				(void) memory::safe_write<std::uint8_t>(
+					scene_object + 0x78,
+					static_cast<std::uint8_t>( *flags & ~( 1u << 3 ) ) );
+			}
 		}
 
 		if ( is_local )
@@ -231,7 +248,7 @@ namespace features::esp::player {
 
 	void chams::on_sort_primitives( std::uintptr_t entries, std::uint32_t count )
 	{
-		if ( !count || !entries )
+		if ( !count || !entries || count > ( 1u << 20 ) )
 		{
 			return;
 		}
@@ -248,58 +265,77 @@ namespace features::esp::player {
 			return;
 		}
 
-		auto overlay_count{ 0 };
+		// Lightweight pre-scan that reads only the material pointer (8 of
+		// the 0x70 primitive bytes): if the overlay primitives already sit
+		// at the tail the list needs no work. On custom-model servers the
+		// per-frame primitive count can be huge, and the old code copied,
+		// partitioned and wrote back every single primitive every frame -
+		// the source of the periodic hard frame drops. The reorder path
+		// below now only runs when the list is actually out of order.
+		auto first_overlay{ total };
+		auto last_regular{ -1 };
 
 		for ( auto i = 0; i < total; ++i )
 		{
-			const auto mat = *reinterpret_cast< std::uintptr_t* >( entries + static_cast< std::size_t >( i ) * 0x68 + 0x20 );
-			if ( this->is_overlay_material( mat ) )
+			const auto material = memory::safe_read<std::uintptr_t>(
+				entries + static_cast<std::size_t>( i ) * detail::primitive_size + detail::primitive_material_offset ).value_or( 0 );
+			if ( !material )
 			{
-				++overlay_count;
+				return;
+			}
+
+			if ( this->is_overlay_material( material ) )
+			{
+				if ( first_overlay == total )
+				{
+					first_overlay = i;
+				}
+			}
+			else
+			{
+				last_regular = i;
 			}
 		}
+
+		if ( last_regular < first_overlay )
+		{
+			return;
+		}
+
+		std::vector<detail::mesh_primitive> sorted;
+		sorted.reserve( total );
+
+		for ( auto i = 0; i < total; ++i )
+		{
+			const auto primitive = memory::safe_read<detail::mesh_primitive>(
+				entries + static_cast<std::size_t>( i ) * detail::primitive_size );
+			if ( !primitive ) {
+				return;
+			}
+
+			sorted.push_back( *primitive );
+		}
+
+		const auto overlay_begin = std::stable_partition(
+			sorted.begin(), sorted.end(), [ this ]( const auto& primitive ) {
+				return !this->is_overlay_material( primitive.material );
+			} );
+		const auto overlay_count = static_cast<int>(
+			std::distance( overlay_begin, sorted.end() ) );
 
 		if ( overlay_count <= 0 || overlay_count >= total )
 		{
 			return;
 		}
 
-		const auto total_bytes = static_cast< std::size_t >( total ) * 0x68;
-
-		static std::vector<std::uint8_t> shared_buffer;
-		static std::mutex buffer_mutex;
-
-		std::lock_guard<std::mutex> lock( buffer_mutex );
-		if ( shared_buffer.size( ) < total_bytes )
-		{
-			shared_buffer.resize( total_bytes );
-		}
-		
-		auto& tls_buffer = shared_buffer;
-
-		auto write{ 0ull };
-
 		for ( auto i = 0; i < total; ++i )
 		{
-			const auto entry = entries + static_cast< std::size_t >( i ) * 0x68;
-			if ( !this->is_overlay_material( *reinterpret_cast< std::uintptr_t* >( entry + 0x20 ) ) )
-			{
-				std::memcpy( tls_buffer.data( ) + write, reinterpret_cast< const void* >( entry ), 0x68 );
-				write += 0x68;
+			if ( !memory::safe_write<detail::mesh_primitive>(
+					entries + static_cast<std::size_t>( i ) * detail::primitive_size,
+					sorted[ i ] ) ) {
+				return;
 			}
 		}
-
-		for ( auto i = 0; i < total; ++i )
-		{
-			const auto entry = entries + static_cast< std::size_t >( i ) * 0x68;
-			if ( this->is_overlay_material( *reinterpret_cast< std::uintptr_t* >( entry + 0x20 ) ) )
-			{
-				std::memcpy( tls_buffer.data( ) + write, reinterpret_cast< const void* >( entry ), 0x68 );
-				write += 0x68;
-			}
-		}
-
-		std::memcpy( reinterpret_cast< void* >( entries ), tls_buffer.data( ), total_bytes );
 	}
 
 	void chams::backtrack::update( )
@@ -329,7 +365,7 @@ namespace features::esp::player {
 				continue;
 			}
 
-			const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+			const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 			const auto pawn = systems::g_entities.lookup( pawn_handle );
 
 			if ( pawn && pawn != local.pawn )
@@ -372,7 +408,7 @@ namespace features::esp::player {
 				continue;
 			}
 
-			const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) );
+			const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
 			const auto pawn = systems::g_entities.lookup( pawn_handle );
 
 			if ( !pawn || pawn == local.pawn )
@@ -511,13 +547,25 @@ namespace features::esp::player {
 
 		auto temp{ 0 };
 
-		const auto world_group_id = memory::call<int*>(PATTERN (patterns::get_world_group_id), game_scene_node, &temp );
+		const auto get_world_group_id = PATTERN( patterns::get_world_group_id );
+		if ( !get_world_group_id )
+		{
+			return;
+		}
+
+		const auto world_group_id = memory::call<int*>(get_world_group_id, game_scene_node, &temp );
 		if ( !world_group_id )
 		{
 			return;
 		}
 
-		const auto world_group_handle = memory::call<std::uintptr_t>(PATTERN (patterns::get_world_group_handle), addresses::globals::render_game_system, *world_group_id );
+		const auto render_game_system = memory::read<std::uintptr_t>( addresses::globals::render_game_system_storage );
+		if ( !render_game_system )
+		{
+			return;
+		}
+
+		const auto world_group_handle = memory::call<std::uintptr_t>(PATTERN (patterns::get_world_group_handle), render_game_system, *world_group_id );
 		if ( !world_group_handle )
 		{
 			return;
@@ -625,25 +673,10 @@ namespace features::esp::player {
 			return;
 
 		auto* record = records.front (); /* just the newest for now, kiro make this customizable or smth */
-
-		const auto global_vars = memory::read<std::uintptr_t> (addresses::globals::global_vars);
-		const auto current_time = memory::read<float> (global_vars + 0x30);
-
-		auto& e = this->m_entries [pawn];
-
-		if (e.scene_object)
-			e.destroy ();
-
-		e.create (pawn);
-		if (!e.scene_object) {
-			this->m_entries.erase (pawn);
-			return;
-		}
-
-		e.pawn = pawn;
-		e.spawn_time = current_time;
-		e.active = true;
-		e.setup_bones (record->bones, record->bone_count);
+		const auto bone_count = std::clamp (record->bone_count, 0, 27);
+		auto& pending = this->m_pending [pawn];
+		pending.bone_count = bone_count;
+		std::copy_n (record->bones, bone_count, pending.bones.begin ());
 	}
 
 	void chams::onshot::update () {
@@ -653,11 +686,33 @@ namespace features::esp::player {
 			for (auto& [pawn, e] : this->m_entries)
 				e.destroy ();
 			this->m_entries.clear ();
+			this->m_pending.clear ();
 			return;
 		}
 
 		const auto global_vars = memory::read<std::uintptr_t> (addresses::globals::global_vars);
 		const auto current_time = memory::read<float> (global_vars + 0x30);
+
+		// Creating mesh scene objects from CreateMove can race the scene graph and
+		// fault inside client.dll. Materialize queued shots at frame stage instead.
+		for (auto& [pawn, pending] : this->m_pending) {
+			auto& e = this->m_entries [pawn];
+			if (e.scene_object)
+				e.destroy ();
+
+			e.create (pawn);
+			if (!e.scene_object) {
+				this->m_entries.erase (pawn);
+				continue;
+			}
+
+			e.pawn = pawn;
+			e.spawn_time = current_time;
+			e.active = true;
+			e.setup_bones (pending.bones.data (), pending.bone_count);
+		}
+		this->m_pending.clear ();
+
 		const auto fade_time = cfg.onshot_fade_time.value;
 
 		for (auto it = this->m_entries.begin (); it != this->m_entries.end (); ) {
@@ -674,6 +729,7 @@ namespace features::esp::player {
 		for (auto& [pawn, e] : this->m_entries)
 			e.destroy ();
 		this->m_entries.clear ();
+		this->m_pending.clear ();
 	}
 
 	bool chams::onshot::has_active (std::uintptr_t pawn) const {
@@ -713,18 +769,14 @@ namespace features::esp::player {
 
 	void chams::apply_layer( std::uintptr_t primitive_buffer, void( __fastcall* original_fn )( std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t ), std::uintptr_t a1, std::uintptr_t scene_object, std::uintptr_t scene_view, const xdraw::color& color, settings::esp::cham_ids material_id )
 	{
-		const auto prev_count = memory::read<int>( primitive_buffer + 0xc );
+		const auto before = detail::read_primitive_buffer( primitive_buffer );
+		const auto prev_count = before ? before->count() : -1;
 
 		original_fn( a1, scene_object, scene_view, primitive_buffer );
 
-		const auto new_count = memory::read<int>( primitive_buffer + 0xc );
-		if ( prev_count >= new_count )
-		{
-			return;
-		}
-
-		const auto primitives_ptr = memory::read<std::uintptr_t>( primitive_buffer );
-		if ( !primitives_ptr )
+		const auto after = detail::read_primitive_buffer( primitive_buffer );
+		const auto new_count = after ? after->count() : -1;
+		if ( !after || prev_count < 0 || prev_count >= new_count )
 		{
 			return;
 		}
@@ -737,9 +789,7 @@ namespace features::esp::player {
 
 		for ( auto i = prev_count; i < new_count; ++i )
 		{
-			const auto primitive = primitives_ptr + ( static_cast< std::size_t >( i ) * 0x68 );
-			memory::write( primitive + 0x20, material );
-			memory::write( primitive + 0x50, color );
+			detail::replace_primitive( after->at( i ), material, color );
 		}
 	}
 
@@ -751,27 +801,21 @@ namespace features::esp::player {
 			return;
 		}
 
-		const auto prev_count = memory::read<int>( primitive_buffer + 0xc );
+		const auto before = detail::read_primitive_buffer( primitive_buffer );
+		const auto prev_count = before ? before->count() : -1;
 
 		original_fn( a1, scene_object, scene_view, primitive_buffer );
 
-		const auto new_count = memory::read<int>( primitive_buffer + 0xc );
-		if ( prev_count >= new_count )
-		{
-			return;
-		}
-
-		const auto primitives_ptr = memory::read<std::uintptr_t>( primitive_buffer );
-		if ( !primitives_ptr )
+		const auto after = detail::read_primitive_buffer( primitive_buffer );
+		const auto new_count = after ? after->count() : -1;
+		if ( !after || prev_count < 0 || prev_count >= new_count )
 		{
 			return;
 		}
 
 		for ( auto i = prev_count; i < new_count; ++i )
 		{
-			const auto primitive = primitives_ptr + ( static_cast< std::size_t >( i ) * 0x68 );
-			memory::write( primitive + 0x20, material );
-			memory::write( primitive + 0x50, color );
+			detail::replace_primitive( after->at( i ), material, color );
 		}
 
 		this->add_overlay_material( material );
@@ -779,39 +823,39 @@ namespace features::esp::player {
 
 	void chams::apply_clone( std::uintptr_t primitive_buffer, void( __fastcall* original_fn )( std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t ), std::uintptr_t a1, std::uintptr_t scene_object, std::uintptr_t scene_view, systems::materials::clone_type type )
 	{
-		const auto prev_count = memory::read<int>( primitive_buffer + 0xc );
+		const auto before = detail::read_primitive_buffer( primitive_buffer );
+		const auto prev_count = before ? before->count() : -1;
 
 		original_fn( a1, scene_object, scene_view, primitive_buffer );
 
-		const auto new_count = memory::read<int>( primitive_buffer + 0xc );
-		if ( prev_count >= new_count )
-		{
-			return;
-		}
-
-		const auto primitives_ptr = memory::read<std::uintptr_t>( primitive_buffer );
-		if ( !primitives_ptr )
+		const auto after = detail::read_primitive_buffer( primitive_buffer );
+		const auto new_count = after ? after->count() : -1;
+		if ( !after || prev_count < 0 || prev_count >= new_count )
 		{
 			return;
 		}
 
 		for ( auto i = prev_count; i < new_count; ++i )
 		{
-			const auto primitive = primitives_ptr + ( static_cast< std::size_t >( i ) * 0x68 );
-			const auto orig_mat = memory::read<std::uintptr_t>( primitive + 0x20 );
+			const auto primitive = after->at( i );
+			const auto orig_mat = memory::safe_read<std::uintptr_t>(
+				primitive + detail::primitive_material_offset );
 
-			if ( !orig_mat )
+			if ( !orig_mat || !*orig_mat )
 			{
 				continue;
 			}
 
-			const auto clone = systems::materials::get_or_create_clone( orig_mat, type );
+			const auto clone = systems::materials::get_or_create_clone( *orig_mat, type );
 			if ( !clone )
 			{
 				continue;
 			}
 
-			memory::write( primitive + 0x20, clone );
+			(void) memory::safe_write<std::uintptr_t>(
+				primitive + detail::primitive_material_offset, clone );
+			(void) memory::safe_write<std::uintptr_t>(
+				primitive + detail::primitive_material_copy_offset, clone );
 		}
 	}
 
