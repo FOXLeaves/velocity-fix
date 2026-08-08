@@ -112,7 +112,9 @@ namespace features::movement {
 			return;
 		}
 
-		const auto view_yaw = base->viewangles( )->y( );
+		// Edgestop writes movement intent in the original command frame;
+		// the final movement transaction applies the anti-aim/aim yaw once.
+		const auto view_yaw = features::movement::g_movement_fix.source_yaw( );
 		const auto view_yaw_rad = view_yaw * ( std::numbers::pi_v<float> / 180.0f );
 		const auto max_weapon_speed = combat::g_shared.ctx( ).valid ? combat::g_shared.ctx( ).weapon_max_speed : 250.0f;
 

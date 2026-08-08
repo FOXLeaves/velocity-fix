@@ -166,6 +166,7 @@
     <ClCompile Include="project\core\features\misc\impl\removals.cpp" />
     <ClCompile Include="project\core\features\misc\impl\scoreboard_weapons.cpp" />
     <ClCompile Include="project\core\features\movement\impl\airstrafe.cpp" />
+    <ClCompile Include="project\core\features\movement\impl\movement_fix.cpp" />
 
     <ClCompile Include="project\core\features\movement\impl\bunnyhop.cpp" />
     <ClCompile Include="project\core\features\movement\impl\edgebug.cpp" />

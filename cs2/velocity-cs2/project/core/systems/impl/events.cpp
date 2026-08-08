@@ -14,12 +14,21 @@ namespace systems {
 			return false;
 		}
 
+		if ( !register_listener( xs( "weapon_fire" ), [ ]( void* event ) { features::misc::g_impacts.on_weapon_fire( reinterpret_cast< std::uintptr_t >( event ) ); } ) )
+		{
+			return false;
+		}
+
 		if ( !register_listener( xs( "player_hurt" ), [ ]( void* event ) { features::misc::g_impacts.on_player_hurt( reinterpret_cast< std::uintptr_t >( event ) ); } ) )
 		{
 			return false;
 		}
 
-		if ( !register_listener( xs( "round_start" ), [ ]( void* event ) { features::misc::g_other.on_round_start( ); } ) )
+		if ( !register_listener( xs( "round_start" ), [ ]( void* event )
+			{
+				features::misc::g_impacts.on_round_start( );
+				features::misc::g_other.on_round_start( );
+			} ) )
 		{
 			return false;
 		}

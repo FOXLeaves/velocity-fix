@@ -263,6 +263,9 @@ namespace systems {
 			math::vector3 origin{};
 			math::vector3 networked_origin{};
 			math::vector3 last_movement_impulses{};
+			math::vector3 last_movement_forward{};
+			math::vector3 last_movement_left{};
+			std::uint32_t last_command_number_processed{};
 			float surface_friction{};
 			float stamina{};
 		};

@@ -243,18 +243,52 @@ namespace settings {
 			{
 				none,
 				down,
-				up
+				up,
+				custom
 			};
 
 			enum class yaw_mode : std::uint8_t
 			{
 				back,
-				real_view
+				real_view,
+				custom
+			};
+
+			enum class jitter_mode : std::uint8_t
+			{
+				none,
+				center,
+				edge,
+				full,
+				three_way,
+				spin
 			};
 
 			xui::setting enabled{ true, {}, "anti aim", "anti aim" };
 			config::enm<pitch_mode> pitch{ pitch_mode::down, "anti aim", "pitch" };
 			config::enm<yaw_mode> yaw{ yaw_mode::back, "anti aim", "yaw" };
+			// Body jitter: alternates the yaw every tick to break a
+			// constant body pose. Center sways around the base heading,
+			// edge sways around the side-step edges, full sweeps the
+			// whole body range and three_way cycles left -> center ->
+			// right.
+			xui::setting jitter{ false, {}, "jitter", "anti aim" };
+			config::enm<jitter_mode> jitter_mode{ jitter_mode::center, "anti aim", "jitter mode" };
+			// Jitter swing in degrees. Negative flips the alternating
+			// phase; 0 disables the swing (three-way still cycles).
+			config::val<float> jitter_amount{ 0.0f, "anti aim", "jitter amount" };
+			// Custom pitch angle (custom mode): -89..89 deg. Up/down keep
+			// the fixed ±89 values, custom lets testers dial in any head
+			// angle in between.
+			config::val<float> pitch_value{ 89.0f, "anti aim", "pitch value" };
+			// Custom body offset (custom mode): 0..360 deg away from the
+			// real view. Back mode stays at 180; custom exposes every
+			// intermediate body angle for testing.
+			config::val<float> yaw_offset{ 180.0f, "anti aim", "yaw offset" };
+			// Manual side-step angle (forced left/right): 1..180 deg.
+			config::val<float> side_offset{ 90.0f, "anti aim", "side step angle" };
+			// Magnitude of the auto yaw adjust (roll-compensation bias).
+			config::val<float> auto_yaw_adjust_amount{ 33.0f, "anti aim", "yaw adjust amount" };
 			xui::setting auto_yaw_adjust{true, {}, "correct yaw to compensate for the models inherit sideways roll", "anti aim"};
 			xui::setting manual_left{ false, { 'Z', xui::bind_mode::toggle }, "force left", "anti aim" };
 			xui::setting manual_right{ false, { 'C', xui::bind_mode::toggle }, "force right", "anti aim" };

@@ -5,7 +5,7 @@
 #include <core/systems/systems.hpp>
 #include <protection/game_addresses.hpp>
 
-// Shared movement helpers: every movement feature (bhop thread, jumpbug,
+// Shared movement helpers: every movement feature (bhop, jumpbug,
 // edgebug, ...) traces the player hull the same way - same mask, same
 // gravity correction, same contact refinement. Keeping those in one place
 // removes the duplicated inline copies and keeps the physics consistent.
@@ -124,6 +124,61 @@ namespace features::movement::utils {
 	[[nodiscard]] inline float standable_normal( )
 	{
 		return CONVAR( "sv_standable_normal" )->get<float>( );
+	}
+
+	// Landing prediction shared by bhop / jumpbug / edgebug: gravity-
+	// corrected single-tick hull trace plus binary-refined contact
+	// fraction. `holding_duck` restores the standing hull for the trace
+	// so the contact fraction matches the unduck at contact.
+	struct landing_result
+	{
+		bool hit{};
+		float fraction{};
+		float normal_z{};
+		float fall_remaining{};
+	};
+
+	[[nodiscard]] inline landing_result predict_landing( std::uintptr_t pawn, const math::vector3& origin, const math::vector3& velocity, bool holding_duck )
+	{
+		landing_result out{};
+
+		const auto movement_services = memory::read<std::uintptr_t>( pawn + SCHEMA( "C_BasePlayerPawn", "m_pMovementServices"_hash ) );
+		if ( !movement_services )
+		{
+			return out;
+		}
+
+		const auto duck_amount = memory::read<float>( movement_services + SCHEMA( "CCSPlayer_MovementServices", "m_flDuckAmount"_hash ) );
+
+		auto hull = player_hull( pawn );
+
+		auto trace_origin = origin;
+		if ( holding_duck && duck_amount > 0.0f )
+		{
+			constexpr float standing_height{ 72.0f };
+			const auto duck_hull_diff = standing_height - hull.maxs.z;
+			trace_origin.z -= duck_hull_diff * 0.5f;
+			hull.maxs.z = standing_height;
+		}
+
+		const auto filter = movement_filter( pawn, movement_services );
+		const auto sv_standable_normal = standable_normal( );
+
+		const auto corrected = gravity_corrected_velocity( velocity, pawn );
+
+		const step_trace_input step{ trace_origin, corrected, hull, filter, movement_services };
+		const auto result = trace_movement_step( step );
+
+		out.normal_z = result.normal.z;
+		out.fall_remaining = trace_origin.z - ( trace_origin.z + corrected.z * cstypes::tick_interval - 2.0f );
+
+		if ( result.fraction > 0.0f && result.fraction < 1.0f && result.normal.z >= sv_standable_normal )
+		{
+			out.hit = true;
+			out.fraction = refine_contact_fraction( result, step, 4 );
+		}
+
+		return out;
 	}
 
 } // namespace features::movement::utils

@@ -221,6 +221,12 @@ namespace hooks {
 		}
 
 		systems::g_local.update( );
+		if ( stage == 7 )
+		{
+			// Shot correlation and console delivery must keep advancing while
+			// dead, spectating, or temporarily without a render camera.
+			features::misc::g_impacts.on_frame_stage_notify( );
+		}
 
 		if ( systems::g_local.get( ).is_valid( ) && systems::g_view.has_camera( ) )
 		{
@@ -238,8 +244,6 @@ namespace hooks {
 				features::world::g_scene.on_frame_stage_notify( );
 				features::world::g_weather.on_frame_stage_notify( );
 				features::misc::g_other.on_frame_stage_notify( );
-				features::misc::g_impacts.on_frame_stage_notify( );
-
 				
 			}
 		}
@@ -345,6 +349,7 @@ namespace hooks {
 
 			systems::g_input.desubtick( current_cmd );
 			systems::g_prediction.capture_prestate( local.pawn, movement_services );
+			features::movement::g_movement_fix.begin( current_cmd );
 
 			{
 				diag::set_exception_phase( "create_move: shared update" );
@@ -411,21 +416,48 @@ namespace hooks {
 				diag::step( "create_move: final subtick begin" );
 			}
 
-			diag::set_exception_phase( "create_move: final subtick" );
-			const auto final_base = current_cmd->csgo_user_cmd.mutable_base( );
-			if ( final_base && final_base->subtick_moves_size( ) > 0
-				&& !features::movement::g_test_strafer.handled_this_tick( ) )
+			diag::set_exception_phase( "create_move: vac bypass" );
+			features::combat::g_vac_bypass.on_create_move( current_cmd );
+
+			// This must be the last command-space writer: it snapshots the
+			// final yaw produced by anti-aim, aim and the bypass, then encodes
+			// every movement source exactly once in that wire frame.
+			diag::set_exception_phase( "create_move: movement fix" );
+			features::movement::g_movement_fix.finish( current_cmd );
+
+			// Put non-Rage attack edges into the same event timeline as Ragebot
+			// shots. They consume weapon_fire/impact/hurt evidence without ever
+			// producing a Rage miss, preventing a manual shot from stealing the
+			// previous Ragebot record.
+			auto primary_attack_edge = ( current_cmd->buttons.value & current_cmd->buttons.value_changed
+				& cstypes::command_buttons::in_attack ) != 0
+				|| current_cmd->csgo_user_cmd.attack1_start_history_index( ) >= 0;
+			auto primary_attack_held = ( current_cmd->buttons.value & cstypes::command_buttons::in_attack ) != 0
+				|| current_cmd->csgo_user_cmd.attack1_start_history_index( ) >= 0;
+			if ( auto* final_base = current_cmd->csgo_user_cmd.mutable_base( ); final_base )
 			{
-				final_base->set_forwardmove( 0.0f );
-				final_base->set_leftmove( 0.0f );
+				for ( auto i = 0; i < final_base->subtick_moves_size( ); ++i )
+				{
+					const auto step = final_base->mutable_subtick_moves( i );
+					if ( step && step->m_has_bits.test( 0x1u ) && step->m_has_bits.test( 0x2u )
+						&& ( step->button( ) & cstypes::command_buttons::in_attack ) != 0 && step->pressed( ) )
+					{
+						primary_attack_edge = true;
+						primary_attack_held = true;
+						break;
+					}
+				}
 			}
+			const auto attack_local = systems::g_local.get( );
+			const auto primary_attack_ready = primary_attack_held && attack_local.controller
+				&& features::combat::g_shared.ctx( ).valid
+				&& features::combat::g_shared.can_shoot( current_cmd, attack_local.controller );
+			features::misc::g_impacts.on_command_finalized(
+				current_cmd->command_number, primary_attack_edge, primary_attack_ready );
 			if ( trace )
 			{
 				diag::step( "create_move: final subtick end" );
 			}
-
-			diag::set_exception_phase( "create_move: vac bypass" );
-			features::combat::g_vac_bypass.on_create_move( current_cmd );
 
 			//systems::g_legit_input.on_create_move( current_cmd );
 		}

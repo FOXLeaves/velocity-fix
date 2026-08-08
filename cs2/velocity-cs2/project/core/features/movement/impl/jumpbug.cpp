@@ -107,56 +107,25 @@ namespace features::movement {
 			this->m_jump_fired_prev = false;
 		}
 
-		const auto movement_services = memory::read<std::uintptr_t>( local.pawn + SCHEMA( "C_BasePlayerPawn", "m_pMovementServices"_hash ) );
-		if ( !movement_services )
-		{
-			return;
-		}
-
-		// Trace the tick's motion with the player hull. When ducked, the
-		// standing hull is restored for the trace so the contact fraction
-		// matches the unduck at contact.
+		// Trace the tick's motion with the player hull (shared landing
+		// predictor: gravity-corrected step trace + binary-refined
+		// contact fraction). When ducked, the standing hull is restored
+		// for the trace so the contact fraction matches the unduck at
+		// contact. The origin stays on the networked side while the
+		// velocity uses the LOCAL prediction - both in the same world
+		// space, matching what the server is about to simulate.
 		const auto holding_duck = ( cmd->buttons.value & cstypes::command_buttons::in_duck ) != 0;
-		const auto duck_amount = memory::read<float>( movement_services + SCHEMA( "CCSPlayer_MovementServices", "m_flDuckAmount"_hash ) );
-
-		auto hull = utils::player_hull( local.pawn );
-
-		auto trace_origin = prestate.networked_origin;
-		if ( holding_duck && duck_amount > 0.0f )
-		{
-			constexpr float standing_height{ 72.0f };
-			const auto duck_hull_diff = standing_height - hull.maxs.z;
-			trace_origin.z -= duck_hull_diff * 0.5f;
-			hull.maxs.z = standing_height;
-		}
-
-		const auto filter = utils::movement_filter( local.pawn, movement_services );
+		const auto landing = utils::predict_landing( local.pawn, prestate.networked_origin, prestate.velocity, holding_duck );
 		const auto sv_standable_normal = CONVAR( "sv_standable_normal" )->get<float>( );
 
-		// Trace velocity uses the LOCAL prediction (m_vecAbsVelocity) with
-		// the half-tick gravity correction: the predicted state is what the
-		// server is about to simulate, while the networked velocity lags a
-		// packet and systematically shifts the contact fraction. The
-		// origin stays on the networked side so both stay in the same
-		// world-space coordinate system. (when is a fraction inside the
-		// command tick - bunnyhop proves this coordinate is honored on
-		// official servers - so the trace stays single-tick; the press
-		// edge tolerance below absorbs the residual drift instead.)
-		const auto velocity = utils::gravity_corrected_velocity( prestate.velocity, local.pawn );
-
-		const utils::step_trace_input step{ trace_origin, velocity, hull, filter, movement_services };
-		const auto result = utils::trace_movement_step( step );
-		const auto trace_end = trace_origin + velocity * cstypes::tick_interval - math::vector3{ 0.0f, 0.0f, 2.0f };
-
-		if ( !( result.fraction > 0.0f && result.fraction < 1.0f ) || result.normal.z < sv_standable_normal )
+		if ( !landing.hit )
 		{
 			// No contact this tick, but a small remaining fall distance
 			// means the ground is one tick away: pre-issue the whole-tick
 			// jump button so the server auto-takeoffs on the landing -
 			// the jumpbug triggers reliably (slightly slower than the
 			// perfect contact jump, but it never silently drops).
-			const auto fall_dist = trace_origin.z - trace_end.z;
-			if ( result.normal.z >= sv_standable_normal && fall_dist < 8.0f )
+			if ( landing.normal_z >= sv_standable_normal && landing.fall_remaining < 8.0f )
 			{
 				this->m_active_this_tick = true;
 				cmd->buttons.value |= cstypes::command_buttons::in_jump;
@@ -168,14 +137,12 @@ namespace features::movement {
 
 		// Slopes are not jumpbug material - hand them to the bunnyhop so a
 		// failed attempt cannot stall the chain.
-		if ( result.normal.z < k_flat_normal )
+		if ( landing.normal_z < k_flat_normal )
 		{
 			return;
 		}
 
-		// Binary-refine the contact fraction so the jump `when` stays
-		// accurate on fast servers.
-		const auto refined = utils::refine_contact_fraction( result, step, k_refine_passes );
+		const auto refined = landing.fraction;
 
 		// Landing near the START or END of the tick: the exact contact
 		// fraction cannot be expressed reliably (too early is ignored,

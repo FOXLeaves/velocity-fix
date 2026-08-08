@@ -51,6 +51,67 @@ namespace features::misc {
 			return std::format( "<font color='#FF5555'>{}</font>", text );
 		}
 
+		[[nodiscard]] std::string escape_chat_text( std::string_view text )
+		{
+			std::string escaped{};
+			escaped.reserve( text.size( ) );
+
+			for ( const auto ch : text )
+			{
+				const auto byte = static_cast< unsigned char >( ch );
+				if ( byte < 0x20 || byte == 0x7f )
+				{
+					escaped += ' ';
+					continue;
+				}
+
+				switch ( ch )
+				{
+				case '&': escaped += "&amp;"; break;
+				case '<': escaped += "&lt;"; break;
+				case '>': escaped += "&gt;"; break;
+				case '\"': escaped += "&quot;"; break;
+				default: escaped += ch; break;
+				}
+			}
+
+			return escaped;
+		}
+
+		[[nodiscard]] std::string sanitize_console_field( std::string_view text )
+		{
+			std::string sanitized{};
+			sanitized.reserve( text.size( ) );
+
+			for ( const auto ch : text )
+			{
+				const auto byte = static_cast< unsigned char >( ch );
+				sanitized += byte < 0x20 || byte == 0x7f ? ' ' : ( ch == '"' ? '\'' : ch );
+			}
+
+			return sanitized;
+		}
+
+		[[nodiscard]] std::string format_metric( float value, std::string_view suffix = {} )
+		{
+			if ( !std::isfinite( value ) || value < 0.0f )
+			{
+				return "n/a";
+			}
+
+			return std::format( "{:.3f}{}", value, suffix );
+		}
+
+		[[nodiscard]] std::string format_vector( const math::vector3& value, bool valid = true )
+		{
+			if ( !valid || !std::isfinite( value.x ) || !std::isfinite( value.y ) || !std::isfinite( value.z ) )
+			{
+				return "n/a";
+			}
+
+			return std::format( "({:.2f},{:.2f},{:.2f})", value.x, value.y, value.z );
+		}
+
 		// kill (health <= 0) = green, otherwise yellow.
 		[[nodiscard]] std::string chat_hit_colored( std::string_view text, int health )
 		{
@@ -105,22 +166,22 @@ namespace features::misc {
 			return result;
 		}
 
-		void chat_print( const char* label_text, std::uint8_t sr, std::uint8_t sg, std::uint8_t sb, std::uint8_t er, std::uint8_t eg, std::uint8_t eb, const char* msg )
+		bool chat_print( const char* label_text, std::uint8_t sr, std::uint8_t sg, std::uint8_t sb, std::uint8_t er, std::uint8_t eg, std::uint8_t eb, const char* msg )
 		{
 			const auto local = systems::g_local.get( );
 			// Miss/hit confirmations resolve 0.35-1s after the shot, so the
 			// local player can be dead by the time the log fires. The chat
 			// is still visible in death cam - keep sending instead of
 			// silently dropping the log.
-			if ( !local.is_valid( ) || systems::g_local.is_in_cinematic( ) || !local.pawn )
+			if ( !local.controller || systems::g_local.is_in_cinematic( ) )
 			{
-				return;
+				return false;
 			}
 
 			const auto hud_element = memory::call<std::uintptr_t>( PATTERN (patterns::find_hud_element), xs( "CCSGO_HudVoiceStatus" ) );
 			if ( !hud_element )
 			{
-				return;
+				return false;
 			}
 
 			const auto voice = hud_element - 32;
@@ -132,15 +193,18 @@ namespace features::misc {
 			std::uint8_t flags[ 2 ]{ 1, 0 };
 
 			const auto set_voice_data = PATTERN( patterns::set_voice_data );
-			if ( set_voice_data )
+			if ( !set_voice_data )
 			{
-				memory::call<void>(set_voice_data, voice, buf, 0xFFFFFFFF, flags );
+				return false;
 			}
+
+			memory::call<void>(set_voice_data, voice, buf, 0xFFFFFFFF, flags );
+			return true;
 		}
 
-		void chat_print_velocity( const char* msg )
+		bool chat_print_velocity( const char* msg )
 		{
-			chat_print( "[velocity]", k_periwinkle_start_r, k_periwinkle_start_g, k_periwinkle_start_b, k_periwinkle_end_r, k_periwinkle_end_g, k_periwinkle_end_b, msg );
+			return chat_print( "[velocity]", k_periwinkle_start_r, k_periwinkle_start_g, k_periwinkle_start_b, k_periwinkle_end_r, k_periwinkle_end_g, k_periwinkle_end_b, msg );
 		}
 
 	} // namespace detail
@@ -156,15 +220,22 @@ namespace features::misc {
 
 	void impacts::on_frame_stage_notify( )
 	{
-		// Frame-stage updates can overlap Present, which renders the same impact vectors.
-		std::unique_lock lock( this->m_mtx );
-
-		if ( this->m_buffered_impact_time > 0.0f )
 		{
-			this->flush_buffered_impacts( );
-			this->m_buffered_impacts.clear( );
-			this->m_buffered_impact_time = -1.0f;
+			// Resolve shot state and mutate shared render data on the game
+			// thread. Native console/chat calls are drained after unlocking.
+			std::unique_lock lock( this->m_mtx );
+			this->check_misses( );
+
+			if ( this->m_buffered_impact_time > 0.0f
+				&& systems::g_local.get( ).is_valid( ) && systems::g_view.has_camera( ) )
+			{
+				this->flush_buffered_impacts( );
+				this->m_buffered_impacts.clear( );
+				this->m_buffered_impact_time = -1.0f;
+			}
 		}
+
+		this->flush_miss_outputs( );
 	}
 
 	void impacts::on_level_change( )
@@ -175,21 +246,36 @@ namespace features::misc {
 		this->m_logs.clear( );
 		this->m_pending_hits.clear( );
 		this->m_pending_shots.clear( );
+		this->m_pending_miss_outputs.clear( );
 		this->m_bullet_impacts.clear( );
 		this->m_buffered_impacts.clear( );
 		this->m_buffered_impact_time = -1.0f;
 		this->m_hit_effect_time = 0.0f;
+		this->m_active_fire_sequence = 0;
+		this->m_next_shot_sequence = 1;
+		this->m_next_impact_event_sequence = 1;
+		++this->m_session_epoch;
+	}
+
+	void impacts::on_round_start( )
+	{
+		// Deliver already-finalized results before the new round resets the
+		// correlation state. Uncommitted/in-flight intents are intentionally
+		// cancelled at the boundary.
+		this->flush_miss_outputs( );
+		std::unique_lock lock( this->m_mtx );
+		this->m_pending_hits.clear( );
+		this->m_pending_shots.clear( );
+		this->m_active_fire_sequence = 0;
+		this->m_next_shot_sequence = 1;
+		this->m_next_impact_event_sequence = 1;
+		++this->m_session_epoch;
 	}
 
 	void impacts::on_render( xdraw::draw_list& draw_list )
 	{
 		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
 		const auto current_time = memory::read<float>( global_vars + 0x30 );
-
-		{
-			std::unique_lock lock( this->m_mtx );
-			this->check_misses( );
-		}
 
 		this->render_hit_markers( draw_list, current_time );
 		this->render_logs( draw_list, current_time );
@@ -332,6 +418,104 @@ namespace features::misc {
 		}
 	}
 
+	void impacts::on_weapon_fire( std::uintptr_t event )
+	{
+		if ( !event )
+		{
+			return;
+		}
+
+		const auto userid_key = cstypes::event_hash{ 0, "userid" };
+		const auto controller = memory::call<std::uintptr_t>( PATTERN( patterns::game_event_get_controller ), event, &userid_key );
+		if ( controller != systems::g_local.get( ).controller )
+		{
+			return;
+		}
+
+		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
+		const auto current_time = memory::read<float>( global_vars + 0x30 );
+		const auto event_weapon_type = features::combat::g_shared.ctx( ).weapon_type;
+		const auto event_weapon_id = features::combat::g_shared.ctx( ).item_def_idx;
+		auto expected_fire_age{ 0.0f };
+		auto max_fire_age{ 0.75f };
+		if ( const auto net_channel = memory::call<std::uintptr_t>( PATTERN( patterns::get_net_channel ), 0, 0 ) )
+		{
+			const auto outgoing = memory::call_vfunc<float>( net_channel, 10, 0 );
+			const auto incoming = memory::call_vfunc<float>( net_channel, 10, 1 );
+			if ( std::isfinite( outgoing ) && outgoing >= 0.0f && outgoing < 1.0f
+				&& std::isfinite( incoming ) && incoming >= 0.0f && incoming < 1.0f )
+			{
+				expected_fire_age = outgoing + incoming;
+				max_fire_age = std::clamp( expected_fire_age + 0.35f, 0.5f, 2.0f );
+			}
+		}
+
+		std::unique_lock lock( this->m_mtx );
+		shot_record* matched{};
+		auto best_age_error{ FLT_MAX };
+
+		for ( auto& shot : this->m_pending_shots )
+		{
+			if ( shot.resolved || shot.fire_confirmed || !shot.committed )
+			{
+				continue;
+			}
+
+			const auto committed_at = shot.committed_time > 0.0f ? shot.committed_time : shot.time;
+			const auto age = current_time - committed_at;
+			if ( age >= -0.05f && age <= max_fire_age )
+			{
+				const auto age_error = std::fabsf( age - expected_fire_age );
+				if ( age_error < best_age_error )
+				{
+					best_age_error = age_error;
+					matched = &shot;
+				}
+			}
+		}
+
+		// Server fire events are ordered. They may only confirm an attack
+		// expression that Ragebot actually committed into a user command.
+		// The active client weapon is deliberately not used: this event is
+		// delayed and can arrive after a weapon switch. Match the intent whose
+		// age is closest to the measured round trip; this lets a missing A fire
+		// leave a gap instead of shifting B's evidence onto A.
+
+		// Every local fire event terminates the previous shotgun pellet
+		// bucket, even when the new fire does not belong to Ragebot.
+		this->m_active_fire_sequence = 0;
+		if ( !matched )
+		{
+			// A held manual/legit weapon can fire without a new command edge.
+			// Materialize an anonymous non-Rage token at the event boundary so
+			// its impact/hurt cannot fall through into an older Rage record.
+			this->m_pending_shots.push_back(
+				{
+					.sequence = this->m_next_shot_sequence++,
+					.session_epoch = this->m_session_epoch,
+					.command_number = -1,
+					.target_name = "non-rage-event",
+					.time = current_time,
+					.committed_time = current_time,
+					.fire_time = current_time,
+					.committed = true,
+					.ragebot = false,
+					.fire_confirmed = true,
+					.weapon_type = event_weapon_type,
+					.weapon_id = static_cast< std::uint16_t >( event_weapon_id ),
+				} );
+			matched = &this->m_pending_shots.back( );
+		}
+
+		if ( matched )
+		{
+			matched->fire_confirmed = true;
+			matched->fire_time = current_time;
+			matched->miss_pending = false;
+			this->m_active_fire_sequence = matched->sequence;
+		}
+	}
+
 	void impacts::on_bullet_impact( std::uintptr_t event )
 	{
 		if ( !event )
@@ -357,38 +541,53 @@ namespace features::misc {
 			const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
 			const auto current_time = memory::read<float>( global_vars + 0x30 );
 			shot_record* matched_shot{};
-			auto best_score{ -FLT_MAX };
+			const auto in_window = [ & ]( const shot_record& shot )
+			{
+				const auto age = current_time - shot.time;
+				return age >= -0.05f && age <= 2.5f;
+			};
 
-			// Server shot callbacks and bullet-impact events preserve command order.
-			// Match the oldest shot that does not have an impact before considering
-			// extra impacts from an already matched shot.
+			// weapon_fire is the strongest event boundary available. Bind the
+			// next impact to that exact token; shotgun tokens stay active for all
+			// pellets until the next local weapon_fire changes the sequence.
 			for ( auto& shot : this->m_pending_shots )
 			{
-				if ( shot.resolved || shot.impact_confirmed )
-				{
-					continue;
-				}
-
-				const auto age = current_time - shot.time;
-				if ( age < -0.05f || age > 1.0f )
-				{
-					continue;
-				}
-
-				const auto origin = shot.server_shoot_position_confirmed ? shot.server_shoot_position : shot.shoot_position;
-				const auto impact_delta = pos - origin;
-				if ( impact_delta.length_sqr( ) < 1.0f )
-				{
-					continue;
-				}
-
-				math::vector3 expected_direction{};
-				math::helpers::angle_vectors_left( shot.aim_angle, &expected_direction );
-				const auto alignment = expected_direction.dot( impact_delta.normalized( ) );
-				if ( alignment > -0.25f )
+				if ( shot.sequence == this->m_active_fire_sequence
+					&& ( !shot.resolved || shot.hurt_confirmed )
+					&& ( !shot.impact_confirmed || shot.weapon_type == cstypes::weapon_type::shotgun )
+					&& in_window( shot ) )
 				{
 					matched_shot = &shot;
 					break;
+				}
+			}
+
+			// A hit can be reported before its impact on a reordered event
+			// stream. Consume that late impact with the retained hit tombstone,
+			// but never ahead of a newer explicit weapon_fire boundary.
+			if ( !matched_shot )
+			{
+				for ( auto& shot : this->m_pending_shots )
+				{
+					if ( shot.hurt_confirmed && !shot.impact_confirmed && in_window( shot ) )
+					{
+						matched_shot = &shot;
+						break;
+					}
+				}
+			}
+
+			// Fire and impact evidence are both ordered. Geometry is analyzed
+			// after binding and must never reorder two rapid Ragebot shots.
+			if ( !matched_shot )
+			{
+				for ( auto& shot : this->m_pending_shots )
+				{
+					if ( !shot.resolved && shot.fire_confirmed && !shot.impact_confirmed && in_window( shot ) )
+					{
+						matched_shot = &shot;
+						break;
+					}
 				}
 			}
 
@@ -396,46 +595,32 @@ namespace features::misc {
 			{
 				for ( auto& shot : this->m_pending_shots )
 				{
-					if ( shot.resolved || !shot.impact_confirmed )
+					if ( !shot.resolved && shot.committed && !shot.impact_confirmed && in_window( shot ) )
 					{
-						continue;
-					}
-
-					const auto age = current_time - shot.time;
-					if ( age < -0.05f || age > 1.0f )
-					{
-						continue;
-					}
-
-					const auto origin = shot.server_shoot_position_confirmed ? shot.server_shoot_position : shot.shoot_position;
-					const auto impact_delta = pos - origin;
-					if ( impact_delta.length_sqr( ) < 1.0f )
-					{
-						continue;
-					}
-
-					math::vector3 expected_direction{};
-					math::helpers::angle_vectors_left( shot.aim_angle, &expected_direction );
-					const auto score = expected_direction.dot( impact_delta.normalized( ) ) * 4.0f - std::fabs( age );
-
-					if ( score > best_score )
-					{
-						best_score = score;
 						matched_shot = &shot;
+						break;
 					}
 				}
 			}
 
 			if ( matched_shot )
 			{
-				const auto target_origin = matched_shot->skeleton[ 0 ].position;
+				matched_shot->committed = true;
+				if ( !matched_shot->fire_confirmed ) matched_shot->fire_time = current_time;
+				matched_shot->fire_confirmed = true;
+				matched_shot->miss_pending = false;
+				++matched_shot->impact_count;
+				matched_shot->impact_event_sequence = this->m_next_impact_event_sequence++;
+				const auto target_origin = matched_shot->aim_position.length_sqr( ) > 1.0f
+					? matched_shot->aim_position
+					: matched_shot->skeleton[ 0 ].position;
 				const auto dist_sq = ( pos - target_origin ).length_sqr( );
+				matched_shot->impact_time = current_time;
 
 				if ( !matched_shot->impact_confirmed || dist_sq < matched_shot->best_impact_dist_sq )
 				{
 					matched_shot->impact_position = pos;
 					matched_shot->best_impact_dist_sq = dist_sq;
-					matched_shot->impact_time = current_time;
 					matched_shot->impact_confirmed = true;
 				}
 			}
@@ -464,13 +649,27 @@ namespace features::misc {
 						if ( local_pawn )
 						{
 							const auto game_scene_node = memory::read<std::uintptr_t>( local_pawn + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
-							const auto origin = memory::read<math::vector3>( game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
-							const auto view_offset = memory::read<math::vector3>( local_pawn + SCHEMA( "C_BaseModelEntity", "m_vecViewOffset"_hash ) );
-							this->m_buffered_eye_position = origin + view_offset;
+							if ( game_scene_node )
+							{
+								const auto origin = memory::read<math::vector3>( game_scene_node + SCHEMA( "CGameSceneNode", "m_vecAbsOrigin"_hash ) );
+								const auto view_offset = memory::read<math::vector3>( local_pawn + SCHEMA( "C_BaseModelEntity", "m_vecViewOffset"_hash ) );
+								this->m_buffered_eye_position = origin + view_offset;
+							}
+							else
+							{
+								this->m_buffered_impact_time = -1.0f;
+							}
+						}
+						else
+						{
+							this->m_buffered_impact_time = -1.0f;
 						}
 					}
 
-					this->m_buffered_impacts.push_back( math::vector3{ x, y, z } );
+					if ( this->m_buffered_impact_time == current_time )
+					{
+						this->m_buffered_impacts.push_back( math::vector3{ x, y, z } );
+					}
 				}
 			}
 		}
@@ -498,17 +697,32 @@ namespace features::misc {
 			return;
 		}
 
+		const auto weapon_id = memory::read<std::uint16_t>( weapon + SCHEMA( "C_EconEntity", "m_AttributeManager"_hash )
+			+ SCHEMA( "C_AttributeContainer", "m_Item"_hash ) + SCHEMA( "C_EconItemView", "m_iItemDefinitionIndex"_hash ) );
+		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
+		const auto current_time = memory::read<float>( global_vars + 0x30 );
 		std::unique_lock lock( this->m_mtx );
 
-		for ( auto it = this->m_pending_shots.begin( ); it != this->m_pending_shots.end( ); ++it )
+		const auto bind_inaccuracy = [ & ]( bool require_weapon )
 		{
-			if ( !it->server_confirmed )
+			for ( auto it = this->m_pending_shots.rbegin( ); it != this->m_pending_shots.rend( ); ++it )
 			{
-				it->server_inaccuracy = inaccuracy;
-				it->server_confirmed = true;
-				break;
+				auto& shot = *it;
+				const auto committed_at = shot.committed_time > 0.0f ? shot.committed_time : shot.time;
+				const auto age = current_time - committed_at;
+				if ( !shot.resolved && shot.committed && !shot.inaccuracy_confirmed
+					&& age >= -0.05f && age <= 0.75f && ( !require_weapon || shot.weapon_id == weapon_id ) )
+				{
+					shot.server_inaccuracy = inaccuracy;
+					shot.inaccuracy_confirmed = true;
+					return true;
+				}
 			}
-		}
+			return false;
+		};
+
+		if ( weapon_id ) bind_inaccuracy( true );
+		else bind_inaccuracy( false );
 	}
 
 	void impacts::on_get_interpolated_shoot_position( std::uintptr_t weapon_services, float* out )
@@ -526,17 +740,133 @@ namespace features::misc {
 		}
 
 		const auto shoot_position = math::vector3{ out[ 0 ], out[ 1 ], out[ 2 ] };
+		const auto weapon_handle = memory::read<std::uint32_t>( weapon_services + SCHEMA( "CPlayer_WeaponServices", "m_hActiveWeapon"_hash ) );
+		const auto weapon = weapon_handle ? systems::g_entities.lookup( weapon_handle ) : 0;
+		const auto weapon_id = weapon ? memory::read<std::uint16_t>( weapon + SCHEMA( "C_EconEntity", "m_AttributeManager"_hash )
+			+ SCHEMA( "C_AttributeContainer", "m_Item"_hash ) + SCHEMA( "C_EconItemView", "m_iItemDefinitionIndex"_hash ) ) : 0;
+		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
+		const auto current_time = memory::read<float>( global_vars + 0x30 );
 
 		std::unique_lock lock( this->m_mtx );
 
-		for ( auto& shot : this->m_pending_shots )
+		const auto bind_shoot_position = [ & ]( bool require_weapon )
 		{
-			if ( !shot.resolved && !shot.server_shoot_position_confirmed )
+			for ( auto it = this->m_pending_shots.rbegin( ); it != this->m_pending_shots.rend( ); ++it )
 			{
-				shot.server_shoot_position = shoot_position;
-				shot.server_shoot_position_confirmed = true;
-				break;
+				auto& shot = *it;
+				const auto committed_at = shot.committed_time > 0.0f ? shot.committed_time : shot.time;
+				const auto age = current_time - committed_at;
+				if ( !shot.resolved && shot.committed && !shot.server_shoot_position_confirmed
+					&& age >= -0.05f && age <= 0.75f && ( !require_weapon || shot.weapon_id == weapon_id ) )
+				{
+					shot.server_shoot_position = shoot_position;
+					shot.server_shoot_position_confirmed = true;
+					return true;
+				}
 			}
+			return false;
+		};
+
+		if ( weapon_id ) bind_shoot_position( true );
+		else bind_shoot_position( false );
+	}
+
+	void impacts::on_shot_committed( std::intptr_t command_number )
+	{
+		if ( command_number < 0 )
+		{
+			return;
+		}
+
+		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
+		const auto current_time = memory::read<float>( global_vars + 0x30 );
+		std::unique_lock lock( this->m_mtx );
+
+		for ( auto it = this->m_pending_shots.rbegin( ); it != this->m_pending_shots.rend( ); ++it )
+		{
+			if ( it->command_number == command_number && !it->resolved )
+			{
+				if ( !it->committed )
+				{
+					it->committed = true;
+					it->committed_time = current_time;
+				}
+				return;
+			}
+		}
+	}
+
+	void impacts::on_command_finalized( std::intptr_t command_number, bool primary_attack_edge, bool primary_attack_ready )
+	{
+		if ( command_number < 0 || ( !primary_attack_edge && !primary_attack_ready ) )
+		{
+			return;
+		}
+
+		const auto& weapon = features::combat::g_shared.ctx( );
+		if ( !weapon.valid || weapon.weapon_type < cstypes::weapon_type::pistol
+			|| weapon.weapon_type > cstypes::weapon_type::lmg
+			|| ( weapon.item_def_idx == cstypes::item_definition_index::weapon_r8_revolver
+				&& features::combat::g_rage.is_cocking_revolver( ) ) )
+		{
+			return;
+		}
+
+		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
+		const auto current_time = memory::read<float>( global_vars + 0x30 );
+		std::unique_lock lock( this->m_mtx );
+
+		// A Ragebot shot already owns this command. Only create a sentinel for
+		// final attack input that no Rage record claimed (manual/legit fire).
+		for ( const auto& shot : this->m_pending_shots )
+		{
+			if ( shot.session_epoch == this->m_session_epoch && shot.command_number == command_number )
+			{
+				return;
+			}
+		}
+
+		// A real subtick edge always represents a distinct fire intent (including
+		// manual double-tap). Only throttle inferred held-fire placeholders.
+		if ( !primary_attack_edge )
+		{
+			const auto cycle_time = weapon.weapon_vdata
+				? memory::read<float>( weapon.weapon_vdata + SCHEMA( "CCSWeaponBaseVData", "m_flCycleTime"_hash ) ) : 0.1f;
+			const auto token_gap = std::clamp( std::isfinite( cycle_time ) ? cycle_time * 0.5f : 0.05f, 0.02f, 0.25f );
+
+			for ( auto it = this->m_pending_shots.rbegin( ); it != this->m_pending_shots.rend( ); ++it )
+			{
+				if ( !it->ragebot && it->weapon_id == weapon.item_def_idx && current_time - it->time < token_gap )
+				{
+					return;
+				}
+			}
+		}
+
+		this->m_pending_shots.push_back(
+			{
+				.sequence = this->m_next_shot_sequence++,
+				.session_epoch = this->m_session_epoch,
+				.command_number = command_number,
+				.target_name = "non-rage",
+				.time = current_time,
+				.committed_time = current_time,
+				.committed = true,
+				.ragebot = false,
+				.weapon_type = weapon.weapon_type,
+				.weapon_id = static_cast< std::uint16_t >( weapon.item_def_idx ),
+			} );
+
+		constexpr auto max_pending_shots{ 128ull };
+		while ( this->m_pending_shots.size( ) > max_pending_shots )
+		{
+			const auto& oldest = this->m_pending_shots.front( );
+			if ( oldest.ragebot && oldest.committed && !oldest.resolved )
+			{
+				this->add_miss_log( oldest,
+					{ .reason = miss_reason::tracker_overflow, .confidence = miss_confidence::low } );
+			}
+			this->m_pending_shots.erase( this->m_pending_shots.begin( ) );
 		}
 	}
 
@@ -544,15 +874,22 @@ namespace features::misc {
 	{
 		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
 		const auto current_time = memory::read<float>( global_vars + 0x30 );
+		const auto target_name = this->get_player_name_from_pawn( params.victim_pawn );
+		const auto controller_handle = memory::read<std::uint32_t>( params.victim_pawn + SCHEMA( "C_BasePlayerPawn", "m_hController"_hash ) );
+		const auto target_velocity = memory::read<math::vector3>( params.victim_pawn + SCHEMA( "C_BaseEntity", "m_vecVelocity"_hash ) );
+		const auto& weapon = features::combat::g_shared.ctx( );
 
 		std::unique_lock lock( this->m_mtx );
-
-		const auto target_velocity = memory::read<math::vector3>( params.victim_pawn + SCHEMA( "C_BaseEntity", "m_vecVelocity"_hash ) );
-
-		this->m_pending_shots.push_back(
+		shot_record record
 			{
+				.sequence = this->m_next_shot_sequence,
+				.session_epoch = this->m_session_epoch,
+				.command_number = params.command_number,
 				.victim_pawn = params.victim_pawn,
+				.victim_controller_handle = controller_handle,
+				.target_name = target_name,
 				.hitgroup = params.hitgroup,
+				.target_health = params.target_health,
 				.damage = params.damage,
 				.hitchance = params.hitchance,
 				.predicted_inaccuracy = params.inaccuracy,
@@ -565,103 +902,221 @@ namespace features::misc {
 				.stamp_tick = params.stamp_tick,
 				.time = current_time,
 				.skeleton = params.skeleton,
-				.resolved = false,
-				.server_confirmed = false,
-				.impact_confirmed = false,
 				.target_velocity = target_velocity,
 				.forced = params.forced,
 				.extrapolated = params.extrapolated,
+				.penetrated = params.penetrated,
 				.seed_mode = params.seed_mode,
 				.dt = params.dt,
-				.weapon_type = features::combat::g_shared.ctx( ).weapon_type,
-			} );
+				.weapon_type = weapon.weapon_type,
+				.weapon_id = static_cast< std::uint16_t >( weapon.item_def_idx ),
+			};
 
-		if ( this->m_pending_shots.size( ) > 10 )
+		if ( params.command_number >= 0 )
 		{
+			for ( auto& pending : this->m_pending_shots )
+			{
+				if ( pending.session_epoch == this->m_session_epoch && pending.command_number == params.command_number )
+				{
+					if ( !pending.ragebot )
+					{
+						record.sequence = pending.sequence;
+						pending = std::move( record );
+						return;
+					}
+
+					// CreateMove can replay one command. Refresh an uncommitted
+					// intent instead of creating a second logical shot.
+					if ( !pending.committed && !pending.fire_confirmed && !pending.impact_confirmed )
+					{
+						record.sequence = pending.sequence;
+						pending = std::move( record );
+					}
+					return;
+				}
+			}
+		}
+
+		++this->m_next_shot_sequence;
+		this->m_pending_shots.push_back( std::move( record ) );
+
+		constexpr auto max_pending_shots{ 128ull };
+		while ( this->m_pending_shots.size( ) > max_pending_shots )
+		{
+			if ( this->m_pending_shots.front( ).ragebot && this->m_pending_shots.front( ).committed
+				&& !this->m_pending_shots.front( ).resolved )
+			{
+				this->add_miss_log( this->m_pending_shots.front( ),
+					{ .reason = miss_reason::tracker_overflow, .confidence = miss_confidence::low } );
+			}
 			this->m_pending_shots.erase( this->m_pending_shots.begin( ) );
 		}
 	}
 
-	const char* impacts::classify_shot_deviation( const shot_record& shot ) const
+	const char* impacts::miss_reason_code( miss_reason reason )
 	{
+		switch ( reason )
+		{
+		case miss_reason::server_rejected: return "server_rejected";
+		case miss_reason::impact_missing: return "impact_missing";
+		case miss_reason::shoot_origin_mismatch: return "shoot_origin_mismatch";
+		case miss_reason::prediction_mismatch: return "prediction_mismatch";
+		case miss_reason::trajectory_mismatch: return "trajectory_mismatch";
+		case miss_reason::occlusion: return "occlusion";
+		case miss_reason::penetration_failed: return "penetration_failed";
+		case miss_reason::spread: return "spread";
+		case miss_reason::lag_compensation: return "lagcomp";
+		case miss_reason::extrapolation_mismatch: return "extrapolation_mismatch";
+		case miss_reason::record_mismatch: return "record_mismatch";
+		case miss_reason::tracker_overflow: return "tracker_overflow";
+		default: return "unknown";
+		}
+	}
+
+	const char* impacts::miss_reason_label( miss_reason reason )
+	{
+		switch ( reason )
+		{
+		case miss_reason::server_rejected: return "服务器未确认";
+		case miss_reason::impact_missing: return "无弹着点";
+		case miss_reason::shoot_origin_mismatch: return "射击位置偏差";
+		case miss_reason::prediction_mismatch: return "精度预测偏差";
+		case miss_reason::trajectory_mismatch: return "弹着轨迹不匹配";
+		case miss_reason::occlusion: return "障碍物";
+		case miss_reason::penetration_failed: return "穿透失败";
+		case miss_reason::spread: return "散布";
+		case miss_reason::lag_compensation: return "延迟补偿";
+		case miss_reason::extrapolation_mismatch: return "外推偏差";
+		case miss_reason::record_mismatch: return "记录偏差";
+		case miss_reason::tracker_overflow: return "跟踪队列溢出";
+		default: return "未知";
+		}
+	}
+
+	const char* impacts::miss_confidence_name( miss_confidence confidence )
+	{
+		switch ( confidence )
+		{
+		case miss_confidence::high: return "high";
+		case miss_confidence::medium: return "medium";
+		default: return "low";
+		}
+	}
+
+	impacts::miss_analysis impacts::analyze_shot( const shot_record& shot ) const
+	{
+		miss_analysis result{};
+
+		if ( !shot.fire_confirmed && !shot.impact_confirmed )
+		{
+			result.reason = miss_reason::server_rejected;
+			result.confidence = miss_confidence::medium;
+			return result;
+		}
+
 		if ( !shot.impact_confirmed )
 		{
-			return "未知";
-		}
-
-		if ( shot.server_confirmed && std::fabsf( shot.server_inaccuracy - shot.predicted_inaccuracy ) > 0.003f )
-		{
-			return "预测偏差";
-		}
-
-		if ( shot.server_shoot_position_confirmed && ( shot.server_shoot_position - shot.shoot_position ).length_sqr( ) > 1.0f )
-		{
-			return "射击位置不匹配";
+			result.reason = miss_reason::impact_missing;
+			result.confidence = miss_confidence::medium;
+			return result;
 		}
 
 		const auto shoot_position = shot.server_shoot_position_confirmed ? shot.server_shoot_position : shot.shoot_position;
+		if ( shot.server_shoot_position_confirmed )
+		{
+			result.shoot_origin_delta = ( shot.server_shoot_position - shot.shoot_position ).length( );
+		}
 
 		math::vector3 ideal_forward{};
 		math::helpers::angle_vectors_left( shot.aim_angle, &ideal_forward );
+		ideal_forward = ideal_forward.normalized( );
 
 		const auto to_impact = shot.impact_position - shoot_position;
-		const auto impact_dist = to_impact.length( );
+		result.impact_distance = to_impact.length( );
+		const auto target_position = shot.aim_position.length_sqr( ) > 1.0f ? shot.aim_position : shot.skeleton[ 0 ].position;
+		result.target_distance = ( target_position - shoot_position ).length( );
 
-		if ( impact_dist <= 0.1f )
+		if ( result.impact_distance <= 0.1f )
 		{
-			return "弹着点过近（可能穿透）";
+			result.reason = miss_reason::unknown;
+			return result;
 		}
 
-		const auto impact_dir = to_impact * ( 1.0f / impact_dist );
-		const auto dot = ideal_forward.dot( impact_dir );
-		const auto angular_deviation = std::acosf( std::clamp( dot, -1.0f, 1.0f ) );
+		const auto impact_direction = to_impact * ( 1.0f / result.impact_distance );
+		const auto angular_deviation = std::acosf( std::clamp( ideal_forward.dot( impact_direction ), -1.0f, 1.0f ) );
+		result.angular_deviation_deg = math::helpers::rad_to_deg( angular_deviation );
 
-		const auto inaccuracy = shot.server_confirmed ? shot.server_inaccuracy : shot.predicted_inaccuracy;
-		const auto max_spread_angle = std::atanf( std::max( inaccuracy, 0.0f ) + std::max( shot.predicted_spread, 0.0f ) );
-		const auto impact_mismatch_angle = std::max( max_spread_angle * 3.0f, math::helpers::deg_to_rad( 2.0f ) );
+		const auto inaccuracy = shot.inaccuracy_confirmed ? shot.server_inaccuracy : shot.predicted_inaccuracy;
+		const auto spread_cone = std::atanf( std::max( inaccuracy, 0.0f ) + std::max( shot.predicted_spread, 0.0f ) );
+		result.spread_cone_deg = math::helpers::rad_to_deg( spread_cone );
 
-		const auto hitbox_dist = this->distance_to_nearest_hitbox( shot );
-		const auto ray_dist = this->ray_distance_to_nearest_hitbox( shot, impact_dir );
-		const auto ideal_ray_dist = this->ray_distance_to_nearest_hitbox( shot, ideal_forward );
-		const auto target_dist = ( shot.skeleton[ 0 ].position - shoot_position ).length( );
-
-		// The scalar cone is only an estimate of the server's shot state. Reserve
-		// this label for an impact that clearly belongs to another direction;
-		// smaller deviations are classified from their hitbox geometry below.
-		if ( angular_deviation > impact_mismatch_angle )
+		if ( shot.victim_pawn && systems::g_entities.exists( shot.victim_pawn ) )
 		{
-			return "弹着点偏差";
-		}
-
-		if ( ideal_ray_dist <= 1.0f && impact_dist < target_dist * 0.85f )
-		{
-			return "障碍";
-		}
-
-		// If the server impact ray misses the saved hitboxes, weapon spread is
-		// already sufficient to explain the miss. Do not blame lag compensation
-		// merely because it passed within several units of the target.
-		if ( ray_dist > 1.0f )
-		{
-			return "散布";
-		}
-
-		if ( impact_dist > target_dist * 1.05f )
-		{
-			if ( shot.target_velocity.length_2d( ) < 5.0f )
+			const auto normalize_metric = [ ]( float value )
 			{
-			return "服务器偏差";
-			}
+				return std::isfinite( value ) && value < FLT_MAX * 0.5f ? std::max( value, 0.0f ) : -1.0f;
+			};
 
-			return "延迟补偿偏差";
+			result.impact_to_hitbox = normalize_metric( this->distance_to_nearest_hitbox( shot ) );
+			result.impact_ray_to_hitbox = normalize_metric( this->ray_distance_to_nearest_hitbox( shot, impact_direction ) );
+			result.ideal_ray_to_hitbox = normalize_metric( this->ray_distance_to_nearest_hitbox( shot, ideal_forward ) );
 		}
 
-		if ( hitbox_dist > 16.0f )
+		if ( result.shoot_origin_delta > 1.0f )
 		{
-			return "散布";
+			result.reason = miss_reason::shoot_origin_mismatch;
+			result.confidence = miss_confidence::high;
+			return result;
 		}
 
-		return "服务器偏差";
+		const auto inaccuracy_tolerance = std::max( 0.0005f, std::fabsf( shot.predicted_inaccuracy ) * 0.35f );
+		if ( shot.inaccuracy_confirmed && std::fabsf( shot.server_inaccuracy - shot.predicted_inaccuracy ) > inaccuracy_tolerance )
+		{
+			result.reason = miss_reason::prediction_mismatch;
+			result.confidence = miss_confidence::high;
+			return result;
+		}
+
+		const auto trajectory_tolerance = std::max( spread_cone * 3.0f, math::helpers::deg_to_rad( 2.0f ) );
+		if ( angular_deviation > trajectory_tolerance )
+		{
+			result.reason = miss_reason::trajectory_mismatch;
+			result.confidence = miss_confidence::high;
+			return result;
+		}
+
+		if ( result.ideal_ray_to_hitbox >= 0.0f && result.ideal_ray_to_hitbox <= 1.0f
+			&& result.target_distance > 0.0f && result.impact_distance + 8.0f < result.target_distance )
+		{
+			result.reason = shot.penetrated ? miss_reason::penetration_failed : miss_reason::occlusion;
+			result.confidence = miss_confidence::high;
+			return result;
+		}
+
+		if ( result.impact_ray_to_hitbox > 1.0f )
+		{
+			result.reason = miss_reason::spread;
+			result.confidence = miss_confidence::high;
+			return result;
+		}
+
+		if ( shot.extrapolated )
+		{
+			result.reason = miss_reason::extrapolation_mismatch;
+			result.confidence = miss_confidence::medium;
+			return result;
+		}
+
+		if ( std::max( shot.stamp_tick - shot.tick, 0 ) > 0 || shot.target_velocity.length_2d( ) >= 5.0f )
+		{
+			result.reason = miss_reason::lag_compensation;
+			result.confidence = miss_confidence::medium;
+			return result;
+		}
+
+		result.reason = result.impact_ray_to_hitbox >= 0.0f ? miss_reason::record_mismatch : miss_reason::unknown;
+		result.confidence = miss_confidence::low;
+		return result;
 	}
 
 	impacts::hit_data impacts::parse_event( std::uintptr_t event )
@@ -693,6 +1148,8 @@ namespace features::misc {
 
 		const auto damage = memory::call<int>( PATTERN (patterns::game_event_get_int), event, "dmg_health", false );
 		const auto hitgroup = memory::call<int>( PATTERN (patterns::game_event_get_int), event, "hitgroup", false );
+		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
+		const auto current_time = memory::read<float>( global_vars + 0x30 );
 
 		auto expected_hitgroup{ 0 };
 		auto expected_damage{ 0.0f };
@@ -712,44 +1169,112 @@ namespace features::misc {
 			}
 
 			auto matched_shot = this->m_pending_shots.end( );
-			for ( auto it = this->m_pending_shots.begin( ); it != this->m_pending_shots.end( ); ++it )
+			auto latest_impact_sequence{ 0ull };
+
+			// A player_hurt normally follows the bullet_impact that caused it.
+			// Correlate by event chronology only: expected hitgroup, expected
+			// damage and geometry are outcomes to diagnose, never identity keys.
+			for ( auto it = this->m_pending_shots.begin( ); hitgroup > 0 && it != this->m_pending_shots.end( ); ++it )
 			{
-				if ( it->victim_pawn != victim_pawn || it->resolved )
+				if ( it->resolved || !it->impact_confirmed
+					|| ( it->ragebot && it->victim_pawn != victim_pawn ) )
 				{
 					continue;
 				}
 
-				if ( matched_shot == this->m_pending_shots.end( ) ||
-					( it->impact_confirmed && ( !matched_shot->impact_confirmed || it->impact_time > matched_shot->impact_time ) ) )
+				if ( it->impact_event_sequence > latest_impact_sequence )
 				{
+					latest_impact_sequence = it->impact_event_sequence;
 					matched_shot = it;
+				}
+			}
+
+			// A newer explicit weapon_fire is a hard correlation boundary. An
+			// older impact (including a non-Rage sentinel) must not cross it and
+			// consume a hurt that can belong to the active shot. A non-Rage
+			// active sentinel deliberately has no target and consumes the hurt
+			// without confirming any Rage shot.
+			if ( hitgroup > 0 )
+			{
+				for ( auto it = this->m_pending_shots.begin( ); it != this->m_pending_shots.end( ); ++it )
+				{
+					if ( it->sequence == this->m_active_fire_sequence && !it->resolved && it->fire_confirmed
+						&& ( !it->ragebot || it->victim_pawn == victim_pawn ) )
+					{
+						const auto no_impact_candidate = matched_shot == this->m_pending_shots.end( );
+						const auto crosses_newer_fire = !no_impact_candidate && matched_shot != it
+							&& it->sequence > matched_shot->sequence
+							&& it->fire_time >= matched_shot->impact_time;
+						if ( no_impact_candidate || crosses_newer_fire ) matched_shot = it;
+						break;
+					}
+				}
+			}
+
+			// Some event streams deliver player_hurt before bullet_impact. In
+			// that case use the oldest server-confirmed fire for this victim;
+			// the retained hit tombstone will absorb its late impact.
+			if ( hitgroup > 0 && matched_shot == this->m_pending_shots.end( ) )
+			{
+				for ( auto it = this->m_pending_shots.begin( ); it != this->m_pending_shots.end( ); ++it )
+				{
+					if ( it->ragebot && it->victim_pawn == victim_pawn && !it->resolved && it->fire_confirmed )
+					{
+						matched_shot = it;
+						break;
+					}
+				}
+			}
+
+			if ( hitgroup > 0 && matched_shot == this->m_pending_shots.end( ) )
+			{
+				for ( auto it = this->m_pending_shots.begin( ); it != this->m_pending_shots.end( ); ++it )
+				{
+					if ( it->ragebot && it->victim_pawn == victim_pawn && !it->resolved && it->committed )
+					{
+						matched_shot = it;
+						break;
+					}
 				}
 			}
 
 			if ( matched_shot != this->m_pending_shots.end( ) )
 			{
-				expected_hitgroup = matched_shot->hitgroup;
-				was_aimbot = true;
 				weapon_type = matched_shot->weapon_type;
-				expected_damage = matched_shot->damage;
-				backtrack_ticks = std::max( matched_shot->stamp_tick - matched_shot->tick, 0 );
-				aim_position = matched_shot->aim_position;
-				matched_shot->resolved = true;
-
-				// Seed-mode hit confirmation feeds the seed-sync verdict.
-				if ( matched_shot->seed_mode )
+				if ( matched_shot->impact_confirmed )
 				{
-					features::combat::g_shared.note_seed_shot( true );
+					impact_pos = matched_shot->impact_position;
 				}
+				matched_shot->committed = true;
+				if ( !matched_shot->fire_confirmed ) matched_shot->fire_time = current_time;
+				matched_shot->fire_confirmed = true;
+				matched_shot->hurt_confirmed = true;
+				matched_shot->resolved = true;
+				matched_shot->resolved_time = current_time;
 
-				if ( expected_hitgroup > 0 && hitgroup != expected_hitgroup )
+				if ( matched_shot->ragebot )
 				{
-					mismatch_reason = this->classify_shot_deviation( *matched_shot );
+					expected_hitgroup = matched_shot->hitgroup;
+					was_aimbot = true;
+					expected_damage = matched_shot->damage;
+					backtrack_ticks = std::max( matched_shot->stamp_tick - matched_shot->tick, 0 );
+					aim_position = matched_shot->aim_position;
+
+					// Seed-mode hit confirmation feeds the seed-sync verdict.
+					if ( matched_shot->seed_mode )
+					{
+						features::combat::g_shared.note_seed_shot( true );
+					}
+
+					if ( expected_hitgroup > 0 && hitgroup != expected_hitgroup )
+					{
+						mismatch_reason = this->miss_reason_label( this->analyze_shot( *matched_shot ).reason );
+					}
 				}
 			}
 		}
 
-		if ( !was_aimbot )
+		if ( !was_aimbot && weapon_type == 0 )
 		{
 			if ( local.pawn )
 			{
@@ -798,11 +1323,7 @@ namespace features::misc {
 			return "unknown";
 		}
 
-		auto name = memory::read_string( name_ptr, 64 );
-
-		std::transform( name.begin( ), name.end( ), name.begin( ), ::tolower );
-
-		return name;
+		return memory::read_string( name_ptr, 64 );
 	}
 
 	std::string impacts::get_player_name_from_pawn( std::uintptr_t pawn )
@@ -1009,8 +1530,6 @@ namespace features::misc {
 		const auto current_time = memory::read<float>( global_vars + 0x30 );
 		const auto& cfg = settings::g_misc.m_impacts;
 
-		std::unique_lock lock( this->m_mtx );
-
 		log entry{};
 		entry.name = this->get_player_name( data.victim );
 		entry.damage = data.damage;
@@ -1090,6 +1609,7 @@ namespace features::misc {
 
 		if ( cfg.hit_log.value )
 		{
+			std::unique_lock lock( this->m_mtx );
 			this->m_logs.insert( this->m_logs.begin( ), std::move( entry ) );
 
 			if ( this->m_logs.size( ) > 5 )
@@ -1100,56 +1620,89 @@ namespace features::misc {
 
 	}
 
-	void impacts::add_miss_log( const shot_record& shot, const char* reason )
+	void impacts::add_miss_log( const shot_record& shot, const miss_analysis& analysis )
 	{
+		if ( !shot.ragebot )
+		{
+			return;
+		}
+
 		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
 		const auto current_time = memory::read<float>( global_vars + 0x30 );
 		const auto& cfg = settings::g_misc.m_impacts;
 
-		const auto name = this->get_player_name_from_pawn( shot.victim_pawn );
+		const auto name = shot.target_name.empty( ) ? std::string{ "unknown" } : shot.target_name;
+		const auto console_name = detail::sanitize_console_field( name );
+		const auto chat_name = detail::escape_chat_text( name );
 		const auto group = systems::g_hitboxes.hitgroup_to_name( shot.hitgroup );
+		const auto reason_code = this->miss_reason_code( analysis.reason );
+		const auto reason_label = this->miss_reason_label( analysis.reason );
 
 		if ( cfg.console_log.value || cfg.chat_log.value )
 		{
-			std::string plain_msg{};
-			std::string chat_msg{};
-
-			if ( shot.weapon_type == cstypes::weapon_type::knife || shot.weapon_type == cstypes::weapon_type::taser )
-			{
-				if ( shot.weapon_type == cstypes::weapon_type::knife )
-				{
-					plain_msg = std::format( "刀未命中 {}（延迟）", name );
-					chat_msg = detail::chat_miss( std::format( "刀未命中 {}（延迟）", name ) );
-				}
-				else
-				{
-					plain_msg = std::format( "电击未命中 {}（目标移动/偏差）", name );
-					chat_msg = detail::chat_miss( std::format( "电击未命中 {}（目标移动/偏差）", name ) );
-				}
-			}
-			else if ( shot.forced )
-			{
-				plain_msg = std::format( "未命中 {}（强制射击）", name );
-				chat_msg = detail::chat_miss( std::format( "未命中 {}（强制射击）", name ) );
-			}
-			else
-			{
-				// Short format: player, hitgroup and the classified cause.
-				// The raw diagnostics (deviation, distance, speed,
-				// backtrack depth) stay in the on-screen miss log list.
-				plain_msg = std::format( "未命中 {}，目标 {}（{}）", name, group, reason );
-				chat_msg = detail::chat_miss( std::format( "未命中 {}，目标 {}（{}）", name, group, reason ) );
-			}
-
+			pending_miss_output output{};
 			if ( cfg.console_log.value )
 			{
-				logging::console::print_severity( 3, xs( "{}" ), plain_msg );
+				std::string flags{};
+				const auto append_flag = [ & ]( std::string_view flag, bool enabled )
+				{
+					if ( !enabled ) return;
+					if ( !flags.empty( ) ) flags += ',';
+					flags += flag;
+				};
+				append_flag( "dt", shot.dt );
+				append_flag( "forced", shot.forced );
+				append_flag( "extrapolated", shot.extrapolated );
+				append_flag( "penetrated", shot.penetrated );
+				append_flag( "seed", shot.seed_mode );
+				append_flag( "target_dead", shot.target_dead_at_resolution );
+				if ( flags.empty( ) ) flags = "none";
+
+				const auto fire_inaccuracy = shot.inaccuracy_confirmed
+					? std::format( "{:.6f}", shot.server_inaccuracy ) : std::string{ "n/a" };
+				const auto committed_at = shot.committed_time > 0.0f ? shot.committed_time : shot.time;
+				const auto age_ms = std::max( current_time - committed_at, 0.0f ) * 1000.0f;
+				const auto shot_id = shot.command_number >= 0
+					? std::format( "S{}-C{}-0", shot.session_epoch, shot.command_number )
+					: std::format( "S{}-Q{}", shot.session_epoch, shot.sequence );
+
+				output.console_message = std::format(
+					"[velocity][ragebot miss] id={} seq={} target=\"{}\" target_pawn=0x{:X} controller_handle=0x{:X} "
+					"weapon={} weapon_type={} reason={} label=\"{}\" confidence={} cmd={} record_tick={} stamp_tick={} bt={} "
+					"expected_hg={} expected_dmg={:.1f} target_hp={} hc={:.1f}% flags={} pred_inacc={:.6f} fire_inacc={} spread={:.6f} "
+					"shoot={} server_shoot={} origin_delta={} aim_angle={} aim={} impact_count={} impact_seq={} impact={} angular={} cone={} "
+					"impact_dist={} target_dist={} impact_hb={} ray_hb={} ideal_ray_hb={} target_velocity={} target_speed={:.2f} "
+					"evidence=committed:{},fire:{},inaccuracy:{},shootpos:{},impact:{},hurt:{} age_ms={:.0f}",
+					shot_id, shot.sequence, console_name, shot.victim_pawn, shot.victim_controller_handle,
+					shot.weapon_id, shot.weapon_type, reason_code, reason_label, this->miss_confidence_name( analysis.confidence ),
+					shot.command_number, shot.tick, shot.stamp_tick, std::max( shot.stamp_tick - shot.tick, 0 ), group,
+					shot.damage, shot.target_health, shot.hitchance * 100.0f, flags, shot.predicted_inaccuracy, fire_inaccuracy,
+					shot.predicted_spread, detail::format_vector( shot.shoot_position ),
+					detail::format_vector( shot.server_shoot_position, shot.server_shoot_position_confirmed ),
+					detail::format_metric( analysis.shoot_origin_delta, "u" ), detail::format_vector( shot.aim_angle ),
+					detail::format_vector( shot.aim_position ), shot.impact_count, shot.impact_event_sequence,
+					detail::format_vector( shot.impact_position, shot.impact_confirmed ),
+					detail::format_metric( analysis.angular_deviation_deg, "deg" ), detail::format_metric( analysis.spread_cone_deg, "deg" ),
+					detail::format_metric( analysis.impact_distance, "u" ), detail::format_metric( analysis.target_distance, "u" ),
+					detail::format_metric( analysis.impact_to_hitbox, "u" ), detail::format_metric( analysis.impact_ray_to_hitbox, "u" ),
+					detail::format_metric( analysis.ideal_ray_to_hitbox, "u" ), detail::format_vector( shot.target_velocity ),
+					shot.target_velocity.length_2d( ), static_cast< int >( shot.committed ), static_cast< int >( shot.fire_confirmed ),
+					static_cast< int >( shot.inaccuracy_confirmed ), static_cast< int >( shot.server_shoot_position_confirmed ),
+					static_cast< int >( shot.impact_confirmed ), static_cast< int >( shot.hurt_confirmed ), age_ms );
 			}
 
 			if ( cfg.chat_log.value )
 			{
-				detail::chat_print_velocity( chat_msg.c_str( ) );
+				const auto short_text = analysis.reason == miss_reason::server_rejected
+					? std::format( "空枪 {}（{}）", chat_name, reason_label )
+					: std::format( "未命中 {} [{}]：{}{}", chat_name, detail::escape_chat_text( group ), reason_label,
+						shot.forced ? "（强制）" : "" );
+				output.chat_message = detail::chat_miss( short_text );
+				output.chat_next_attempt_at = std::chrono::steady_clock::now( );
+				output.chat_expires_at = output.chat_next_attempt_at + std::chrono::seconds( 2 );
 			}
+
+			this->m_pending_miss_outputs.push_back( std::move( output ) );
 		}
 
 		if ( !cfg.miss_log.value )
@@ -1159,16 +1712,8 @@ namespace features::misc {
 
 		log entry{};
 		entry.name = name;
-
-		if ( shot.forced )
-		{
-			entry.reason = "强制射击";
-			entry.hitgroup = std::format( "（强制命中率 {:.0f}%）", shot.hitchance * 100.0f );
-		}
-		else
-		{
-			entry.reason = reason;
-		}
+		entry.reason = reason_label;
+		entry.hitgroup = shot.forced ? std::format( "({}，强制)", group ) : std::format( "({})", group );
 
 		entry.damage = 0;
 		entry.health = -1;
@@ -1192,138 +1737,169 @@ namespace features::misc {
 
 	}
 
+	void impacts::flush_miss_outputs( )
+	{
+		std::vector<pending_miss_output> outputs{};
+		{
+			std::unique_lock lock( this->m_mtx );
+			outputs.swap( this->m_pending_miss_outputs );
+		}
+
+		const auto now = std::chrono::steady_clock::now( );
+		std::vector<pending_miss_output> retries{};
+
+		for ( auto& output : outputs )
+		{
+			if ( !output.console_message.empty( ) )
+			{
+				logging::console::print_severity( 3, xs( "{}" ), output.console_message );
+			}
+
+			if ( !output.chat_message.empty( ) )
+			{
+				if ( now < output.chat_next_attempt_at )
+				{
+					retries.push_back( std::move( output ) );
+				}
+				else if ( !detail::chat_print_velocity( output.chat_message.c_str( ) ) && now < output.chat_expires_at )
+				{
+					output.console_message.clear( );
+					output.chat_next_attempt_at = now + std::chrono::milliseconds( 100 );
+					retries.push_back( std::move( output ) );
+				}
+			}
+		}
+
+		if ( !retries.empty( ) )
+		{
+			std::unique_lock lock( this->m_mtx );
+			for ( auto& retry : retries )
+			{
+				this->m_pending_miss_outputs.push_back( std::move( retry ) );
+			}
+		}
+	}
+
 	void impacts::check_misses( )
 	{
 		const auto global_vars = memory::read<std::uintptr_t>( addresses::globals::global_vars );
 		const auto current_time = memory::read<float>( global_vars + 0x30 );
+		auto latency{ 0.0f };
+		if ( const auto net_channel = memory::call<std::uintptr_t>( PATTERN( patterns::get_net_channel ), 0, 0 ) )
+		{
+			const auto measured = memory::call_vfunc<float>( net_channel, 10, 0 );
+			if ( std::isfinite( measured ) && measured > 0.0f && measured < 1.0f )
+			{
+				latency = measured;
+			}
+		}
 
-		constexpr auto hurt_grace_period{ 0.35f };
-		constexpr auto absolute_timeout{ 1.0f };
-
+		const auto hurt_grace_period = std::clamp( 0.35f + latency * 1.5f, 0.35f, 1.5f );
+		const auto absolute_timeout = std::clamp( 1.0f + latency * 2.0f, 1.0f, 3.0f );
+		constexpr auto uncommitted_timeout{ 0.5f };
+		constexpr auto hit_tombstone_time{ 1.0f };
+		constexpr auto miss_finalization_delay{ 0.5f };
 		const auto& cfg = settings::g_misc.m_impacts;
+		const auto wants_output = cfg.miss_log.value || cfg.console_log.value || cfg.chat_log.value;
+		const auto erase_shot = [ & ]( auto it )
+		{
+			if ( it->sequence == this->m_active_fire_sequence )
+			{
+				this->m_active_fire_sequence = 0;
+			}
+			return this->m_pending_shots.erase( it );
+		};
 
 		for ( auto it = this->m_pending_shots.begin( ); it != this->m_pending_shots.end( ); )
 		{
 			if ( it->resolved )
 			{
-				it = this->m_pending_shots.erase( it );
-				continue;
-			}
-
-			const auto elapsed = current_time - it->time;
-			const auto impact_elapsed = it->impact_confirmed ? ( current_time - it->impact_time ) : 0.0f;
-			const auto is_stale = it->impact_confirmed && impact_elapsed > hurt_grace_period;
-			const auto is_expired = elapsed > absolute_timeout;
-
-			if ( is_stale || is_expired )
-			{
-				// A predicted trigger command is not necessarily a shot (notably
-				// while cocking the R8). Discard it unless the server fire path or
-				// a bullet impact confirms that a round was emitted.
-				if ( !it->server_confirmed && !it->impact_confirmed )
+				if ( current_time - it->resolved_time <= hit_tombstone_time )
 				{
-					// Neither the server fire callback nor a bullet impact
-					// confirmed the round (pattern drift / missed event / the
-					// shot landed outside the confirm window). fire_gun only
-					// calls on_boom after a real fire decision, so the round
-					// was emitted - record it instead of silently dropping the
-					// log (the old build's silent erase made every such miss
-					// invisible, and no-spread whiffs are exactly the shots
-					// the user wants surfaced).
-					it->resolved = true;
-
-					if ( cfg.miss_log.value )
-					{
-						const auto local = systems::g_local.get( );
-						const auto local_dead = !local.is_alive
-							|| ( local.pawn && memory::read<int>( local.pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) ) <= 0 );
-
-						if ( !local_dead )
-						{
-							// Double tap: a rejected pair attempt produces a
-							// shot on consecutive ticks - one entry per 0.5s
-							// keeps the log readable.
-							if ( it->dt )
-							{
-								if ( current_time - this->m_last_dt_empty_log > 0.5f )
-								{
-									this->m_last_dt_empty_log = current_time;
-									this->add_miss_log( *it, "服务器未确认空枪" );
-								}
-							}
-							else
-							{
-								this->add_miss_log( *it, "未知空枪" );
-							}
-						}
-					}
-
-					it = this->m_pending_shots.erase( it );
+					++it;
 					continue;
 				}
 
-				it->resolved = true;
+				it = erase_shot( it );
+				continue;
+			}
 
-				// Seed-mode miss feeds the seed-sync verdict: a predicted
-				// seed that keeps scattering off the body means the server
-				// blocks seed sync and the gate should be dropped.
-				if ( it->seed_mode )
+			// Manual/legit sentinels only occupy the causal event timeline.
+			// They are never analyzed or emitted as Ragebot misses.
+			if ( !it->ragebot )
+			{
+				const auto evidence_time = it->impact_confirmed ? it->impact_time
+					: ( it->fire_confirmed && it->fire_time > 0.0f ? it->fire_time : it->committed_time );
+				const auto evidence_timeout = it->impact_confirmed ? hurt_grace_period + miss_finalization_delay : absolute_timeout;
+				if ( current_time - evidence_time > evidence_timeout )
+				{
+					it = erase_shot( it );
+					continue;
+				}
+
+				++it;
+				continue;
+			}
+
+			// Do not print a miss at the first timeout edge. Keep the shot
+			// matchable for one final bounded window so a reordered/late hurt
+			// cannot produce contradictory "miss + hit" output for one shot.
+			if ( it->miss_pending )
+			{
+				if ( current_time - it->resolved_time <= miss_finalization_delay )
+				{
+					++it;
+					continue;
+				}
+
+				if ( it->seed_mode && it->impact_confirmed )
 				{
 					features::combat::g_shared.note_seed_shot( false );
 				}
 
-				if ( cfg.miss_log.value )
+				const auto analysis = this->analyze_shot( *it );
+				const auto victim_gone = it->victim_pawn && ( !systems::g_entities.exists( it->victim_pawn )
+					|| memory::read<int>( it->victim_pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) ) <= 0 );
+				it->target_dead_at_resolution = victim_gone;
+
+				if ( wants_output )
 				{
-					// The victim is already dead: the shot that finished the
-					// target (or the burst that did) landed - hurt/impact
-					// confirmations become unreliable post-mortem, so a shot
-					// at a dead target is never a miss.
-					const auto victim_dead = it->victim_pawn
-						&& ( !systems::g_entities.exists( it->victim_pawn )
-							|| memory::read<int>( it->victim_pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) ) <= 0 );
-
-					if ( victim_dead )
-					{
-						it = this->m_pending_shots.erase( it );
-						continue;
-					}
-
-					const char* reason;
-
-					// If the local player is dead the shot very likely never
-					// left the barrel (interrupted by the kill) - classify it
-					// as such instead of blaming the aim.
-					const auto local = systems::g_local.get( );
-					const auto local_dead = !local.is_alive
-						|| ( local.pawn && memory::read<int>( local.pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) ) <= 0 );
-
-					if ( local_dead )
-					{
-						reason = "本地玩家已死亡";
-					}
-					else if ( it->forced )
-					{
-						reason = "强制射击";
-					}
-					else if ( !it->impact_confirmed )
-					{
-						// No impact point and no other classification could be
-						// derived - a bare whiff with an unknown cause.
-						reason = "未知空枪";
-					}
-					else
-					{
-						reason = this->classify_shot_deviation( *it );
-					}
-
-					this->add_miss_log( *it, reason );
+					this->add_miss_log( *it, analysis );
 				}
 
-				it = this->m_pending_shots.erase( it );
+				it = erase_shot( it );
 				continue;
 			}
 
+			const auto elapsed = current_time - it->time;
+			if ( !it->committed && !it->fire_confirmed && !it->impact_confirmed )
+			{
+				if ( elapsed > uncommitted_timeout )
+				{
+					it = erase_shot( it );
+					continue;
+				}
+
+				++it;
+				continue;
+			}
+
+			const auto committed_at = it->committed_time > 0.0f ? it->committed_time : it->time;
+			const auto committed_elapsed = current_time - committed_at;
+			const auto ready_to_resolve = it->impact_confirmed
+				? current_time - it->impact_time > hurt_grace_period
+				: committed_elapsed > absolute_timeout;
+
+			if ( !ready_to_resolve )
+			{
+				++it;
+				continue;
+			}
+
+			it->miss_pending = true;
+			it->resolved_time = current_time;
 			++it;
+
 		}
 	}
 
@@ -1463,7 +2039,6 @@ namespace features::misc {
 	{
 		std::unique_lock lock( this->m_mtx );
 
-		const auto& cfg = settings::g_misc.m_impacts;
 		const auto& s = xui::ctx( ).style;
 
 		constexpr auto fade_ratio{ 0.8f };

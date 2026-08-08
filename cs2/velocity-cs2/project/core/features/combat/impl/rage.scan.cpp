@@ -11,7 +11,7 @@
 // Ragebot target scanning and evaluation: per-player hitbox scans,
 // hitchance evaluation and best-target selection, split out of rage.cpp.
 namespace features::combat {
-	std::vector<rage::scan_hit> rage::scan_players( const math::vector3& eye, float inaccuracy, const aim_context& ctx, std::vector<candidate>& candidates, const systems::local::snapshot& local ) const
+	std::vector<rage::scan_hit> rage::scan_players( const math::vector3& eye, float inaccuracy, const aim_context& ctx, std::vector<candidate>& candidates, const systems::local::snapshot& local, int max_traces ) const
 	{
 		diag::set_exception_phase( "rage: scan" );
 
@@ -23,7 +23,15 @@ namespace features::combat {
 		// scan runs hundreds of them per tick and the frame time spikes.
 		// The budget caps the total per scan pass - full scans for a few
 		// targets, and a fixed upper bound for crowded servers.
-		std::atomic<int> trace_budget{ k_max_scan_traces };
+		std::atomic<int> trace_budget{ max_traces };
+
+		// Fair-share slice: without it the candidates that start first
+		// would drain the shared budget and the last targets on a
+		// crowded server would never get scanned at all (aim drops
+		// targets under load). Each candidate gets its own slice; the
+		// global budget still caps the total, so the worst-case cost
+		// is unchanged while every target keeps a chance to be hit.
+		const auto share = std::max( max_traces / std::max( candidate_count, 1 ), 48 );
 
 		const auto scan_range = [ & ]( int begin, int end )
 			{
@@ -33,14 +41,21 @@ namespace features::combat {
 					auto& candidate_hits = per_candidate[ ci ];
 					candidate_hits.reserve( 24 );
 
+					auto local_budget = share;
+
 					for ( auto ri = 0; ri < cand.record_count; ++ri )
 					{
+						if ( local_budget <= 0 )
+						{
+							break;
+						}
+
 						if ( !cand.records[ ri ] || !cand.records[ ri ]->valid )
 						{
 							continue;
 						}
 
-						auto hits = this->scan_player( eye, inaccuracy, ctx, cand, cand.records[ ri ], local, trace_budget );
+						auto hits = this->scan_player( eye, inaccuracy, ctx, cand, cand.records[ ri ], local, trace_budget, local_budget );
 						const auto has_direct_hit = std::any_of( hits.begin( ), hits.end( ), [ ]( const scan_hit& hit )
 							{
 								return !hit.penetrated;
@@ -101,7 +116,7 @@ namespace features::combat {
 		return flat;
 	}
 
-	std::vector<rage::scan_hit> rage::scan_player( const math::vector3& eye, float inaccuracy, const aim_context& ctx, candidate& cand, shared::lagcomp::record* record, const systems::local::snapshot& local, std::atomic<int>& trace_budget ) const
+	std::vector<rage::scan_hit> rage::scan_player( const math::vector3& eye, float inaccuracy, const aim_context& ctx, candidate& cand, shared::lagcomp::record* record, const systems::local::snapshot& local, std::atomic<int>& trace_budget, int& local_budget ) const
 	{
 		const auto& skeleton = record->bones;
 		const auto& hitbox_set = cand.hitboxes;
@@ -219,13 +234,15 @@ namespace features::combat {
 
 					shared::penetration::result pen{};
 					// Consume one trace from the shared budget before the
-					// engine call - the hottest per-point cost.
-					if ( trace_budget.fetch_sub( 1, std::memory_order_relaxed ) <= 0 )
+					// engine call - the hottest per-point cost. The local
+					// slice stops this candidate once its fair share is
+					// spent so crowded servers cannot starve later targets.
+					if ( trace_budget.fetch_sub( 1, std::memory_order_relaxed ) <= 0 || --local_budget <= 0 )
 					{
 						return false;
 					}
 
-					if ( !g_shared.pen( ).run( eye, position, pen_ctx, local.pawn, local.team, pen ) )
+					if ( !g_shared.pen( ).run( eye, position, pen_ctx, local.pawn, local.team, pen, hitbox_index ) )
 					{
 						return false;
 					}
@@ -450,10 +467,10 @@ namespace features::combat {
 				// sampling noise (that flutter read as hesitant firing).
 				const auto dist = ( h.source_eye.position - h.position ).length( );
 				auto samples = dist < 900.0f ? 256 : dist < 2200.0f ? 256 : 512;
-				hc = g_shared.calculate_hitchance( h.source_eye.position, h.aim_angle, h.hitbox, bone, eval_inaccuracy, aim_ctx.spread, samples );
+				hc = g_shared.calculate_hitchance( h.source_eye.position, h.aim_angle, h.hitbox, bone, eval_inaccuracy, aim_ctx.spread, samples, needed_hc - 0.01f );
 				if ( std::fabsf( hc - needed_hc ) < 0.05f && samples < 512 )
 				{
-					hc = g_shared.calculate_hitchance( h.source_eye.position, h.aim_angle, h.hitbox, bone, eval_inaccuracy, aim_ctx.spread, 512 );
+					hc = g_shared.calculate_hitchance( h.source_eye.position, h.aim_angle, h.hitbox, bone, eval_inaccuracy, aim_ctx.spread, 512, needed_hc - 0.01f );
 				}
 			}
 			const auto hp = static_cast< float >( h.health );

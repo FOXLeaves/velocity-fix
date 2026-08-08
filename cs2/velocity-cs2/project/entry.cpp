@@ -471,7 +471,7 @@ namespace {
 		features::world::g_scene.discover_skyboxes( );
 
 		diag::step( "stage: movement threads" );
-		features::movement::g_bhop.start_thread( );
+
 
 		diag::step( "stage: done" );
 		return 1;

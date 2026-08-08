@@ -122,15 +122,21 @@ namespace features::misc {
 		void on_render( xdraw::draw_list& draw_list );
 		void on_report_hit( std::uintptr_t msg );
 		void on_player_hurt( std::uintptr_t event );
+		void on_weapon_fire( std::uintptr_t event );
 		void on_bullet_impact( std::uintptr_t event );
 		void on_base_fire_guns_get_inaccuracy( std::uintptr_t weapon, float inaccuracy );
 		void on_get_interpolated_shoot_position( std::uintptr_t weapon_services, float* out );
+		void on_shot_committed( std::intptr_t command_number );
+		void on_command_finalized( std::intptr_t command_number, bool primary_attack_edge, bool primary_attack_ready );
+		void on_round_start( );
 		// Everything the impact/miss tracker needs to know about a shot the
 		// ragebot fired. Packed so the callback signature stays stable.
 		struct shot_parameters
 		{
 			std::uintptr_t victim_pawn{};
+			std::intptr_t command_number{ -1 };
 			int hitgroup{};
+			int target_health{};
 			float damage{};
 			float hitchance{};
 			float inaccuracy{};
@@ -145,6 +151,7 @@ namespace features::misc {
 			std::array<systems::bones::data, 27> skeleton{};
 			bool forced{};
 			bool extrapolated{};
+			bool penetrated{};
 			bool seed_mode{};
 			// Double tap shot: an unconfirmed one is an "empty shot" (the
 			// server rejected the claim / no round left the barrel) and is
@@ -159,10 +166,40 @@ namespace features::misc {
 		void play_custom_sound( std::string_view filename, float volume ) const;
 
 	private:
+		enum class miss_reason : std::uint8_t
+		{
+			unknown,
+			server_rejected,
+			impact_missing,
+			shoot_origin_mismatch,
+			prediction_mismatch,
+			trajectory_mismatch,
+			occlusion,
+			penetration_failed,
+			spread,
+			lag_compensation,
+			extrapolation_mismatch,
+			record_mismatch,
+			tracker_overflow
+		};
+
+		enum class miss_confidence : std::uint8_t
+		{
+			low,
+			medium,
+			high
+		};
+
 		struct shot_record
 		{
+			std::uint64_t sequence{};
+			std::uint32_t session_epoch{};
+			std::intptr_t command_number{ -1 };
 			std::uintptr_t victim_pawn{};
+			std::uint32_t victim_controller_handle{};
+			std::string target_name{};
 			int hitgroup{};
+			int target_health{};
 			float damage{};
 			float hitchance{};
 			float predicted_inaccuracy{};
@@ -179,19 +216,54 @@ namespace features::misc {
 			// client current_tick which carries the ~24t time-base offset).
 			int stamp_tick{};
 			float time{};
+			float committed_time{};
+			float fire_time{};
 			float impact_time{};
+			float resolved_time{};
 			std::array<systems::bones::data, 27> skeleton{};
+			bool committed{};
+			bool ragebot{ true };
 			bool resolved{};
-			bool server_confirmed{};
+			bool miss_pending{};
+			bool fire_confirmed{};
+			bool inaccuracy_confirmed{};
 			bool impact_confirmed{};
+			bool hurt_confirmed{};
 			math::vector3 server_shoot_position{};
 			bool server_shoot_position_confirmed{};
+			std::uint32_t impact_count{};
+			std::uint64_t impact_event_sequence{};
 			math::vector3 target_velocity{};
 			bool forced{};
 			bool extrapolated{};
+			bool penetrated{};
 			bool seed_mode{};
 			bool dt{};
+			bool target_dead_at_resolution{};
 			std::uint32_t weapon_type{};
+			std::uint16_t weapon_id{};
+		};
+
+		struct miss_analysis
+		{
+			miss_reason reason{ miss_reason::unknown };
+			miss_confidence confidence{ miss_confidence::low };
+			float angular_deviation_deg{ -1.0f };
+			float spread_cone_deg{ -1.0f };
+			float impact_to_hitbox{ -1.0f };
+			float impact_ray_to_hitbox{ -1.0f };
+			float ideal_ray_to_hitbox{ -1.0f };
+			float impact_distance{ -1.0f };
+			float target_distance{ -1.0f };
+			float shoot_origin_delta{ -1.0f };
+		};
+
+		struct pending_miss_output
+		{
+			std::string console_message{};
+			std::string chat_message{};
+			std::chrono::steady_clock::time_point chat_expires_at{};
+			std::chrono::steady_clock::time_point chat_next_attempt_at{};
 		};
 
 		struct hit_data
@@ -246,7 +318,10 @@ namespace features::misc {
 			float time{};
 		};
 
-		[[nodiscard]] const char* classify_shot_deviation( const shot_record& shot ) const;
+		[[nodiscard]] miss_analysis analyze_shot( const shot_record& shot ) const;
+		[[nodiscard]] static const char* miss_reason_code( miss_reason reason );
+		[[nodiscard]] static const char* miss_reason_label( miss_reason reason );
+		[[nodiscard]] static const char* miss_confidence_name( miss_confidence confidence );
 		[[nodiscard]] hit_data parse_event( std::uintptr_t event );
 		[[nodiscard]] std::string get_player_name( std::uintptr_t controller );
 		[[nodiscard]] std::string get_player_name_from_pawn( std::uintptr_t pawn );
@@ -254,8 +329,9 @@ namespace features::misc {
 		[[nodiscard]] float ray_distance_to_nearest_hitbox( const shot_record& shot, const math::vector3& direction ) const;
 
 		void add_hit_log( const hit_data& data );
-		void add_miss_log( const shot_record& shot, const char* reason );
+		void add_miss_log( const shot_record& shot, const miss_analysis& analysis );
 		void check_misses( );
+		void flush_miss_outputs( );
 
 		void render_hit_markers( xdraw::draw_list& draw_list, float time );
 		void render_logs( xdraw::draw_list& draw_list, float time );
@@ -273,13 +349,14 @@ namespace features::misc {
 		std::vector<log> m_logs{};
 		std::vector<pending_hit> m_pending_hits{};
 		std::vector<shot_record> m_pending_shots{};
+		std::vector<pending_miss_output> m_pending_miss_outputs{};
 		std::vector<bullet_impact> m_bullet_impacts{};
 		mutable std::mutex m_mtx{};
 
-		// Last time an unconfirmed DT shot was logged - throttles the
-		// "server rejected" empty-shot entries that arrive on consecutive
-		// ticks while double tap is active.
-		float m_last_dt_empty_log{ 0.0f };
+		std::uint64_t m_next_shot_sequence{ 1 };
+		std::uint64_t m_next_impact_event_sequence{ 1 };
+		std::uint64_t m_active_fire_sequence{};
+		std::uint32_t m_session_epoch{ 1 };
 
 		bool m_death_effect_loaded{};
 		bool m_bullet_impact_effect_loaded{};

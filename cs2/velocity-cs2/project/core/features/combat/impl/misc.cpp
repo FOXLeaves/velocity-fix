@@ -42,7 +42,16 @@ namespace features::combat {
 
 		const auto local = systems::g_local.get( );
 		const auto base = cmd->csgo_user_cmd.mutable_base( );
-		const auto view_angles = systems::g_input.get_view_angles( );
+		const auto command_angles = base ? base->viewangles( ) : nullptr;
+		if ( !base || !command_angles )
+		{
+			return;
+		}
+		const auto view_angles = math::vector3{
+			command_angles->x( ),
+			command_angles->y( ),
+			command_angles->z( )
+		};
 		const auto& ctx = g_shared.ctx( );
 
 		if ( cmd->buttons.value & cstypes::command_buttons::in_use )
@@ -74,52 +83,25 @@ namespace features::combat {
 
 		this->m_modified_angles = this->m_old_angles;
 		this->m_modified_angles.x = this->get_pitch( this->m_old_angles.x );
-		this->m_modified_angles.y = this->get_yaw( this->m_old_angles, local );
-
-		// Airborne AA switch (test-strafer assist): while a side-step is
-		// active the back mode accels correctly and the side-step stalls,
-		// so in the air the yaw temporarily flips back to the back heading
-		// and returns to the side-step on landing. Holding a grenade/throw
-		// disables the AA entirely in the air (real view) and restores it
-		// on landing.
-		const auto& prestate = systems::g_prediction.pre( );
-		if ( settings::g_movement.m_test_strafer.enabled.value && !( prestate.flags & cstypes::entity_flags::on_ground ) )
+		auto aa_yaw = this->get_yaw( this->m_old_angles, local );
+		const auto new_command = !this->m_jitter_command_valid
+			|| this->m_jitter_pawn != local.pawn
+			|| this->m_jitter_command_number != cmd->command_number;
+		if ( new_command )
 		{
-			if ( ctx.weapon_type == cstypes::weapon_type::grenade )
-			{
-				this->m_modified_angles = this->m_old_angles;
-			}
-			else
-			{
-				auto side = this->m_modified_angles.y - this->m_old_angles.y;
-				math::helpers::normalize_angle( side );
-				if ( side > 90.0f )
-				{
-					side -= 180.0f;
-				}
-				else if ( side < -90.0f )
-				{
-					side += 180.0f;
-				}
-
-				if ( std::fabsf( side ) > 30.0f )
-				{
-					this->m_modified_angles.y = this->m_old_angles.y + 180.0f;
-				}
-			}
-
-			math::helpers::normalize_angles( this->m_modified_angles );
+			this->m_jitter_command_number = cmd->command_number;
+			this->m_jitter_pawn = local.pawn;
+			this->m_command_jitter_tick = this->m_jitter_tick++;
+			this->m_jitter_command_valid = true;
 		}
+		this->apply_jitter( aa_yaw, this->m_command_jitter_tick, new_command );
+		this->m_modified_angles.y = aa_yaw;
 
 		math::helpers::normalize_angles( this->m_modified_angles );
 
 		base->mutable_viewangles( )->set_x( this->m_modified_angles.x );
 		base->mutable_viewangles( )->set_y( this->m_modified_angles.y );
 		base->mutable_viewangles( )->set_z( this->m_modified_angles.z );
-
-		this->m_should_correct = true;
-
-		this->correct_movement( cmd );
 	}
 
 	void misc::antiaim::on_render( xdraw::draw_list& draw_list ) const
@@ -241,6 +223,8 @@ namespace features::combat {
 			return 89.0f;
 		case settings::combat::antiaim::pitch_mode::up:
 			return -89.0f;
+		case settings::combat::antiaim::pitch_mode::custom:
+			return std::clamp( settings::g_combat.m_antiaim.pitch_value.value, -89.0f, 89.0f );
 		default:
 			return view_pitch;
 		}
@@ -248,7 +232,11 @@ namespace features::combat {
 
 	float misc::antiaim::get_yaw( const math::vector3& view_angles, const systems::local::snapshot& local )
 	{
-		if ( settings::g_combat.m_antiaim.yaw.value == settings::combat::antiaim::yaw_mode::real_view )
+		const auto& aa = settings::g_combat.m_antiaim;
+		const auto side_offset = std::clamp( aa.side_offset.value, 1.0f, 180.0f );
+		const auto yaw_adjust = std::clamp( aa.auto_yaw_adjust_amount.value, 0.0f, 180.0f );
+
+		if ( aa.yaw.value == settings::combat::antiaim::yaw_mode::real_view )
 		{
 			// Real-view facing: the yaw is the player's actual view
 			// direction rotated 180 degrees - always back to the real
@@ -258,23 +246,27 @@ namespace features::combat {
 
 			if ( this->m_yaw_side == -1 )
 			{
-				yaw -= 90.0f;
+				yaw -= side_offset;
 			}
 			else if ( this->m_yaw_side == 1 )
 			{
-				yaw += 90.0f;
+				yaw += side_offset;
 			}
 
-			if ( settings::g_combat.m_antiaim.auto_yaw_adjust.value )
+			if ( aa.auto_yaw_adjust.value )
 			{
-				yaw += 33.0f;
+				yaw += yaw_adjust;
 			}
 
 			this->m_indicator_yaw = yaw;
 			return yaw;
 		}
 
-		auto base_yaw_offset{ 180.0f };
+		// Back mode keeps the classic 180 deg offset; custom mode uses the
+		// dialed-in yaw_offset so testers can sweep every body angle.
+		const auto base_yaw_offset = aa.yaw.value == settings::combat::antiaim::yaw_mode::custom
+			? std::fmodf( aa.yaw_offset.value, 360.0f )
+			: 180.0f;
 
 		const auto view_yaw = view_angles.y;
 		auto base_yaw = view_yaw - base_yaw_offset;
@@ -470,11 +462,11 @@ namespace features::combat {
 		auto indicator = base_yaw;
 		if ( this->m_yaw_side == -1 )
 		{
-			indicator -= 90.0f;
+			indicator -= side_offset;
 		}
 		else if ( this->m_yaw_side == 1 )
 		{
-			indicator += 90.0f;
+			indicator += side_offset;
 		}
 
 		this->m_indicator_yaw = indicator;
@@ -482,247 +474,93 @@ namespace features::combat {
 		auto yaw = base_yaw;
 		if ( this->m_yaw_side == -1 )
 		{
-			yaw -= 90.0f;
+			yaw -= side_offset;
 		}
 		else if ( this->m_yaw_side == 1 )
 		{
-			yaw += 90.0f;
+			yaw += side_offset;
 		}
 
 		if (settings::g_combat.m_antiaim.auto_yaw_adjust.value)
-			yaw += 20.0f; // thx saphy
+			yaw += yaw_adjust; // thx saphy
+
+		math::helpers::normalize_angle( yaw );
 
 		return yaw;
 	}
 
-	void misc::antiaim::correct_movement( systems::input::usercmd* cmd )
+	void misc::antiaim::apply_jitter( float& yaw, std::uint32_t tick, bool advance_spin )
 	{
-		if ( !this->m_should_correct )
+		const auto& aa = settings::g_combat.m_antiaim;
+		if ( !aa.jitter.value || aa.jitter_mode.value == settings::combat::antiaim::jitter_mode::none )
 		{
 			return;
 		}
 
-		this->m_should_correct = false;
+		const auto amount = std::clamp( aa.jitter_amount.value, -180.0f, 180.0f );
 
-		const auto base = cmd->csgo_user_cmd.mutable_base( );
-		const auto forward_move = base->forwardmove( );
-		const auto side_move = base->leftmove( );
-
-		if ( forward_move == 0.0f && side_move == 0.0f )
+		// A zero swing means nothing moves - no mode (three-way included)
+		// may start swaying before the tester dials in a value. The old
+		// build let edge/three-way swing on the side-step angle alone,
+		// which made the body rock the moment the mode was picked.
+		if ( amount == 0.0f )
 		{
 			return;
 		}
 
-		// The engine view starts each tick at the anti-aim yaw and the
-		// test_strafer yaw deltas stack on top of it. Keeping the input in
-		// the real frame while the view sits at AA + deltas reverses the
-		// wish by the AA offset (back mode: walks backwards, no accel), so
-		// the input must be rotated into the AA frame - the 180 deg back
-		// mode then cancels and accels forward. With AA active the move
-		// direction is the AA movement direction.
-		const auto& prestate = systems::g_prediction.pre( );
-		const auto in_air = !( prestate.flags & cstypes::entity_flags::on_ground );
-
-		math::vector3 new_forward{}, new_left{};
-		math::helpers::angle_vectors_left( this->m_modified_angles, &new_forward, &new_left, nullptr );
-
-		math::vector3 old_forward{}, old_left{};
-		math::helpers::angle_vectors_left( this->m_old_angles, &old_forward, &old_left, nullptr );
-
-		new_forward.z = 0.0f; new_left.z = 0.0f;
-		old_forward.z = 0.0f; old_left.z = 0.0f;
-		new_forward.normalize( );
-		new_left.normalize( );
-		old_forward.normalize( );
-		old_left.normalize( );
-
-		const auto intent = old_forward * forward_move + old_left * -side_move;
-		const auto intent_len = intent.length( );
-
-		if ( intent_len == 0.0f )
+		const auto side = std::clamp( aa.side_offset.value, 1.0f, 180.0f );
+		switch ( aa.jitter_mode.value )
 		{
-			return;
-		}
-
-		const auto intent_dir = intent / intent_len;
-		const auto corrected_forward = new_forward.dot( intent_dir ) * intent_len;
-		const auto corrected_side = -new_left.dot( intent_dir ) * intent_len;
-
-		auto final_forward = std::clamp( corrected_forward, -1.0f, 1.0f );
-		auto final_side = std::clamp( corrected_side, -1.0f, 1.0f );
-
-		// Air only: a 90 deg side-step rotates forward inputs into a pure
-		// side move, which cannot accelerate in CS2 physics (wish is
-		// perpendicular to the velocity - dot product zero). Inject a
-		// forward component in the air; on the ground the rewritten move
-		// keys keep the walk straight.
-		if ( in_air && std::fabsf( final_forward ) < 0.3f && std::fabsf( final_side ) > 0.3f )
-		{
-			final_forward = final_side * 1.0f;
-		}
-
-		base->set_forwardmove( final_forward );
-		base->set_leftmove( final_side );
-
-		// Snapshot the raw command buttons before the rewrite below: the
-		// airstrafe / test_strafer derive their direction bookkeeping from
-		// these, and a 90 deg side-step rewrite (W -> moveleft) would
-		// otherwise mis-steer the bunnyhop accel by 90 deg.
-		this->m_raw_movement_buttons = cmd->buttons.value;
-
-		if ( systems::g_prediction.pre( ).flags & cstypes::entity_flags::on_ground )
-		{
-			auto buttons = cmd->buttons.value;
-			buttons &= ~static_cast< std::uintptr_t >( cstypes::command_buttons::in_forward | cstypes::command_buttons::in_back | cstypes::command_buttons::in_moveleft | cstypes::command_buttons::in_moveright );
-
-			if ( base->forwardmove( ) > 0.0f )
+		case settings::combat::antiaim::jitter_mode::center:
+			// Small sway around the base heading (half the dialed swing).
+			yaw += ( tick & 1 ) ? amount * 0.5f : -amount * 0.5f;
+			break;
+		case settings::combat::antiaim::jitter_mode::edge:
+			// Alternate between the two side-step edges, swaying around
+			// each by half the amount.
+			yaw += ( ( tick & 1 ) ? 1.0f : -1.0f ) * side;
+			yaw += ( tick & 1 ) ? amount * 0.5f : -amount * 0.5f;
+			break;
+		case settings::combat::antiaim::jitter_mode::full:
+			// Wide swing across the whole body range (the full dialed
+			// swing, up to ±180 deg).
+			yaw += ( tick & 1 ) ? amount : -amount;
+			break;
+		case settings::combat::antiaim::jitter_mode::three_way:
+			// Three-way cycle driven by the swing amount: left -> center
+			// -> right. The side-step angle no longer kicks the sway by
+			// itself, so the body stays still until a value is dialed in.
+			switch ( tick % 3 )
 			{
-				buttons |= cstypes::command_buttons::in_forward;
+			case 0: yaw -= amount; break;
+			case 1: break;
+			case 2: yaw += amount; break;
+			default: break;
 			}
-			else if ( base->forwardmove( ) < 0.0f )
+			break;
+		case settings::combat::antiaim::jitter_mode::spin:
+			// Continuous rotation (top-spin): the amount is the spin
+			// RATE in degrees per tick on a 64-tick baseline - positive
+			// spins one way, negative the other, magnitude is the speed.
+			// The offset ACCUMULATES across ticks (it never resets to the
+			// base heading) so the body keeps spinning. Normalized by
+			// tick interval so the rate is the same on 64 and 128 tick
+			// servers. No artificial cap - the slider is the speed.
+			// CreateMove may revisit the same command. Keep the phase bound to
+			// command_number so a rewrite cannot advance a high-speed spin twice.
+			if ( advance_spin )
 			{
-				buttons |= cstypes::command_buttons::in_back;
+				this->m_spin_accum = std::remainderf(
+					this->m_spin_accum + amount * ( 64.0f * cstypes::tick_interval ),
+					360.0f );
 			}
-
-			if ( base->leftmove( ) > 0.0f )
-			{
-				buttons |= cstypes::command_buttons::in_moveleft;
-			}
-			else if ( base->leftmove( ) < 0.0f )
-			{
-				buttons |= cstypes::command_buttons::in_moveright;
-			}
-
-			cmd->buttons.value = buttons;
+			yaw += this->m_spin_accum;
+			break;
+		default:
+			break;
 		}
 
-		// Re-level the history pitch only: a fake pitch makes the local
-		// movement pitch forward into the ground. The yaw stays on the
-		// command/AA heading - the strafer's subtick yaw deltas stack on
-		// top of it, so the body sways on the AA base.
-		const auto history_size = cmd->csgo_user_cmd.input_history_size( );
-		for ( auto i = 0; i < history_size; ++i )
-		{
-			auto entry = cmd->csgo_user_cmd.mutable_input_history( i );
-			if ( !entry )
-			{
-				continue;
-			}
-
-			if ( const auto angles = entry->mutable_view_angles( ) )
-			{
-				angles->set_x( 0.0f );
-			}
-		}
-	}
-
-	void misc::antiaim::rotate_move_to_aa( proto::base_usercmd_pb* base ) const
-	{
-		if ( !this->m_antiaim_active )
-		{
-			return;
-		}
-
-		const auto forward_move = base->forwardmove( );
-		const auto side_move = base->leftmove( );
-
-		if ( forward_move == 0.0f && side_move == 0.0f )
-		{
-			return;
-		}
-
-		// Same world-intent projection as correct_movement, so the move-key
-		// convention (leftmove > 0 = left) stays identical everywhere. A
-		// plain 2D Lua rotation assumes side > 0 = right and doubles the
-		// 90 deg side-step error into 180 deg - invisible under the 180 deg
-		// back mode (left/right symmetric), fatal for side-steps.
-		math::vector3 new_forward{}, new_left{};
-		math::helpers::angle_vectors_left( this->m_modified_angles, &new_forward, &new_left, nullptr );
-
-		math::vector3 old_forward{}, old_left{};
-		math::helpers::angle_vectors_left( this->m_old_angles, &old_forward, &old_left, nullptr );
-
-		new_forward.z = 0.0f; new_left.z = 0.0f;
-		old_forward.z = 0.0f; old_left.z = 0.0f;
-		new_forward.normalize( );
-		new_left.normalize( );
-		old_forward.normalize( );
-		old_left.normalize( );
-
-		const auto intent = old_forward * forward_move + old_left * -side_move;
-		const auto intent_len = intent.length( );
-
-		if ( intent_len == 0.0f )
-		{
-			return;
-		}
-
-		const auto intent_dir = intent / intent_len;
-		const auto corrected_forward = new_forward.dot( intent_dir ) * intent_len;
-		const auto corrected_side = -new_left.dot( intent_dir ) * intent_len;
-
-		auto final_forward = std::clamp( corrected_forward, -1.0f, 1.0f );
-		auto final_side = std::clamp( corrected_side, -1.0f, 1.0f );
-
-		// A 90 deg side-step rotates forward inputs into a pure side move,
-		// and the engine barely walks on side input alone while anti-aim
-		// locks the view (the A/D turn is overwritten every tick). Inject a
-		// forward component so W/S still move; the small direction bias is
-		// preferable to no movement at all.
-		if ( std::fabsf( final_forward ) < 0.3f && std::fabsf( final_side ) > 0.3f )
-		{
-			final_forward = final_side * 1.0f;
-		}
-
-		base->set_forwardmove( final_forward );
-		base->set_leftmove( final_side );
-	}
-
-	void misc::antiaim::unrotate_move_from_aa( proto::base_usercmd_pb* base ) const
-	{
-		if ( !this->m_antiaim_active )
-		{
-			return;
-		}
-
-		const auto forward_move = base->forwardmove( );
-		const auto side_move = base->leftmove( );
-
-		if ( forward_move == 0.0f && side_move == 0.0f )
-		{
-			return;
-		}
-
-		// Mirror of rotate_move_to_aa with the frames swapped: the input
-		// sits in the anti-aim (modified) frame, project its world intent
-		// back into the real (old) frame.
-		math::vector3 new_forward{}, new_left{};
-		math::helpers::angle_vectors_left( this->m_modified_angles, &new_forward, &new_left, nullptr );
-
-		math::vector3 old_forward{}, old_left{};
-		math::helpers::angle_vectors_left( this->m_old_angles, &old_forward, &old_left, nullptr );
-
-		new_forward.z = 0.0f; new_left.z = 0.0f;
-		old_forward.z = 0.0f; old_left.z = 0.0f;
-		new_forward.normalize( );
-		new_left.normalize( );
-		old_forward.normalize( );
-		old_left.normalize( );
-
-		const auto intent = new_forward * forward_move + new_left * -side_move;
-		const auto intent_len = intent.length( );
-
-		if ( intent_len == 0.0f )
-		{
-			return;
-		}
-
-		const auto intent_dir = intent / intent_len;
-		const auto corrected_forward = old_forward.dot( intent_dir ) * intent_len;
-		const auto corrected_side = -old_left.dot( intent_dir ) * intent_len;
-
-		base->set_forwardmove( std::clamp( corrected_forward, -1.0f, 1.0f ) );
-		base->set_leftmove( std::clamp( corrected_side, -1.0f, 1.0f ) );
+		math::helpers::normalize_angle( yaw );
 	}
 
 	bool misc::antiaim::is_near_ladder( std::uintptr_t local_pawn ) const
@@ -852,7 +690,7 @@ namespace features::combat {
 			else if ( distance < speed * 0.1f && speed > 15.0f )
 			{
 				const auto vel_angle = math::helpers::vector_to_angle( velocity * -1.0f );
-				const auto yaw_diff = math::helpers::deg_to_rad( base->viewangles( )->y( ) - vel_angle.y );
+				const auto yaw_diff = math::helpers::deg_to_rad( features::movement::g_movement_fix.source_yaw( ) - vel_angle.y );
 
 				base->set_forwardmove( std::cosf( yaw_diff ) );
 				base->set_leftmove( -std::sinf( yaw_diff ) );
@@ -884,7 +722,7 @@ namespace features::combat {
 			{
 				const auto diff = this->m_saved_origin - origin;
 				const auto angle_to_pos = math::helpers::vector_to_angle( diff );
-				const auto yaw_diff = math::helpers::deg_to_rad( base->viewangles( )->y( ) - angle_to_pos.y );
+				const auto yaw_diff = math::helpers::deg_to_rad( features::movement::g_movement_fix.source_yaw( ) - angle_to_pos.y );
 
 				base->set_forwardmove( std::cosf( yaw_diff ) );
 				base->set_leftmove( -std::sinf( yaw_diff ) );
@@ -1115,10 +953,11 @@ namespace features::combat {
 
 		const auto move_magnitude = std::clamp( speed / ctx.weapon_max_speed, 0.0f, 1.0f );
 
-		// Decompose with the command yaw, matching the old build: the
-		// auto-stop counter-move works correctly there, while decomposing
-		// with the real view yaw made the stop wander under anti-aim.
-		const auto yaw_rad = base->viewangles( )->y( ) * ( std::numbers::pi_v<float> / 180.0f );
+		// Decompose with the REAL view yaw: the global move fix rotates
+		// every system's output into the command (AA) frame at the end of
+		// create_move, so the stop counter-move must be written in the
+		// real frame here or it would be rotated a second time.
+		const auto yaw_rad = features::movement::g_movement_fix.source_yaw( ) * ( std::numbers::pi_v<float> / 180.0f );
 		const auto sy = std::sinf( yaw_rad );
 		const auto cy = std::cosf( yaw_rad );
 
@@ -1137,8 +976,9 @@ namespace features::combat {
 				step->set_button( 0 );
 				step->set_pressed( false );
 				step->set_when( 0.0f );
-				step->set_analog_forward_delta( forward_move - prestate.last_movement_impulses.x );
-				step->set_analog_left_delta( left_move - prestate.last_movement_impulses.y );
+				const auto& source_impulses = features::movement::g_movement_fix.source_impulses( );
+				step->set_analog_forward_delta( forward_move - source_impulses.x );
+				step->set_analog_left_delta( left_move - source_impulses.y );
 			}
 		}
 

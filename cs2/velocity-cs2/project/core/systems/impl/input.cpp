@@ -22,8 +22,6 @@ namespace systems {
 
 	void input::apply( )
 	{
-		const auto local = systems::g_local.get ();
-
 		if ( !this->m_current_cmd ) {
 			return;
 		}
@@ -31,36 +29,6 @@ namespace systems {
 		const auto base = this->m_current_cmd->csgo_user_cmd.mutable_base( );
 		if ( !base ) {
 			return;
-		}
-
-		auto has_move_subticks = [] (proto::base_usercmd_pb* base_cmd) {
-			// just use protobufs atp
-			for (size_t i = 0; i < base_cmd->subtick_moves_size (); i++) {
-				proto::subtick_move_step* step = base_cmd->mutable_subtick_moves (i);
-				if (step->m_has_bits.test (0x8) || step->m_has_bits.test (0x10))
-					return true;
-
-				if (step->m_has_bits.test (0x1))
-					return true;
-			}
-
-			return false;
-		};
-
-		// fix movement for ag2
-		diag::set_exception_phase( "input apply: subtick movement" );
-		if (!has_move_subticks (base)) {
-			if (const auto step = systems::g_input.acquire_subtick_step (base->mutable_subtick_moves ())) {
-
-				const auto movement_services = local.pawn ? memory::read<std::uintptr_t> (local.pawn + SCHEMA ("C_BasePlayerPawn", "m_pMovementServices"_hash)) : 0;
-				if (movement_services) {
-					step->set_button (0);
-					step->set_pressed (false);
-					step->set_when (0.0f);
-					step->set_analog_forward_delta (base->forwardmove () - memory::read<float> (movement_services + SCHEMA ("CPlayer_MovementServices", "m_flCmdForwardMove"_hash)));
-					step->set_analog_left_delta (base->leftmove () - memory::read<float> (movement_services + SCHEMA ("CPlayer_MovementServices", "m_flCmdLeftMove"_hash)));
-				}
-			}
 		}
 
 		diag::set_exception_phase( "input apply: buttons" );
@@ -130,6 +98,26 @@ namespace systems {
 		}
 
 		proto::subtick_move_step* step{};
+		auto reset_step = []( proto::subtick_move_step* value )
+		{
+			if ( !value )
+			{
+				return;
+			}
+
+			// Repeated protobuf entries come from an arena pool. Reset field
+			// presence and payload explicitly so a button-only event cannot
+			// inherit last tick's analog/yaw fields from the same slot.
+			value->m_has_bits.clear( 0x7fu );
+			value->m_button = 0;
+			value->m_pressed = false;
+			value->m_when = 0.0f;
+			value->m_analog_forward_delta = 0.0f;
+			value->m_analog_left_delta = 0.0f;
+			value->m_pitch_delta = 0.0f;
+			value->m_yaw_delta = 0.0f;
+			value->m_cached_size = 0;
+		};
 
 		if ( subtick_moves->m_rep )
 		{
@@ -140,16 +128,7 @@ namespace systems {
 				{
 					subtick_moves->m_current_size++;
 					step = proto::impl_ptr<proto::subtick_move_step>( element );
-
-					// Reuse the pooled slot without zeroing it (matches
-					// the engine's own pool behaviour - zeroing the
-					// cached size/has bits made the server parse the
-					// step differently and the input felt less smooth).
-					// Only the view deltas are cleared explicitly: a
-					// stale pitch/yaw delta on a jump/duck step would
-					// rotate the view mid-tick.
-					step->set_pitch_delta( 0.0f );
-					step->set_yaw_delta( 0.0f );
+					reset_step( step );
 				}
 			}
 		}
@@ -161,8 +140,7 @@ namespace systems {
 			{
 				memory::call<std::uintptr_t>(PATTERN (patterns::utl_vector_push), reinterpret_cast< std::uintptr_t >( subtick_moves ), reinterpret_cast< std::uintptr_t >( move_step ) );
 				step = proto::impl_ptr<proto::subtick_move_step>( move_step );
-				step->set_pitch_delta( 0.0f );
-				step->set_yaw_delta( 0.0f );
+				reset_step( step );
 			}
 		}
 

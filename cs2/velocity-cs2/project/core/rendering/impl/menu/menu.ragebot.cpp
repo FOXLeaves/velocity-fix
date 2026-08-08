@@ -8,8 +8,9 @@ namespace rendering {
 	namespace detail {
 
 		constexpr const char* hitbox_names[ ]{ "头部", "胸部", "腹部", "手臂", "腿部", "爪子" };
-		constexpr const char* pitch_items[ ]{ "无", "向下", "向上" };
-		constexpr const char* aa_yaw_items[ ]{ "背向", "真实视角" };
+	constexpr const char* pitch_items[ ]{ "无", "向下", "向上", "自定义" };
+	constexpr const char* aa_yaw_items[ ]{ "背向", "真实视角", "自定义" };
+	constexpr const char* jitter_items[ ]{ "无", "中心", "边缘", "全身", "三向", "旋转" };
 
 	} // namespace detail
 
@@ -137,8 +138,29 @@ namespace rendering {
 		{
 			xui::checkbox( "反瞄准", aa.enabled );
 
-			xui::combo( "俯仰", aa.pitch.value, detail::pitch_items, 3 );
-			xui::combo( "偏航", aa.yaw.value, detail::aa_yaw_items, 2 );
+			xui::combo( "俯仰", aa.pitch.value, detail::pitch_items, 4 );
+			xui::combo( "偏航", aa.yaw.value, detail::aa_yaw_items, 3 );
+
+			if ( aa.pitch.value == settings::combat::antiaim::pitch_mode::custom )
+			{
+				xui::slider_float( "俯仰角度##aa_pitch", aa.pitch_value, -89.0f, 89.0f, "%.1f°" );
+			}
+			if ( aa.yaw.value == settings::combat::antiaim::yaw_mode::custom )
+			{
+				xui::slider_float( "身体偏移##aa_yaw", aa.yaw_offset, 0.0f, 360.0f, "%.0f°" );
+			}
+			xui::slider_float( "侧步角度##aa_side", aa.side_offset, 1.0f, 180.0f, "%.0f°" );
+			if ( aa.auto_yaw_adjust.value )
+			{
+				xui::slider_float( "调整量##aa_adj", aa.auto_yaw_adjust_amount, 0.0f, 180.0f, "%.0f°" );
+			}
+
+			xui::checkbox( "身体抖动", aa.jitter );
+			if ( aa.jitter.value )
+			{
+				xui::combo( "抖动模式##aa_jit", aa.jitter_mode.value, detail::jitter_items, 6 );
+				xui::slider_float( "抖动幅度##aa_jit_amt", aa.jitter_amount, -180.0f, 180.0f, "%.0f°" );
+			}
 
 			xui::checkbox( "补偿横滚", aa.auto_yaw_adjust );
 			xui::checkbox( "强制左", aa.manual_left );

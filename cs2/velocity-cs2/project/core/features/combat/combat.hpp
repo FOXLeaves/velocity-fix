@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <core/systems/systems.hpp>
 
@@ -148,7 +148,7 @@ namespace features::combat {
 			void prepare( std::uintptr_t weapon_vdata, std::uintptr_t weapon );
 
 			[[nodiscard]] run_context prepare_target( std::uintptr_t target_pawn, lagcomp::record* record, const systems::hitboxes::set* external_hitboxes = nullptr ) const;
-			[[nodiscard]] bool run( const math::vector3& start, const math::vector3& end, const run_context& ctx, std::uintptr_t local_pawn, int local_team, result& out ) const;
+			[[nodiscard]] bool run( const math::vector3& start, const math::vector3& end, const run_context& ctx, std::uintptr_t local_pawn, int local_team, result& out, int fallback_hitbox = -1 ) const;
 			[[nodiscard]] bool can( const math::vector3& start, const math::vector3& direction, float& out_damage, const systems::local::snapshot& local ) const;
 			[[nodiscard]] float get_max_damage( int hitgroup, int target_armor, bool has_helmet, int target_team ) const;
 			[[nodiscard]] const weapon_data& get_weapon_data( ) const { return this->m_weapon_data; }
@@ -260,8 +260,8 @@ namespace features::combat {
 		[[nodiscard]] std::uint32_t get_spread_seed( const math::vector3& angles, int tick ) const;
 		[[nodiscard]] math::vector2 calculate_spread( int seed, float accuracy, float spread, float recoil_index, int item_def_idx, int num_bullets ) const;
 		[[nodiscard]] math::vector3 get_aim_punch( std::uintptr_t local_pawn ) const;
-		[[nodiscard]] float calculate_hitchance( const math::vector3& shoot_position, const math::vector3& aim_angle, const systems::hitboxes::entry& hitbox, const systems::bones::data& bone, float inaccuracy, float spread, int samples = 512 ) const;
-		[[nodiscard]] math::vector3 find_spread_correction( const math::vector3& aim_angle, int tick ) const;
+		[[nodiscard]] float calculate_hitchance( const math::vector3& shoot_position, const math::vector3& aim_angle, const systems::hitboxes::entry& hitbox, const systems::bones::data& bone, float inaccuracy, float spread, int samples = 512, float threshold = -1.0f ) const;
+		[[nodiscard]] math::vector3 find_spread_correction( const math::vector3& aim_angle, int tick, std::uint32_t known_seed = 0 ) const;
 		[[nodiscard]] math::vector3 get_eye_position( std::uintptr_t local_pawn ) const;
 		[[nodiscard]] math::vector3 get_shoot_position( ) const;
 		[[nodiscard]] math::vector3 get_interpolated_shoot_position( std::uintptr_t local_pawn, bool newest = false ) const;
@@ -305,43 +305,32 @@ namespace features::combat {
 			void on_create_move( systems::input::usercmd* cmd );
 			void on_render( xdraw::draw_list& draw_list ) const;
 
-			[[nodiscard]] bool has_modified_angles( ) const { return this->m_should_correct || this->m_modified_angles.y != this->m_old_angles.y; }
+			[[nodiscard]] bool has_modified_angles( ) const { return this->m_modified_angles.y != this->m_old_angles.y; }
 			[[nodiscard]] const math::vector3& get_modified_angles( ) const { return this->m_modified_angles; }
 			[[nodiscard]] bool antiaim_active( ) const { return this->m_antiaim_active; }
 			// -1 = forced left (Z), +1 = forced right (C), 0 = none.
 			[[nodiscard]] int yaw_side( ) const { return this->m_yaw_side; }
-			// Command buttons captured before correct_movement rewrites the
-			// move keys; the airstrafe reads these so its direction
-			// bookkeeping (m_last_pressed) is not skewed by a 90 deg
-			// side-step button rewrite.
-			[[nodiscard]] std::uintptr_t raw_movement_buttons( ) const { return this->m_raw_movement_buttons; }
-			// Rotates a move vector (forward/side) from the real-view frame
-			// into the anti-aim frame. The airstrafe / test_strafer write
-			// their outputs in the real frame; the engine decomposes along
-			// the command angles, so the outputs must be rotated too or
-			// bunnyhop accel steers off under anti-aim.
-			void rotate_move_to_aa( proto::base_usercmd_pb* base ) const;
-			// Inverse of rotate_move_to_aa: restores the real-view frame.
-			// test_strafer steers the view in the real frame via subtick
-			// yaw deltas, so the AA-rotated input must be brought back or
-			// side-steps compound a 90 deg error (the 180 deg back mode
-			// hides it by symmetry).
-			void unrotate_move_from_aa( proto::base_usercmd_pb* base ) const;
 
 		private:
 			[[nodiscard]] float get_pitch( float view_pitch );
 			[[nodiscard]] float get_yaw( const math::vector3& view_angles, const systems::local::snapshot& local );
-			void correct_movement( systems::input::usercmd* cmd );
+			void apply_jitter( float& yaw, std::uint32_t tick, bool advance_spin );
 			[[nodiscard]] bool is_near_ladder( std::uintptr_t local_pawn ) const;
-
 			math::vector3 m_old_angles{};
 			math::vector3 m_modified_angles{};
 
 			int m_yaw_side{};
-			bool m_should_correct{};
+			std::uint32_t m_jitter_tick{};
+			std::uint32_t m_command_jitter_tick{};
+			std::intptr_t m_jitter_command_number{ -1 };
+			std::uintptr_t m_jitter_pawn{};
+			bool m_jitter_command_valid{};
 			bool m_antiaim_active{};
-			std::uintptr_t m_raw_movement_buttons{};
 			float m_indicator_yaw{};
+			// Spin accumulator: the spin mode keeps rotating from the
+			// previous tick's offset (top-spin), it does not reset back
+			// to the base heading every tick.
+			float m_spin_accum{};
 		};
 
 		class duckpeek
@@ -684,8 +673,8 @@ namespace features::combat {
 		void run_knife( systems::input::usercmd* cmd, const aim_context& ctx, const systems::local::snapshot& local );
 		void auto_revolver( systems::input::usercmd* cmd, const aim_context& ctx, const systems::local::snapshot& local );
 
-		[[nodiscard]] std::vector<scan_hit> scan_players( const math::vector3& eye, float inaccuracy, const aim_context& ctx, std::vector<candidate>& candidates, const systems::local::snapshot& local ) const;
-		[[nodiscard]] std::vector<scan_hit> scan_player( const math::vector3& eye, float inaccuracy, const aim_context& ctx, candidate& cand, shared::lagcomp::record* record, const systems::local::snapshot& local, std::atomic<int>& trace_budget ) const;
+		[[nodiscard]] std::vector<scan_hit> scan_players( const math::vector3& eye, float inaccuracy, const aim_context& ctx, std::vector<candidate>& candidates, const systems::local::snapshot& local, int max_traces = k_max_scan_traces ) const;
+		[[nodiscard]] std::vector<scan_hit> scan_player( const math::vector3& eye, float inaccuracy, const aim_context& ctx, candidate& cand, shared::lagcomp::record* record, const systems::local::snapshot& local, std::atomic<int>& trace_budget, int& local_budget ) const;
 		[[nodiscard]] target select_best( const aim_context& aim_ctx, const std::vector<scan_hit>& hits, float eval_inaccuracy ) const;
 		[[nodiscard]] float evaluate_hitchance( const scan_hit& hit, const aim_context& ctx, float inaccuracy ) const;
 		[[nodiscard]] float get_standing_inaccuracy( const systems::local::snapshot& local, const aim_context& ctx ) const;

@@ -21,9 +21,12 @@ namespace features::movement {
 			return;
 		}
 
-		// Community servers run with sv_quantize_movement_input 0 and ignore
-		// subtick moves; use the dedicated unquantized path there.
-		if ( !CONVAR ("sv_quantize_movement_input")->get<bool>( ) )
+		// The discrete/yaw path needs both movement quantization and subtick
+		// movement view angles. Without either capability, use the analog path.
+		const auto quantize_cvar = CONVAR( "sv_quantize_movement_input" );
+		const auto subtick_view_cvar = CONVAR( "sv_subtick_movement_view_angles" );
+		if ( !quantize_cvar || !quantize_cvar->get<bool>( )
+			|| !subtick_view_cvar || !subtick_view_cvar->get<bool>( ) )
 		{
 			this->unquantized_move( cmd );
 			return;
@@ -36,59 +39,12 @@ namespace features::movement {
 		const bool in_air = !( prestate.flags & cstypes::entity_flags::on_ground );
 
 
-		if ( shift_held && in_air )
-		{
-			const auto& vel = prestate.networked_velocity;
-			float forward_move = 0.0f;
-			float left_move = 0.0f;
+		const auto wants_stop = shift_held
+			|| features::combat::g_rage.should_stop( )
+			|| features::misc::g_projectile_trajectory.should_stop( );
 
-			if ( vel.length_2d( ) > 10.0f )
-			{
-				const auto vel_yaw = std::atan2f( vel.y, vel.x )
-					* ( 180.0f / std::numbers::pi_v<float> );
-
-				const auto view_yaw = this->m_angles.y;
-				const auto relative_yaw = ( vel_yaw - view_yaw )
-					* ( std::numbers::pi_v<float> / 180.0f );
-
-				const auto fwd_x = std::cosf( relative_yaw );
-				const auto fwd_y = std::sinf( relative_yaw );
-
-				forward_move = std::clamp( -fwd_x, -1.0f, 1.0f );
-				left_move = std::clamp( -fwd_y, -1.0f, 1.0f ); // negated
-			}
-
-			base->set_forwardmove( forward_move );
-			base->set_leftmove( left_move );
-
-			// With anti-aim active the engine decomposes along the command
-			// angles, so rotate this real-view stop output into the AA
-			// frame (angle_vectors convention matches the shift output).
-			features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
-
-			// write subtick entries so the engine respects the input precisely 
-			const auto subtick_moves = base->mutable_subtick_moves( );
-			if ( subtick_moves )
-			{
-				const auto step = systems::g_input.acquire_subtick_step( subtick_moves );
-				if ( step )
-				{
-					step->set_button( 0 );
-					step->set_pressed( false );
-					step->set_when( 0.0f );
-					// The engine consumes the analog deltas, not the base
-					// move fields, so the deltas must carry the AA-rotated
-					// values or the rotation (and the stop) is ignored.
-					step->set_analog_forward_delta( base->forwardmove( ) - prestate.last_movement_impulses.x );
-					step->set_analog_left_delta( base->leftmove( ) - prestate.last_movement_impulses.y );
-				}
-			}
-			return;
-		}
-
-		const auto wants_stop = features::combat::g_rage.should_stop( ) || features::misc::g_projectile_trajectory.should_stop( );
-
-		if ( !settings::g_movement.airstrafe.value && !wants_stop || features::combat::g_rage.is_firing_this_tick( ) )
+		if ( ( !settings::g_movement.airstrafe.value && !wants_stop )
+			|| features::combat::g_rage.is_firing_this_tick( ) )
 		{
 			return;
 		}
@@ -115,11 +71,6 @@ namespace features::movement {
 			return;
 		}
 
-		if ( current_buttons & static_cast< std::uintptr_t >( cstypes::command_buttons::in_sprint ) )
-		{
-			return;
-		}
-
 		const auto subtick_moves = base->mutable_subtick_moves( );
 		if ( !subtick_moves )
 		{
@@ -128,18 +79,13 @@ namespace features::movement {
 
 		if ( !wants_stop )
 		{
-			// Use the pre-fix command buttons: correct_movement rewrites the
-			// move keys under anti-aim (W -> moveleft on a side-step), and
-			// that would skew the direction bookkeeping by 90 deg.
-			const auto raw_buttons = features::combat::g_misc.antiaim( ).antiaim_active( )
-				? features::combat::g_misc.antiaim( ).raw_movement_buttons( )
-				: current_buttons;
-
-			this->check_button( raw_buttons, cstypes::command_buttons::in_moveleft );
-			this->check_button( raw_buttons, cstypes::command_buttons::in_moveright );
-			this->check_button( raw_buttons, cstypes::command_buttons::in_forward );
-			this->check_button( raw_buttons, cstypes::command_buttons::in_back );
-			this->m_last_buttons = raw_buttons;
+			// The global movement transaction runs after the airstrafer, so
+			// buttons are still the player's unmodified input here.
+			this->check_button( current_buttons, cstypes::command_buttons::in_moveleft );
+			this->check_button( current_buttons, cstypes::command_buttons::in_moveright );
+			this->check_button( current_buttons, cstypes::command_buttons::in_forward );
+			this->check_button( current_buttons, cstypes::command_buttons::in_back );
+			this->m_last_buttons = current_buttons;
 		}
 
 		const auto movement_services = memory::read<std::uintptr_t>( local.pawn + SCHEMA( "C_BasePlayerPawn", "m_pMovementServices"_hash ) );
@@ -192,7 +138,8 @@ namespace features::movement {
 		const auto effective_wants_stop = wants_stop || ( settings::g_movement.airstrafe_fully_directional.value && !has_direction_input );
 
 		auto velocity = prestate.networked_velocity;
-		auto last_impulses = prestate.last_movement_impulses;
+		const auto& initial_impulses = features::movement::g_movement_fix.source_impulses( );
+		auto last_impulses = math::vector3{ initial_impulses.x, initial_impulses.y, prestate.last_movement_impulses.z };
 		auto stamina = prestate.stamina;
 		const auto surface_friction = prestate.surface_friction;
 
@@ -216,100 +163,16 @@ namespace features::movement {
 			base->set_forwardmove( cmd_move_backup.x );
 			base->set_leftmove( cmd_move_backup.y );
 
-			auto speed_2d = std::sqrtf( velocity.x * velocity.x + velocity.y * velocity.y );
-
-			if ( stamina > 0.0f )
-			{
-				const auto speed_scale = std::clamp( 1.0f - ( stamina / 100.0f ), 0.0f, 1.0f );
-				speed_2d *= speed_scale * speed_scale;
-				stamina = std::fmaxf( stamina - ( frame_time * sv_staminarecoveryrate ), 0.0f );
-			}
-
-			velocity.z -= ( sv_gravity * frame_time );
-
-			if ( speed_2d > 0.0001f )
-			{
-				math::vector3 forward_dir{}, right_dir{};
-				math::helpers::angle_vectors_2d( base->viewangles( )->y( ), forward_dir, right_dir );
-
-				math::vector3 wish_dir
-				{
-					( forward_dir.x * last_impulses.x * effective_maxspeed ) + ( right_dir.x * last_impulses.y * effective_maxspeed ),
-					( forward_dir.y * last_impulses.x * effective_maxspeed ) + ( right_dir.y * last_impulses.y * effective_maxspeed ),
-					0.0f
-				};
-
-				auto wish_speed = std::sqrtf( wish_dir.x * wish_dir.x + wish_dir.y * wish_dir.y );
-				if ( wish_speed > 0.0001f )
-				{
-					wish_dir.x /= wish_speed;
-					wish_dir.y /= wish_speed;
-					wish_dir.z = 0.0f;
-				}
-
-				wish_speed = std::fminf( wish_speed, effective_maxspeed );
-
-				const auto capped_wish = std::fminf( wish_speed, sv_air_max_wishspeed );
-				const auto current_speed = velocity.x * wish_dir.x + velocity.y * wish_dir.y;
-				const auto add_speed = capped_wish - current_speed;
-
-				if ( add_speed > 0.0f )
-				{
-					const auto accel_speed = sv_airaccelerate * effective_maxspeed * frame_time * surface_friction;
-					const auto half_accel = accel_speed * 0.5f;
-					const auto gain = std::fminf( half_accel, add_speed );
-
-					velocity.x += wish_dir.x * gain;
-					velocity.y += wish_dir.y * gain;
-				}
-
-				/*if ( add_speed > 0.0f )
-				{
-					const auto accel_speed = sv_airaccelerate * effective_maxspeed * frame_time * surface_friction;
-					const auto half_accel = accel_speed * 0.5f;
-
-					if ( half_accel <= add_speed )
-					{
-						if ( accel_speed <= add_speed )
-						{
-							velocity.x += wish_dir.x * half_accel;
-							velocity.y += wish_dir.y * half_accel;
-						}
-						else
-						{
-							const auto remainder = add_speed - half_accel;
-							velocity.x += wish_dir.x * remainder;
-							velocity.y += wish_dir.y * remainder;
-						}
-					}
-				}*/
-			}
-
-			velocity.z += ( sv_gravity * frame_time ) * 0.5f;
-			speed_2d = std::sqrtf( velocity.x * velocity.x + velocity.y * velocity.y );
+			const auto speed_2d = std::sqrtf( velocity.x * velocity.x + velocity.y * velocity.y );
 
 			if ( speed_2d >= 10.0f )
 			{
 				base->set_forwardmove( 0.0f );
 				base->set_leftmove( 0.0f );
-					if ( effective_wants_stop )
-					{
-						this->rotate_to_stop( base, velocity );
-
-						features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
-
-						if ( const auto stop_subtick = base->mutable_subtick_moves( ) )
-							{
-								if ( const auto stop_step = systems::g_input.acquire_subtick_step( stop_subtick ) )
-								{
-									stop_step->set_button( 0 );
-									stop_step->set_pressed( false );
-									stop_step->set_when( 0.0f );
-									stop_step->set_analog_forward_delta( base->forwardmove( ) - prestate.last_movement_impulses.x );
-									stop_step->set_analog_left_delta( base->leftmove( ) - prestate.last_movement_impulses.y );
-							}
-						}
-					}
+				if ( effective_wants_stop )
+				{
+					this->rotate_to_stop( base, velocity );
+				}
 				else
 				{
 					const auto velocity_angle = std::atan2f( velocity.y, velocity.x ) * ( 180.0f / std::numbers::pi_v<float> );
@@ -351,29 +214,13 @@ namespace features::movement {
 					math::helpers::normalize_angle( target_yaw );
 
 					this->rotate_movement( base, target_yaw, this->m_angles.y );
-					features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
-
-					// Carry the rotated values into the analog deltas: the
-					// engine moves from the subtick deltas, so a rotation
-					// that only touches the base fields is ignored.
-					if ( const auto accel_subtick = base->mutable_subtick_moves( ) )
-						{
-							if ( const auto accel_step = systems::g_input.acquire_subtick_step( accel_subtick ) )
-							{
-								accel_step->set_button( 0 );
-								accel_step->set_pressed( false );
-								accel_step->set_when( 0.0f );
-								accel_step->set_analog_forward_delta( base->forwardmove( ) - prestate.last_movement_impulses.x );
-								accel_step->set_analog_left_delta( base->leftmove( ) - prestate.last_movement_impulses.y );
-						}
-					}
 				}
 			}
 
 			const auto step = systems::g_input.acquire_subtick_step( subtick_moves );
 			if ( !step )
 			{
-				continue;
+				break;
 			}
 
 			step->set_button( 0 );
@@ -382,8 +229,56 @@ namespace features::movement {
 			step->set_analog_forward_delta( base->forwardmove( ) - last_impulses.x );
 			step->set_analog_left_delta( base->leftmove( ) - last_impulses.y );
 
-			last_impulses.x += base->forwardmove( ) - last_impulses.x;
-			last_impulses.y += base->leftmove( ) - last_impulses.y;
+			last_impulses.x = base->forwardmove( );
+			last_impulses.y = base->leftmove( );
+
+			// A subtick movement event applies at the start of its interval.
+			// Simulate that interval with the just-emitted absolute impulse so
+			// the planner and the server do not differ by one full substep.
+			auto simulated_speed = speed_2d;
+			if ( stamina > 0.0f )
+			{
+				const auto speed_scale = std::clamp( 1.0f - ( stamina / 100.0f ), 0.0f, 1.0f );
+				simulated_speed *= speed_scale * speed_scale;
+				stamina = std::fmaxf( stamina - ( frame_time * sv_staminarecoveryrate ), 0.0f );
+			}
+
+			velocity.z -= ( sv_gravity * frame_time );
+
+			if ( simulated_speed > 0.0001f )
+			{
+				math::vector3 forward_dir{}, left_dir{};
+				math::helpers::angle_vectors_2d( view_angles.y, forward_dir, left_dir );
+
+				math::vector3 wish_dir
+				{
+					( forward_dir.x * last_impulses.x * effective_maxspeed ) + ( left_dir.x * last_impulses.y * effective_maxspeed ),
+					( forward_dir.y * last_impulses.x * effective_maxspeed ) + ( left_dir.y * last_impulses.y * effective_maxspeed ),
+					0.0f
+				};
+
+				auto wish_speed = std::sqrtf( wish_dir.x * wish_dir.x + wish_dir.y * wish_dir.y );
+				if ( wish_speed > 0.0001f )
+				{
+					wish_dir.x /= wish_speed;
+					wish_dir.y /= wish_speed;
+				}
+
+				wish_speed = std::fminf( wish_speed, effective_maxspeed );
+				const auto capped_wish = std::fminf( wish_speed, sv_air_max_wishspeed );
+				const auto current_speed = velocity.x * wish_dir.x + velocity.y * wish_dir.y;
+				const auto add_speed = capped_wish - current_speed;
+
+				if ( add_speed > 0.0f )
+				{
+					const auto accel_speed = sv_airaccelerate * effective_maxspeed * frame_time * surface_friction;
+					const auto gain = std::fminf( accel_speed * 0.5f, add_speed );
+					velocity.x += wish_dir.x * gain;
+					velocity.y += wish_dir.y * gain;
+				}
+			}
+
+			velocity.z += ( sv_gravity * frame_time ) * 0.5f;
 
 			if ( !effective_wants_stop )
 			{
@@ -446,13 +341,13 @@ namespace features::movement {
 
 			base->set_forwardmove( forward_move );
 			base->set_leftmove( left_move );
-			features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
 			return;
 		}
 
 		const auto wants_stop = features::combat::g_rage.should_stop( ) || features::misc::g_projectile_trajectory.should_stop( );
 
-		if ( !settings::g_movement.airstrafe.value && !wants_stop || features::combat::g_rage.is_firing_this_tick( ) )
+		if ( ( !settings::g_movement.airstrafe.value && !wants_stop )
+			|| features::combat::g_rage.is_firing_this_tick( ) )
 		{
 			return;
 		}
@@ -480,7 +375,6 @@ namespace features::movement {
 		if ( wants_stop && speed_2d <= 10.0f )
 		{
 			this->rotate_to_stop( base, velocity );
-			features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
 			return;
 		}
 
@@ -545,13 +439,13 @@ namespace features::movement {
 		math::helpers::normalize_angle( target_yaw );
 
 		this->rotate_movement( base, target_yaw, this->m_angles.y );
-		features::combat::g_misc.antiaim( ).rotate_move_to_aa( base );
 		this->m_side_switch = !this->m_side_switch;
 	}
 
 	void airstrafe::store_angles( )
 	{
 		this->m_angles = systems::g_input.get_view_angles( );
+		this->m_angles.y = features::movement::g_movement_fix.source_yaw( );
 	}
 
 	void airstrafe::check_button( std::uintptr_t current_buttons, std::uintptr_t button )
@@ -593,20 +487,20 @@ namespace features::movement {
 		const auto forward_move = base->forwardmove( );
 		const auto side_move = base->leftmove( );
 
-		math::vector3 target_forward{}, target_right{};
-		math::helpers::angle_vectors_2d( target_yaw, target_forward, target_right );
+		math::vector3 target_forward{}, target_left{};
+		math::helpers::angle_vectors_2d( target_yaw, target_forward, target_left );
 
-		math::vector3 view_forward{}, view_right{};
-		math::helpers::angle_vectors_2d( view_yaw, view_forward, view_right );
+		math::vector3 view_forward{}, view_left{};
+		math::helpers::angle_vectors_2d( view_yaw, view_forward, view_left );
 
 		const auto tf = target_forward * forward_move;
-		const auto tr = target_right * side_move;
+		const auto tl = target_left * side_move;
 
-		const auto corrected_forward = view_forward.dot( tf ) + view_forward.dot( tr );
-		const auto corrected_side = view_right.dot( tf ) + view_right.dot( tr );
+		const auto corrected_forward = view_forward.dot( tf ) + view_forward.dot( tl );
+		const auto corrected_side = view_left.dot( tf ) + view_left.dot( tl );
 
-		base->set_forwardmove( std::clamp( -corrected_forward, -1.0f, 1.0f ) );
-		base->set_leftmove( std::clamp( -corrected_side, -1.0f, 1.0f ) );
+		base->set_forwardmove( std::clamp( corrected_forward, -1.0f, 1.0f ) );
+		base->set_leftmove( std::clamp( corrected_side, -1.0f, 1.0f ) );
 	}
 
 	void airstrafe::rotate_to_stop( proto::base_usercmd_pb* base, const math::vector3& velocity ) const

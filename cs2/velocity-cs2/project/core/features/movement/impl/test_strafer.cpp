@@ -238,16 +238,20 @@ namespace features::movement {
 			return;
 		}
 
-		// TEMP TEST (gpt5.6): always run the subtick yaw path regardless of
-		// sv_quantize_movement_input to verify whether quantize 0 actually
-		// ignores subtick yaw deltas at all.
-		this->quantized_path( cmd );
+		if ( !CONVAR( "sv_quantize_movement_input" )->get<bool>( ) )
+		{
+			this->unquantized_path( cmd );
+		}
+		else
+		{
+			this->quantized_path( cmd );
+		}
 	}
 
 	// Unquantized servers (most community servers, sv_quantize_movement_input 0)
 	// ignore subtick yaw deltas. Steer by rotating the desired world direction
-	// into the command frame and writing the base move fields - the view (and
-	// anti-aim yaw) stays untouched.
+	// into the original command frame and writing the base move fields. The
+	// global movement transaction applies the final anti-aim/aim frame once.
 	void test_strafer::unquantized_path( systems::input::usercmd* cmd )
 	{
 		const auto current_buttons = cmd->buttons.value;
@@ -293,7 +297,7 @@ namespace features::movement {
 		}
 
 		// Interpret WASD against the real view yaw.
-		const auto input_yaw = systems::g_input.get_view_angles( ).y;
+		const auto input_yaw = features::movement::g_movement_fix.source_yaw( );
 		const auto input_offset = std::atan2f( -player_move.y, player_move.x ) * ( 180.0f / std::numbers::pi_v<float> );
 
 		auto target_world_yaw = input_yaw + input_offset;
@@ -302,8 +306,7 @@ namespace features::movement {
 		const auto entry_side = ( this->m_substep_counter % 2 ) == 0;
 		const auto wishdir_yaw = ref_air_strafer_unq( velocity.x, velocity.y, target_world_yaw, cstypes::tick_interval, entry_side, sv_maxspeed, sv_airaccelerate, sv_air_max_wishspeed, surface_friction );
 
-		// Use the final command yaw (keeps whatever anti-aim wrote).
-		const auto command_yaw = base->viewangles( )->y( );
+		const auto command_yaw = features::movement::g_movement_fix.source_yaw( );
 
 		auto delta = wishdir_yaw - command_yaw;
 		math::helpers::normalize_angle( delta );
@@ -312,7 +315,7 @@ namespace features::movement {
 		// input fractional or the direction collapses toward 45 degrees.
 		const auto rad = delta * ( std::numbers::pi_v<float> / 180.0f );
 		auto forward_move = std::cosf( rad );
-		auto left_move = -std::sinf( rad );
+		auto left_move = std::sinf( rad );
 
 		const auto move_length = std::hypotf( forward_move, left_move );
 		if ( move_length > 1.0f )
@@ -332,11 +335,12 @@ namespace features::movement {
 	{
 		math::helpers::normalize_angle( yaw_delta );
 
-		// Only reject a truly zero spin; the side-step lock injects 0.005
-		// deg per step to keep the strafer active.
+		// An already-aligned interval is a successful no-op, not an allocation
+		// failure. The caller must still simulate it and retain ownership of the
+		// tick instead of falling through to the second airstrafe implementation.
 		if ( std::fabsf( yaw_delta ) <= 0.001f )
 		{
-			return false;
+			return true;
 		}
 
 		const auto subtick_moves = base->mutable_subtick_moves( );
@@ -384,7 +388,7 @@ namespace features::movement {
 		const auto& prestate = systems::g_prediction.pre( );
 		const auto velocity = prestate.networked_velocity;
 		const auto speed_2d = velocity.length_2d( );
-		const auto command_yaw = systems::g_input.get_view_angles( ).y;
+		const auto command_yaw = features::movement::g_movement_fix.source_yaw( );
 
 		const auto player_move = movement_from_buttons( this->m_last_pressed );
 		if ( player_move.x == 0.0f && player_move.y == 0.0f )
@@ -412,28 +416,6 @@ namespace features::movement {
 		auto target_yaw = command_yaw + base_yaw_offset;
 		math::helpers::normalize_angle( target_yaw );
 
-		// While a side-step is active the engine view must stay locked at
-		// the AA yaw: the AA-rotated input decomposes along it back to the
-		// user's world direction the whole way, whereas unwinding the view
-		// toward the strafe target only aligns part of the tick and the
-		// accel stalls. Back mode keeps the normal steering (works fine).
-		auto side_offset{ 0.0f };
-		if ( features::combat::g_misc.antiaim( ).antiaim_active( ) )
-		{
-			const auto aa_yaw = features::combat::g_misc.antiaim( ).get_modified_angles( ).y;
-			side_offset = aa_yaw - command_yaw;
-			math::helpers::normalize_angle( side_offset );
-			if ( side_offset > 90.0f )
-			{
-				side_offset -= 180.0f;
-			}
-			else if ( side_offset < -90.0f )
-			{
-				side_offset += 180.0f;
-			}
-		}
-		const auto side_locked = std::fabsf( side_offset ) > 30.0f;
-
 		const auto sub_frame = cstypes::tick_interval / static_cast< float >( k_max_subticks );
 		const auto when_step = ( 1.0f - start_when ) / static_cast< float >( k_max_subticks + 1 );
 
@@ -450,14 +432,8 @@ namespace features::movement {
 			auto target_view_yaw = wishdir_yaw - base_yaw_offset;
 			math::helpers::normalize_angle( target_view_yaw );
 
-			// Side-step: keep the view on the AA yaw (0.005 deg/step keeps
-			// the subtick step registering so the strafer stays active).
-			auto yaw_delta{ 0.005f };
-			if ( !side_locked )
-			{
-				yaw_delta = target_view_yaw - acc_yaw;
-				math::helpers::normalize_angle( yaw_delta );
-			}
+			auto yaw_delta = target_view_yaw - acc_yaw;
+			math::helpers::normalize_angle( yaw_delta );
 			acc_yaw += yaw_delta;
 			math::helpers::normalize_angle( acc_yaw );
 

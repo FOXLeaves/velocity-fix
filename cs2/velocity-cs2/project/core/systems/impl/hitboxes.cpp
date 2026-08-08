@@ -156,7 +156,7 @@ namespace systems {
 	const char* hitboxes::hitgroup_to_name( int hitgroup )
 	{
 		constexpr const char* k_names[ ]{ "body", "head", "chest", "stomach", "left arm", "right arm", "left leg", "right leg", "neck" };
-		return hitgroup < 9 ? k_names[ hitgroup ] : "body";
+		return hitgroup >= 0 && hitgroup < 9 ? k_names[ hitgroup ] : "body";
 	}
 
 } // namespace systems

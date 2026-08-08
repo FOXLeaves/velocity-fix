@@ -1,4 +1,4 @@
-﻿#include <pch/pch.hpp>
+#include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
 #include <utilities/logging/logging.hpp>
@@ -665,6 +665,8 @@ namespace features::combat {
 				// button + attack index that fire_gun set (the index is
 				// what makes the server use the corrected entry angles), so
 				// no extra subtick edge is added for it.
+				auto attack_committed = !dt_active || attack_config.no_spread.value;
+
 				if ( !attack_config.no_spread.value )
 				{
 					if ( auto* base = cmd->csgo_user_cmd.mutable_base( ) )
@@ -673,8 +675,14 @@ namespace features::combat {
 						{
 							step->set_button( cstypes::command_buttons::in_attack );
 							step->set_pressed( true );
+							attack_committed = true;
 						}
 					}
+				}
+
+				if ( attack_committed )
+				{
+					features::misc::g_impacts.on_shot_committed( cmd->command_number );
 				}
 
 				// Remember the freshest aim angles.
@@ -1312,14 +1320,18 @@ namespace features::combat {
 			eye_candidates.count = 1;
 		}
 
-		const auto scan_from_eye_candidates = [ & ]( const math::vector3& eye_offset, float inaccuracy )
+		const auto scan_from_eye_candidates = [ & ]( std::vector<candidate>& scan_set, const math::vector3& eye_offset, float inaccuracy, int max_traces )
 		{
 			std::vector<scan_hit> hits_out;
 
 			for ( auto i = 0; i < eye_candidates.count; ++i )
 			{
 				const auto eye = eye_candidates.entries[ i ].position + eye_offset;
-				auto hits = this->scan_players( eye, inaccuracy, ctx, candidates, local );
+				// Secondary eye candidates are only reached when the
+				// primary found no direct hit - halve their budget so the
+				// fallback pass cannot double the per-tick trace cost.
+				const auto pass_budget = i == 0 ? max_traces : max_traces / 2;
+				auto hits = this->scan_players( eye, inaccuracy, ctx, scan_set, local, pass_budget );
 				auto found_direct{ false };
 
 				for ( auto& hit : hits )
@@ -1343,7 +1355,7 @@ namespace features::combat {
 		if ( config.no_spread.value )
 		{
 			shared_ctx.inaccuracy = g_shared.get_inaccuracy( false );
-			auto all_hits = scan_from_eye_candidates( {}, shared_ctx.inaccuracy );
+			auto all_hits = scan_from_eye_candidates( candidates, {}, shared_ctx.inaccuracy, k_max_scan_traces );
 
 			if ( all_hits.empty( ) )
 			{
@@ -1385,7 +1397,7 @@ namespace features::combat {
 		const auto& prestate = systems::g_prediction.pre( );
 
 		// Current-shot selection is always based on current engine shoot-history.
-		auto current_hits = scan_from_eye_candidates( {}, ctx.predicted_inaccuracy );
+		auto current_hits = scan_from_eye_candidates( candidates, {}, ctx.predicted_inaccuracy, k_max_scan_traces );
 		const auto best = this->select_best( ctx, current_hits, ctx.predicted_inaccuracy );
 		this->m_double_tap.update_aim( best.hit.aim_angle - g_shared.get_aim_punch( local.pawn ) );
 
@@ -1440,11 +1452,33 @@ namespace features::combat {
 		// stationary, so the bullet always leaves from the stopped spread.
 		if ( !shot_viable && this->should_stop_movement( ctx ) )
 		{
+			// The stop-plan re-scan is a refinement of THIS tick's scan:
+			// the stopped eye only shifts a few units and the hitbox
+			// points are unchanged, so a target the current eye could
+			// not hit at all will not appear from the stopped one.
+			// Restricting the plan pass to the candidates the current
+			// scan already saw turns the second full-scan into a ~1-2
+			// target pass - halving the worst-case trace cost of a stop
+			// tick, which is exactly when the scan runs twice.
+			std::vector<candidate> plan_candidates;
+			plan_candidates.reserve( 2 );
+			for ( const auto& cand : candidates )
+			{
+				const auto seen = std::any_of( current_hits.begin( ), current_hits.end( ),
+					[ & ]( const scan_hit& h ) { return h.pawn == cand.pawn; } );
+				if ( seen )
+				{
+					plan_candidates.push_back( cand );
+				}
+			}
+
 			const auto stop = this->predict_stop( ctx, primary_eye, local );
 			if ( stop )
 			{
 				const auto future_offset = stop->eye - primary_eye;
-				auto planned_hits = scan_from_eye_candidates( future_offset, stop->inaccuracy );
+				auto planned_hits = plan_candidates.empty( )
+					? std::vector<scan_hit>{}
+					: scan_from_eye_candidates( plan_candidates, future_offset, stop->inaccuracy, k_max_scan_traces );
 				const auto planned = this->select_best( ctx, planned_hits, stop->inaccuracy );
 				this->m_should_stop = planned.valid;
 			}
@@ -1652,7 +1686,11 @@ namespace features::combat {
 		// over the network latency (plus one tick of server processing),
 		// like the extrapolation does. The extrapolated record already
 		// carries the predicted lead, so never double-compensate it.
-		if ( config.no_spread.value && tgt.hit.record && !tgt.hit.record->extrapolated )
+		// PENETRATED shots are exempt: the exposed point was found through
+		// the wall, and pushing it sideways by the lead slides it off the
+		// hitbox onto wall - the bullet clips the cover and the shot that
+		// would have connected whiffs instead.
+		if ( config.no_spread.value && tgt.hit.record && !tgt.hit.record->extrapolated && !tgt.hit.penetrated )
 		{
 			const auto target_velocity = memory::read<math::vector3>( tgt.hit.pawn + SCHEMA( "C_BaseEntity", "m_vecVelocity"_hash ) );
 			if ( target_velocity.length_2d( ) > 1.0f )
@@ -1668,7 +1706,40 @@ namespace features::combat {
 					}
 				}
 
-				aim_position += target_velocity * std::min( lead_time, 0.25f );
+				auto lead = target_velocity * std::min( lead_time, 0.25f );
+
+				// Jittering targets: a sideways lead pushes the aim point
+				// across the hitbox edge and every corrected bullet misses.
+				// Verify the led ray still crosses the RECORD capsule (the
+				// pose the server rewinds to) and halve the lead until it
+				// does; the un-led point is the fallback.
+				if ( tgt.hit.bone_index >= 0 && tgt.hit.bone_index < 28 )
+				{
+					const auto& bone = tgt.hit.record->bones[ tgt.hit.bone_index ];
+					const auto& hb = tgt.hit.hitbox;
+					const auto capsule_start = bone.rotation.rotate_vector( hb.mins ) + bone.position;
+					const auto capsule_end = bone.rotation.rotate_vector( hb.maxs ) + bone.position;
+					const auto radius = hb.radius > 0.0f ? hb.radius : 1.8f;
+
+					auto led_point = tgt.hit.position + lead;
+					for ( auto iter = 0; iter < 3; ++iter )
+					{
+						auto fraction{ 1.0f };
+						const auto dir = ( led_point - shoot_eye ).normalized( );
+						if ( g_shared.ray_vs_capsule( shoot_eye, dir * shared_ctx.range, capsule_start, capsule_end, radius, fraction ) )
+						{
+							aim_position = led_point;
+							break;
+						}
+
+						lead *= 0.5f;
+						led_point = tgt.hit.position + lead;
+					}
+				}
+				else
+				{
+					aim_position += lead;
+				}
 			}
 		}
 
@@ -1788,7 +1859,7 @@ namespace features::combat {
 					// corrected angles) drop the shot instead.
 					if ( config.no_spread.value )
 					{
-						const auto corrected = g_shared.find_spread_correction( aim_angle, claim_tick );
+						const auto corrected = g_shared.find_spread_correction( aim_angle, claim_tick, seed );
 						if ( corrected.x == 0.0f && corrected.y == 0.0f && corrected.z == 0.0f )
 						{
 							this->m_firing_this_tick = false;
@@ -1843,7 +1914,7 @@ namespace features::combat {
 				if ( g_shared.get_spread_seed( corrected, claim_tick ) != seed )
 				{
 					// Different bucket: fall back to the full sweep.
-					corrected = g_shared.find_spread_correction( aim_angle, claim_tick );
+					corrected = g_shared.find_spread_correction( aim_angle, claim_tick, seed );
 					if ( corrected.x == 0.0f && corrected.y == 0.0f && corrected.z == 0.0f )
 					{
 						this->m_firing_this_tick = false;
@@ -1852,6 +1923,35 @@ namespace features::combat {
 				}
 
 				aim_angle = corrected;
+
+				// Trajectory verification: the bucket match above only
+				// guarantees the server derives the SAME spread seed from
+				// the corrected angle - it does not guarantee the
+				// corrected bullet geometrically crosses the hitbox. The
+				// pitch-lift + roll compensation is an approximation, so
+				// verify the actual bullet direction (corrected angle +
+				// that seed's spread) against the RECORD pose capsule the
+				// server rewinds to. A miss here means the shot would
+				// whiff - drop it instead of firing a guaranteed miss.
+				if ( tgt.hit.bone_index >= 0 && tgt.hit.bone_index < 28 )
+				{
+					const auto& bone = tgt.hit.record->bones[ tgt.hit.bone_index ];
+					const auto& hb = tgt.hit.hitbox;
+					const auto capsule_start = bone.rotation.rotate_vector( hb.mins ) + bone.position;
+					const auto capsule_end = bone.rotation.rotate_vector( hb.maxs ) + bone.position;
+					const auto radius = hb.radius > 0.0f ? hb.radius : 1.8f;
+
+					math::vector3 fwd{}, lft{}, up{};
+					math::helpers::angle_vectors_left( aim_angle, &fwd, &lft, &up );
+					const auto dir = ( fwd + lft * spread.x + up * spread.y ).normalized( );
+
+					auto fraction{ 1.0f };
+					if ( !g_shared.ray_vs_capsule( shoot_eye, dir * shared_ctx.range, capsule_start, capsule_end, radius, fraction ) )
+					{
+						this->m_firing_this_tick = false;
+						return;
+					}
+				}
 			}
 
 			if ( settings::g_misc.m_impacts.console_log.value && shared_ctx.item_def_idx == cstypes::item_definition_index::weapon_r8_revolver )
@@ -1887,21 +1987,25 @@ namespace features::combat {
 		features::misc::g_impacts.on_boom(
 			{
 				.victim_pawn = tgt.hit.pawn,
+				.command_number = cmd->command_number,
 				.hitgroup = tgt.hit.hitgroup,
+				.target_health = tgt.hit.health,
 				.damage = tgt.hit.damage,
 				.hitchance = tgt.hitchance,
 				.inaccuracy = shared_ctx.inaccuracy,
 				.spread = shared_ctx.spread,
 				.aim_angle = aim_angle,
-				.aim_position = tgt.hit.position,
+				.aim_position = aim_position,
 				.shoot_position = shoot_eye,
 				.tick = tgt.hit.record->tick,
 				.stamp_tick = stamp_tick,
 				.skeleton = g_shared.lc( ).get_skeleton( *tgt.hit.record ),
 				.forced = was_forced,
 				.extrapolated = tgt.hit.record->extrapolated,
+				.penetrated = tgt.hit.penetrated,
 				.seed_mode = seed_mode,
-				.dt = settings::g_combat.m_ragebot.m_double_tap.enabled.value,
+				.dt = settings::g_combat.m_ragebot.m_double_tap.enabled.value
+					&& shared_ctx.item_def_idx != cstypes::item_definition_index::weapon_r8_revolver,
 			} );
 		features::esp::player::g_chams.os ().push (tgt.hit.pawn);
 		const auto record_time = cstypes::tick_fraction::from_value( tgt.hit.record->simulation_time / cstypes::tick_interval );
@@ -1986,6 +2090,7 @@ namespace features::combat {
 			// previous build expressed no-spread shots with button + index
 			// and it worked, so restore that expression for it.
 			if ( !settings::g_combat.m_ragebot.m_double_tap.enabled.value
+				|| shared_ctx.item_def_idx == cstypes::item_definition_index::weapon_r8_revolver
 				|| config.no_spread.value )
 			{
 				cmd->buttons.value |= cstypes::command_buttons::in_attack;
@@ -1996,6 +2101,11 @@ namespace features::combat {
 				{
 					cmd->csgo_user_cmd.set_attack1_start_history_index( history_size - 1 );
 				}
+
+				// This path has already written the real attack expression.
+				// Commit here instead of asking double_tap::on_fired to infer
+				// it through a second can_shoot check after last_shoot_tick moved.
+				features::misc::g_impacts.on_shot_committed( cmd->command_number );
 			}
 		}
 
@@ -2021,11 +2131,13 @@ namespace features::combat {
 		if ( !subtick_attack && ( vac_bypass || ( facing_away && settings::g_combat.m_antiaim.hide_shots.value ) ) )
 		{
 			// 7/29 VACNet hardening: the old over-the-horizon pitch (179.9)
-			// is now rejected by server-side viewangle validation, so the
-			// vac-bypass path uses an engine-valid inverted pitch instead
-			// (the heading reversal alone hides the aim; the bullet still
-			// travels through the input history angle).
-			command_aim.x = vac_bypass ? -punched_aim.x : 179.9f;
+			// is now rejected by server-side viewangle validation, so both
+			// hidden-heading paths use an engine-valid inverted pitch
+			// instead (the heading reversal alone hides the aim; the bullet
+			// still travels through the input history angle). Clamped so a
+			// steep aim + aim punch can never push the wire pitch past the
+			// ±90 validation bound.
+			command_aim.x = vac_bypass ? -punched_aim.x : std::clamp( -punched_aim.x, -89.0f, 89.0f );
 			// VACNet parity: jitter the hidden heading slightly every shot
 			// so the wire never carries a perfectly constant inverted
 			// angle - a repeatable signature the AI detector can learn.

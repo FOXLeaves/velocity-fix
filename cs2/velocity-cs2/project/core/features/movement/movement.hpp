@@ -2,18 +2,65 @@
 
 namespace features::movement {
 
+	// Owns the only movement coordinate-space conversion in create_move.
+	// Movement features write in the unmodified command frame; finish( )
+	// converts the base move and every subtick impulse into the final wire
+	// frame after anti-aim, aim and bypass code have finished changing yaw.
+	class movement_fix
+	{
+	public:
+		void begin( systems::input::usercmd* cmd );
+		void finish( systems::input::usercmd* cmd );
+		[[nodiscard]] bool claim_quantized_trajectory(
+			proto::base_usercmd_pb* base,
+			proto::subtick_move_step* const* steps,
+			int step_count );
+
+		[[nodiscard]] const math::vector2& source_impulses( ) const { return this->m_source_impulses; }
+		[[nodiscard]] float source_yaw( ) const { return this->m_source_yaw; }
+
+	private:
+		struct command_frame
+		{
+			std::intptr_t command_number{ -1 };
+			std::uintptr_t pawn{};
+			std::uintptr_t movement_buttons{};
+			float yaw{};
+			bool quantized_payload{};
+		};
+
+		static constexpr auto k_command_history_size{ 150 };
+		static constexpr auto k_max_quantized_trajectory_steps{ 31 };
+
+		struct quantized_step_claim
+		{
+			proto::subtick_move_step* step{};
+			std::uint32_t presence{};
+			float when{};
+			float forward_delta{};
+			float left_delta{};
+			float yaw_delta{};
+		};
+
+		math::vector2 m_wire_impulses{};
+		math::vector2 m_source_impulses{};
+		float m_source_yaw{};
+
+		command_frame m_command_frames[ k_command_history_size ]{};
+		command_frame m_legacy_command_frames[ k_command_history_size ]{};
+		proto::base_usercmd_pb* m_quantized_trajectory_base{};
+		quantized_step_claim m_quantized_trajectory[ k_max_quantized_trajectory_steps ]{};
+		int m_quantized_trajectory_count{};
+		bool m_quantized_trajectory_claimed{};
+		std::uintptr_t m_previous_buttons{};
+		bool m_previous_buttons_valid{};
+		bool m_active{};
+	};
+
 	class bhop
 	{
 	public:
 		void on_create_move( systems::input::usercmd* cmd );
-
-		// Hysteria-style high-frequency bhop: an independent thread polls
-		// the local velocity for the landing signature (vertical speed
-		// killed) and pulses the space key at the landing moment. The
-		// engine treats the pulse as a real keypress and the server
-		// resolves the takeoff on the landing tick at full speed - no
-		// subtick/trace dependence, immune to frame drops.
-		static void start_thread( );
 
 	private:
 		// Consecutive grounded commands: the first one keeps the held

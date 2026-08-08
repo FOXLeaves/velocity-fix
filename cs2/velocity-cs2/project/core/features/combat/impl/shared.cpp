@@ -102,7 +102,7 @@ namespace features::combat {
 		return ctx;
 	}
 
-	bool shared::penetration::run( const math::vector3& start, const math::vector3& end, const run_context& ctx, std::uintptr_t local_pawn, int local_team, result& out ) const
+	bool shared::penetration::run( const math::vector3& start, const math::vector3& end, const run_context& ctx, std::uintptr_t local_pawn, int local_team, result& out, int fallback_hitbox ) const
 	{
 		return detail::guarded( [ & ]( ) -> bool
 		{
@@ -223,6 +223,11 @@ namespace features::combat {
 
 		auto penetrated{ false };
 
+		// State for the through-wall geometry fallback (see below).
+		auto last_record_damage{ 0.0f };
+		auto penetrated_exit{ false };
+		auto damage_depleted{ false };
+
 		if ( !hit_array || !surface_array )
 		{
 			out = {};
@@ -236,8 +241,14 @@ namespace features::combat {
 
 			if ( !std::isfinite( damage ) || damage <= 0.0f )
 			{
+				// The bullet ran out of damage before reaching the
+				// target - the geometry fallback must not fire through
+				// a wall that exhausted the shot.
+				damage_depleted = true;
 				break;
 			}
+
+			last_record_damage = damage;
 
 			if ( ( hit->can_penetrate & 1 ) != 0 )
 			{
@@ -245,9 +256,18 @@ namespace features::combat {
 
 				if ( *reinterpret_cast< float* >( reinterpret_cast< std::uintptr_t >( hit ) + 4 ) == 1.0f )
 				{
+					// The bullet stopped inside the cover - it never
+					// reached the target, so the fallback below must
+					// not treat this as a successful wallbang.
+					penetrated_exit = false;
 					break;
 				}
 
+				// A can_penetrate record with an exit fraction < 1 is
+				// the client simulation confirming the bullet got
+				// through that surface (same semantics as penetration::
+				// can()).
+				penetrated_exit = true;
 				continue;
 			}
 
@@ -271,13 +291,50 @@ namespace features::combat {
 
 			if ( actual_hitbox < 0 )
 			{
-				continue;
+				// The engine trace resolved against the LIVE pose (the
+				// mid-trace hook is dropped by design), while the
+				// intersection test above ran against the rewound RECORD
+				// skeleton - on a moving target the stale record can miss
+				// a trace that visibly hit the body, and the hit was
+				// silently discarded. Fall back to the hitbox the caller
+				// aimed at: the server rewinds the target to the record
+				// tick when the shot fires, and that point IS the record
+				// pose - so the aimed hitbox is the pose's own hitbox.
+				actual_hitbox = fallback_hitbox;
+				if ( actual_hitbox < 0 )
+				{
+					continue;
+				}
 			}
 
 			out.hitbox = actual_hitbox;
 			out.hitgroup = systems::g_hitboxes.hitgroup_from_hitbox( actual_hitbox );
 			out.penetrated = penetrated;
 			out.damage = damage;
+
+			this->scale_damage( out.hitgroup, ctx.target_armor, ctx.has_helmet, ctx.target_team, ctx.armor_ratio, ctx.headshot_multiplier, ctx.scales, out.damage );
+
+			return true;
+		}
+
+		// Geometry fallback for wallbangs: the entity-hit records are
+		// tied back to the pawn through surface contact handles, and a
+		// penetration pass frequently produces records whose contact
+		// index resolves to the COVER's surface - the hit is then
+		// silently dropped even though the shot visibly connects (the
+		// player can hit it manually). When the client simulation
+		// confirmed the bullet passed through cover (penetrated_exit),
+		// the bullet had damage left (not damage_depleted) AND the ray
+		// geometrically crosses the target's record hitboxes, the
+		// server resolves that same trajectory against the same pose -
+		// accept the hit with the last recorded damage instead of
+		// staring at the wall.
+		if ( actual_hitbox >= 0 && penetrated_exit && !damage_depleted && last_record_damage > 0.0f )
+		{
+			out.hitbox = actual_hitbox;
+			out.hitgroup = systems::g_hitboxes.hitgroup_from_hitbox( actual_hitbox );
+			out.penetrated = true;
+			out.damage = last_record_damage;
 
 			this->scale_damage( out.hitgroup, ctx.target_armor, ctx.has_helmet, ctx.target_team, ctx.armor_ratio, ctx.headshot_multiplier, ctx.scales, out.damage );
 
@@ -1173,7 +1230,7 @@ namespace features::combat {
 			} );
 	}
 
-	float shared::calculate_hitchance( const math::vector3& shoot_position, const math::vector3& aim_angle, const systems::hitboxes::entry& hitbox, const systems::bones::data& bone, float inaccuracy, float spread, int samples ) const
+	float shared::calculate_hitchance( const math::vector3& shoot_position, const math::vector3& aim_angle, const systems::hitboxes::entry& hitbox, const systems::bones::data& bone, float inaccuracy, float spread, int samples, float threshold ) const
 	{
 		const auto total = spread + inaccuracy;
 		if ( total < 0.0001f )
@@ -1294,12 +1351,35 @@ namespace features::combat {
 			{
 				++hits;
 			}
+
+			// Exact early exit against the caller's gate threshold: when
+			// the sampled hits already clear the final target even if
+			// every remaining sample misses (or can no longer reach it
+			// no matter how many hit), the outcome is decided and the
+			// rest of the budget is skipped. These are hard bounds, not
+			// heuristics - the pass/fail decision is identical to a full
+			// sample run, but the common cases (center body points, out-
+			// of-body angles) sample a fraction of the budget. This is
+			// the hottest ragebot cost after the scan traces.
+			if ( threshold >= 0.0f )
+			{
+				const auto threshold_total = threshold * static_cast< float >( samples );
+				if ( static_cast< float >( hits ) >= threshold_total )
+				{
+					return static_cast< float >( hits ) / static_cast< float >( i + 1 );
+				}
+
+				if ( static_cast< float >( hits + ( samples - i - 1 ) ) < threshold_total )
+				{
+					return static_cast< float >( hits + ( samples - i - 1 ) ) / static_cast< float >( samples );
+				}
+			}
 		}
 
 		return static_cast< float >( hits ) / static_cast< float >( samples );
 	}
 
-	math::vector3 shared::find_spread_correction( const math::vector3& aim_angle, int tick ) const
+	math::vector3 shared::find_spread_correction( const math::vector3& aim_angle, int tick, std::uint32_t known_seed ) const
 	{
 		// Restored from the previous build: full 360 deg / 0.5 deg sweep
 		// (720 probes). The focused +/-6 deg grid that replaced it missed
@@ -1308,27 +1388,84 @@ namespace features::combat {
 		// silently dropped every no-spread shot and made the feature look
 		// broken. The full sweep always finds the bucket the coarse grid
 		// could jump over.
-		for ( auto i = 0; i < 720; i++ )
-		{
-			const auto test_angles = math::vector3{ static_cast< float >( i ) / 2.0f, aim_angle.y, 0.0f };
-			const auto seed = this->get_spread_seed( test_angles, tick );
+		//
+		// Speed: the 720 probes walked pitch 0..359.5 in 0.5 deg steps,
+		// which after the ±90 normalize visits every legal pitch TWICE -
+		// half the engine calls were wasted on duplicate angles. The
+		// sweep now probes the aim pitch neighborhood first (the seed
+		// bucket flips locally around the corrected pitch) and only falls
+		// back to the full legal pitch range (-89.5..89.5) when the
+		// neighborhood misses - the common case drops from 720 engine
+		// calls to ~40.
+		const auto try_pitch = [ & ]( float pitch ) -> std::optional<math::vector3>
+			{
+				const auto test_angles = math::vector3{ pitch, aim_angle.y, 0.0f };
+				const auto seed = this->get_spread_seed( test_angles, tick );
 
-			// The engine call is SEH-guarded and returns 0 on failure;
-			// skip rather than build a correction on a garbage seed.
-			if ( seed == 0 )
+				// The engine call is SEH-guarded and returns 0 on failure;
+				// skip rather than build a correction on a garbage seed.
+				if ( seed == 0 )
+				{
+					return std::nullopt;
+				}
+
+				const auto spread = this->calculate_spread( seed, this->m_ctx.inaccuracy, this->m_ctx.spread, this->m_ctx.recoil_index, this->m_ctx.item_def_idx, this->m_ctx.num_bullets );
+
+				auto adj_angle = aim_angle;
+				adj_angle.x += math::helpers::rad_to_deg( std::atan( std::sqrt( spread.x * spread.x + spread.y * spread.y ) ) );
+				adj_angle.z = -math::helpers::rad_to_deg( std::atan2( spread.x, spread.y ) );
+
+				if ( this->get_spread_seed( adj_angle, tick ) == seed )
+				{
+					return adj_angle;
+				}
+
+				return std::nullopt;
+			};
+
+		// Spread-cone lift of the aim itself (reuses the caller's seed
+		// when available) - the neighborhood center.
+		auto lift{ 0.0f };
+		if ( const auto aim_seed = known_seed != 0 ? known_seed : this->get_spread_seed( aim_angle, tick ) )
+		{
+			const auto aim_spread = this->calculate_spread( aim_seed, this->m_ctx.inaccuracy, this->m_ctx.spread, this->m_ctx.recoil_index, this->m_ctx.item_def_idx, this->m_ctx.num_bullets );
+			lift = math::helpers::rad_to_deg( std::atan( std::sqrt( aim_spread.x * aim_spread.x + aim_spread.y * aim_spread.y ) ) );
+		}
+
+		const auto center = aim_angle.x + lift;
+
+		// Tight neighborhood: +-2 deg in 0.5 deg steps (9 probes) around
+		// the lifted pitch - the target bucket sits right there.
+		for ( auto i = -4; i <= 4; ++i )
+		{
+			if ( auto correction = try_pitch( center + static_cast< float >( i ) * 0.5f ) )
+			{
+				return *correction;
+			}
+		}
+
+		// Wider neighborhood: +-6 deg (24 more probes) for weapons with
+		// a large cone whose lift shifts across buckets.
+		for ( auto i = -12; i <= 12; ++i )
+		{
+			if ( std::abs( i ) <= 4 )
 			{
 				continue;
 			}
 
-			const auto spread = this->calculate_spread( seed, this->m_ctx.inaccuracy, this->m_ctx.spread, this->m_ctx.recoil_index, this->m_ctx.item_def_idx, this->m_ctx.num_bullets );
-
-			auto adj_angle = aim_angle;
-			adj_angle.x += math::helpers::rad_to_deg( std::atan( std::sqrt( spread.x * spread.x + spread.y * spread.y ) ) );
-			adj_angle.z = -math::helpers::rad_to_deg( std::atan2( spread.x, spread.y ) );
-
-			if ( this->get_spread_seed( adj_angle, tick ) == seed )
+			if ( auto correction = try_pitch( center + static_cast< float >( i ) * 0.5f ) )
 			{
-				return adj_angle;
+				return *correction;
+			}
+		}
+
+		// Full legal pitch range: 0..179.5 deg (0.5 deg steps) covers
+		// every pitch after the +-90 normalize - no duplicates.
+		for ( auto i = 0; i < 360; ++i )
+		{
+			if ( auto correction = try_pitch( static_cast< float >( i ) / 2.0f ) )
+			{
+				return *correction;
 			}
 		}
 

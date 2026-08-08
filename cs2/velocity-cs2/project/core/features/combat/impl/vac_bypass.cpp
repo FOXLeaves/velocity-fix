@@ -68,16 +68,6 @@ namespace features::combat {
 
 		this->suppress_cheat_cvars( );
 
-		// On a firing tick the rage path already wrote the attack entry
-		// into the input history (angles, attack timestamp). Appending a
-		// fresh entry here with the current client tick would sit after the
-		// attack entry and can shadow it on the server - leave the history
-		// alone while firing.
-		if ( features::combat::g_rage.is_firing_this_tick( ) )
-		{
-			return;
-		}
-
 		const auto base = cmd ? cmd->csgo_user_cmd.mutable_base( ) : nullptr;
 		if ( !base )
 		{
@@ -116,6 +106,22 @@ namespace features::combat {
 		// (Fires still get their history entry from the rage path.)
 		last_angles = current_angles;
 		have_last_angles = true;
+
+		// Firing tick: the rage path already wrote the attack entry into
+		// the input history (angles, attack timestamp). Appending a fresh
+		// entry here with the current client tick would sit after the
+		// attack entry and can shadow it on the server - leave the history
+		// alone. The mouse deltas above are still applied though: on a
+		// firing tick the wire view (fire_gun's hidden heading) jumps by
+		// ~180°, and a sudden view jump with a zero mouse delta is the
+		// exact "automated aiming" signature VACnet reads (it restarted
+		// full behavior analysis after the 7/29 fix). Reflecting the jump
+		// into the deltas keeps the server-side view prediction (last
+		// angles + mouse delta) consistent with the wire.
+		if ( features::combat::g_rage.is_firing_this_tick( ) )
+		{
+			return;
+		}
 
 		if ( !last_valid || moved < 0.05f )
 		{

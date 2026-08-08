@@ -67,6 +67,9 @@ namespace systems {
 		this->m_prestate.last_movement_impulses.x = memory::read<float>( movement_services + SCHEMA( "CPlayer_MovementServices", "m_flCmdForwardMove"_hash ) );
 		this->m_prestate.last_movement_impulses.y = memory::read<float>( movement_services + SCHEMA( "CPlayer_MovementServices", "m_flCmdLeftMove"_hash ) );
 		this->m_prestate.last_movement_impulses.z = memory::read<float>( movement_services + SCHEMA( "CPlayer_MovementServices", "m_flCmdUpMove"_hash ) );
+		this->m_prestate.last_movement_forward = memory::read<math::vector3>( movement_services + SCHEMA( "CCSPlayer_MovementServices", "m_vecForward"_hash ) );
+		this->m_prestate.last_movement_left = memory::read<math::vector3>( movement_services + SCHEMA( "CCSPlayer_MovementServices", "m_vecLeft"_hash ) );
+		this->m_prestate.last_command_number_processed = memory::read<std::uint32_t>( movement_services + SCHEMA( "CPlayer_MovementServices", "m_nLastCommandNumberProcessed"_hash ) );
 
 		const auto game_scene_node = memory::read<std::uintptr_t>( local_pawn + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
 		if ( game_scene_node )
