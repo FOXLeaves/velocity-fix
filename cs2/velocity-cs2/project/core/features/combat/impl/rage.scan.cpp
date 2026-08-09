@@ -8,9 +8,11 @@
 #include <core/settings.hpp>
 #include <protection/game_addresses.hpp>
 
-// Ragebot target scanning and evaluation: per-player hitbox scans,
-// hitchance evaluation and best-target selection, split out of rage.cpp.
+// Ragebot target scanning and evaluation (rewritten): per-player hitbox
+// scans with a dynamic hitbox priority, hitchance evaluation and a
+// dimension-split target scoring model.
 namespace features::combat {
+
 	std::vector<rage::scan_hit> rage::scan_players( const math::vector3& eye, float inaccuracy, const aim_context& ctx, std::vector<candidate>& candidates, const systems::local::snapshot& local, int max_traces ) const
 	{
 		diag::set_exception_phase( "rage: scan" );
@@ -19,18 +21,12 @@ namespace features::combat {
 		std::vector<std::vector<scan_hit>> per_candidate( candidates.size( ) );
 
 		// Trace budget: every scan point costs an engine trace_bullet
-		// (the hottest ragebot cost). With a full server the unthrottled
-		// scan runs hundreds of them per tick and the frame time spikes.
-		// The budget caps the total per scan pass - full scans for a few
-		// targets, and a fixed upper bound for crowded servers.
+		// (the hottest ragebot cost). The budget caps the total per scan
+		// pass - full scans for a few targets, a fixed upper bound for
+		// crowded servers. Every candidate also gets a fair-share slice
+		// so the first targets cannot drain the shared budget and the
+		// last ones on a crowded server never get scanned at all.
 		std::atomic<int> trace_budget{ max_traces };
-
-		// Fair-share slice: without it the candidates that start first
-		// would drain the shared budget and the last targets on a
-		// crowded server would never get scanned at all (aim drops
-		// targets under load). Each candidate gets its own slice; the
-		// global budget still caps the total, so the worst-case cost
-		// is unchanged while every target keeps a chance to be hit.
 		const auto share = std::max( max_traces / std::max( candidate_count, 1 ), 48 );
 
 		const auto scan_range = [ & ]( int begin, int end )
@@ -66,16 +62,14 @@ namespace features::combat {
 							candidate_hits.push_back( std::move( h ) );
 						}
 
-						// A viable shot on the newest record is both more reliable and
-						// cheaper than evaluating historical poses for the same target.
+						// A viable shot on the newest record is both more
+						// reliable and cheaper than evaluating historical
+						// poses for the same target.
 						if ( has_direct_hit )
 						{
 							break;
 						}
 
-						// Budget exhausted: stop scanning further records and
-						// candidates - the remaining budget is better spent
-						// keeping the scan pass short.
 						if ( trace_budget.load( std::memory_order_relaxed ) <= 0 )
 						{
 							return;
@@ -140,32 +134,49 @@ namespace features::combat {
 			return {};
 		}
 
-		// Scan order: head first, then limbs, then the torso - the torso
-		// multipoints are the reliable fallback, so they go last.
+		// Dynamic hitbox priority (new): value order head > chest > stomach
+		// > legs > arms. A fast-moving target flips chest above head - the
+		// small head capsule is far less reliable under motion, the torso
+		// stays hittable and the damage floor is still met.
 		std::array<int, 20> scan_order{};
 		auto scan_count{ 0 };
 
-		for ( auto idx : { 0 } )
+		const auto fast_target = cand.velocity.length_2d( ) >= 300.0f;
+
+		if ( fast_target )
+		{
+			for ( auto idx : { 4, 5, 6 } )
+			{
+				scan_order[ scan_count++ ] = idx;
+			}
+			for ( auto idx : { 0 } )
+			{
+				scan_order[ scan_count++ ] = idx;
+			}
+		}
+		else
+		{
+			for ( auto idx : { 0 } )
+			{
+				scan_order[ scan_count++ ] = idx;
+			}
+			for ( auto idx : { 4, 5, 6 } )
+			{
+				scan_order[ scan_count++ ] = idx;
+			}
+		}
+
+		for ( auto idx : { 2, 3 } )
+		{
+			scan_order[ scan_count++ ] = idx;
+		}
+
+		for ( auto idx : { 7, 8, 9, 10, 11, 12 } )
 		{
 			scan_order[ scan_count++ ] = idx;
 		}
 
 		for ( auto idx : { 13, 14, 15, 16, 17, 18 } )
-		{
-			scan_order[ scan_count++ ] = idx;
-		}
-
-		for ( auto idx : { 7, 8, 9, 10 } )
-		{
-			scan_order[ scan_count++ ] = idx;
-		}
-
-		for ( auto idx : { 11, 12 } )
-		{
-			scan_order[ scan_count++ ] = idx;
-		}
-
-		for ( auto idx : { 4, 5, 6, 3, 2 } )
 		{
 			scan_order[ scan_count++ ] = idx;
 		}
@@ -300,21 +311,12 @@ namespace features::combat {
 				m_debug_points.push_back( { center, hitbox_index, true } );
 			}
 
-			// Multipoints first: they cover far more of the hitbox than the
-			// center alone, so a shootable point is found sooner - faster
-			// lock-on and more hits on moving/edge cases. A direct hit with
-			// lethal damage ends the hitbox scan early - further points
-			// cannot improve on it, and every skipped trace_bullet call is
-			// a big FPS win (the engine trace is the hottest ragebot cost).
-			//
-			// Stationary targets skip the edge multipoints entirely: the
-			// client-side ray vs the server's capsule resolution carry a
-			// small implementation difference, and an edge point that hugs
-			// the capsule surface can sit just outside on the server side -
-			// the geometric CENTER is the point that is guaranteed inside
-			// no matter the resolution delta, so it wins for a standing
-			// target. Moving targets keep the multipoints (they absorb the
-			// pose/velocity residual).
+			// Multipoints only for moving targets: they absorb the
+			// pose/velocity residual that shifts the surface between the
+			// record and what the server resolves. A stationary target's
+			// geometric CENTER is the point guaranteed inside the capsule
+			// no matter the resolution delta, so edge points only risk
+			// landing just outside on the server side.
 			if ( config.pointscale > 0.0f && cand.velocity.length_2d( ) >= 5.0f )
 			{
 				const auto mps = this->generate_multipoints( *hb, center, bone.rotation, config.pointscale, eye, inaccuracy );
@@ -349,8 +351,34 @@ namespace features::combat {
 		return results;
 	}
 
-	rage::target rage::select_best( const aim_context& aim_ctx, const std::vector<scan_hit>& hits, float eval_inaccuracy ) const
-	{		diag::set_exception_phase( "rage: select_best" );
+	rage::target rage::select_best( const aim_context& ctx, const std::vector<scan_hit>& hits, float eval_inaccuracy ) const
+	{
+		diag::set_exception_phase( "rage: select_best" );
+
+		// Scoring model (rewritten): dimension-split weights instead of
+		// an inline magic-number pile. The feasibility gate (hitchance
+		// passing the configured threshold) is decisive - a shot that
+		// cannot land reliably never wins, no matter its damage.
+		constexpr auto k_feasibility_scale{ 1000000.0f };
+		// Lethality
+		constexpr auto k_lethal_bonus{ 100000.0f };
+		constexpr auto k_damage_per_hc{ 100.0f };
+		constexpr auto k_damage_weight{ 5.0f };
+		// Reliability
+		constexpr auto k_direct_bonus{ 250.0f };
+		constexpr auto k_center_bonus{ 50.0f };
+		constexpr auto k_dt_center_bonus{ 200.0f };
+		// Pose freshness
+		constexpr auto k_pose_current{ 150000.0f };
+		constexpr auto k_pose_rewind_penalty{ 5000.0f };
+		// Double tap claim alignment (dominates everything)
+		constexpr auto k_dt_align_bonus{ 200000.0f };
+		constexpr auto k_dt_align_penalty{ 5000.0f };
+		// Aim stability
+		constexpr auto k_hitgroup_weight{ 2.0f };
+		constexpr auto k_fov_penalty{ 0.1f };
+		// Target-switch debounce
+		constexpr auto k_switch_debounce{ 800.0f };
 
 		auto hitgroup_priority = [ ]( int hitbox_index ) -> int
 			{
@@ -394,7 +422,7 @@ namespace features::combat {
 
 		auto cheap_score = [ & ]( const scan_hit& h ) -> float
 			{
-				const auto lethal_bonus = h.damage * 0.9f >= static_cast< float >( h.health ) ? 100000.0f : 0.0f;
+				const auto lethal_bonus = h.damage * 0.9f >= static_cast< float >( h.health ) ? k_lethal_bonus : 0.0f;
 				const auto direct_bonus = h.penetrated ? 0.0f : 5000.0f;
 				const auto center_bonus = h.is_center ? 2000.0f : 0.0f;
 
@@ -456,25 +484,39 @@ namespace features::combat {
 					continue;
 				}
 
-			const auto& bone = group.record->bones[ h.bone_index ];
-			float hc{ 1.0f };
-			if ( !config.no_spread.value )
-			{
-				// Adaptive sampling with threshold focus: 256 samples keep
-				// the common case fast, and when the estimate lands near
-				// the configured threshold it re-checks with 512 so the
-				// pass/fail decision does not flutter tick-to-tick from
-				// sampling noise (that flutter read as hesitant firing).
-				const auto dist = ( h.source_eye.position - h.position ).length( );
-				auto samples = dist < 900.0f ? 256 : dist < 2200.0f ? 256 : 512;
-				hc = g_shared.calculate_hitchance( h.source_eye.position, h.aim_angle, h.hitbox, bone, eval_inaccuracy, aim_ctx.spread, samples, needed_hc - 0.01f );
-				if ( std::fabsf( hc - needed_hc ) < 0.05f && samples < 512 )
+				const auto& bone = group.record->bones[ h.bone_index ];
+				float hc{ 1.0f };
+				if ( !config.no_spread.value )
 				{
-					hc = g_shared.calculate_hitchance( h.source_eye.position, h.aim_angle, h.hitbox, bone, eval_inaccuracy, aim_ctx.spread, 512, needed_hc - 0.01f );
+					// Adaptive sampling with threshold focus: 256 samples keep
+					// the common case fast, and when the estimate lands near
+					// the configured threshold it re-checks with 512 so the
+					// pass/fail decision does not flutter tick-to-tick from
+					// sampling noise (that flutter read as hesitant firing).
+					const auto dist = ( h.source_eye.position - h.position ).length( );
+					auto samples = dist < 900.0f ? 256 : dist < 2200.0f ? 256 : 512;
+					hc = g_shared.calculate_hitchance( h.source_eye.position, h.aim_angle, h.hitbox, bone, eval_inaccuracy, ctx.spread, samples, needed_hc - 0.01f );
+					if ( std::fabsf( hc - needed_hc ) < 0.05f && samples < 512 )
+					{
+						hc = g_shared.calculate_hitchance( h.source_eye.position, h.aim_angle, h.hitbox, bone, eval_inaccuracy, ctx.spread, 512, needed_hc - 0.01f );
+					}
+					// Diagnostic: a high hitchance under a large inaccuracy
+					// cone is physically impossible (0.02+ rad at 1000+ units
+					// scatters the cone way past any capsule). Log the actual
+					// inputs once so a stale accuracy getter / engine spread
+					// mismatch is visible instead of "fires but misses".
+					if ( eval_inaccuracy > 0.02f && hc > 0.5f )
+					{
+						static bool hc_inputs_warned{};
+						if ( !hc_inputs_warned )
+						{
+							hc_inputs_warned = true;
+							diag::writef( diag::level::info, "[hitchance] HIGH hc under large inaccuracy: inacc {:.5f} spread {:.5f} hc {:.3f} dist {:.0f} samples {}", eval_inaccuracy, ctx.spread, hc, dist, samples );
+						}
+					}
 				}
-			}
-			const auto hp = static_cast< float >( h.health );
-			const auto can_kill = h.damage >= hp;
+				const auto hp = static_cast< float >( h.health );
+				const auto can_kill = h.damage >= hp;
 				// The head is the lethal hitbox: its small capsule caps the
 				// reachable sampled hitchance far below the body's, so a
 				// strict threshold made ragebot wait forever on visible
@@ -485,25 +527,25 @@ namespace features::combat {
 				const auto is_head = systems::g_hitboxes.hitgroup_from_hitbox( h.hitbox_index ) == 1;
 				const auto head_tolerance = is_head ? ( can_kill ? 0.25f : 0.10f ) : 0.0f;
 				const auto passes_hitchance = config.no_spread.value || hc >= needed_hc - 0.01f - head_tolerance;
-				auto score = passes_hitchance ? 1000000.0f : 0.0f;
+				auto score = passes_hitchance ? k_feasibility_scale : 0.0f;
 
 				if ( can_kill )
 				{
-					score += 100000.0f + hc * 10000.0f;
+					score += k_lethal_bonus + hc * 10000.0f;
 				}
 				else
 				{
-					score += h.damage * hc * 100.0f + h.damage * 5.0f;
+					score += h.damage * hc * k_damage_per_hc + h.damage * k_damage_weight;
 				}
 
-				score += h.penetrated ? 0.0f : 250.0f;
+				score += h.penetrated ? 0.0f : k_direct_bonus;
 				// Center points are the most stable aim reference during
 				// double tap (the rewound pose carries a residual offset,
 				// so a center point stays inside while an edge multipoint
 				// may not) - boost them under DT.
-				score += h.is_center ? ( settings::g_combat.m_ragebot.m_double_tap.enabled.value ? 200.0f : 50.0f ) : 0.0f;
-				score += static_cast< float >( hitgroup_priority( h.hitbox_index ) ) * 2.0f;
-				score -= h.fov * 0.1f;
+				score += h.is_center ? ( settings::g_combat.m_ragebot.m_double_tap.enabled.value ? k_dt_center_bonus : k_center_bonus ) : 0.0f;
+				score += static_cast< float >( hitgroup_priority( h.hitbox_index ) ) * k_hitgroup_weight;
+				score -= h.fov * k_fov_penalty;
 
 				// Pose priority, velocity-aware: the extrapolated prediction
 				// is the closest match to the pose the server resolves
@@ -521,8 +563,8 @@ namespace features::combat {
 				// record. A rewound pose's "direct hit / lethal" is a
 				// phantom - the server never rewinds to it - so the
 				// freshness term dominates every other score component
-				// (lethal +100k included) and stale poses are penalized
-				// hard instead of winning on fake damage.
+				// (lethal included) and stale poses are penalized hard
+				// instead of winning on fake damage.
 				//
 				// Double tap overrides the priority: every attack claims
 				// the weapon-ready tick on the input history, and the
@@ -531,9 +573,9 @@ namespace features::combat {
 				// resolve the shot against - anything else (live/extrap)
 				// makes the rewound body drift off the aimed point and
 				// both shots of the pair miss. The alignment bonus must
-				// dominate every other score term (lethal +100k, direct
-				// +5k): a "direct hit" on a non-aligned pose is a phantom
-				// - the server never rewinds to it - so it must never win.
+				// dominate every other score term: a "direct hit" on a
+				// non-aligned pose is a phantom - the server never rewinds
+				// to it - so it must never win.
 				if ( settings::g_combat.m_ragebot.m_double_tap.enabled.value && h.record )
 				{
 					const auto claim_tick = const_cast<rage*>( this )->m_double_tap.claimed_tick( );
@@ -543,13 +585,13 @@ namespace features::combat {
 					// stricter gate would swap the aligned record tick to
 					// tick and the aim would jump between poses. Within the
 					// tolerance the alignment dominates everything.
-					score += align <= 2 ? 200000.0f : -static_cast< float >( align ) * 5000.0f;
+					score += align <= 2 ? k_dt_align_bonus : -static_cast< float >( align ) * k_dt_align_penalty;
 				}
 				else if ( h.record && h.record->extrapolated )
 				{
 					// Predicted current pose - the closest match to the
 					// current-tick resolution.
-					score += 150000.0f;
+					score += k_pose_current;
 				}
 				else if ( h.record )
 				{
@@ -557,14 +599,14 @@ namespace features::combat {
 					if ( age <= 1 )
 					{
 						// Newest live record ≈ current pose.
-						score += 150000.0f;
+						score += k_pose_current;
 					}
 					else
 					{
 						// Rewound pose: the server resolves the current
 						// tick, this pose is a phantom - never let a fake
 						// "direct hit" on it win.
-						score -= static_cast< float >( age ) * 5000.0f;
+						score -= static_cast< float >( age ) * k_pose_rewind_penalty;
 					}
 				}
 
@@ -610,7 +652,7 @@ namespace features::combat {
 			// the previous tick. Re-aiming at a different target every tick
 			// re-aligns pose/claim each time and tanks the hit rate during
 			// a multi-target fight; a clearly better score still wins.
-			if ( best.valid && e.score > best.score - 800.0f && h.pawn == this->m_last_select_pawn )
+			if ( best.valid && e.score > best.score - k_switch_debounce && h.pawn == this->m_last_select_pawn )
 			{
 				is_better = true;
 			}
@@ -747,57 +789,57 @@ namespace features::combat {
 		// Trace from outside through the center to find the real capsule surface.
 		// This is accurate around rounded end caps, where radius offsets are not.
 		const auto surface_point = [ & ]( const math::vector3& direction ) -> math::vector3
-		{
-			const auto dir = direction.normalized( );
-
-			if ( hitbox.radius > 0.001f )
 			{
-				const auto reach = ( capsule_b - capsule_a ).length( ) + hitbox.radius * 2.0f + 1.0f;
-				const auto origin = center + dir * reach;
-				const auto delta = dir * ( reach * -2.0f );
-				auto fraction{ 1.0f };
+				const auto dir = direction.normalized( );
 
-				if ( g_shared.ray_vs_capsule( origin, delta, capsule_a, capsule_b, hitbox.radius, fraction ) )
+				if ( hitbox.radius > 0.001f )
 				{
-					return origin + delta * fraction;
+					const auto reach = ( capsule_b - capsule_a ).length( ) + hitbox.radius * 2.0f + 1.0f;
+					const auto origin = center + dir * reach;
+					const auto delta = dir * ( reach * -2.0f );
+					auto fraction{ 1.0f };
+
+					if ( g_shared.ray_vs_capsule( origin, delta, capsule_a, capsule_b, hitbox.radius, fraction ) )
+					{
+						return origin + delta * fraction;
+					}
 				}
-			}
-			else
-			{
-				// Intersect box hitboxes in bone space using their directional support.
-				auto inverse = bone_rot;
-				inverse.x = -inverse.x;
-				inverse.y = -inverse.y;
-				inverse.z = -inverse.z;
-				const auto local_dir = inverse.rotate_vector( dir );
-				const auto extents = ( hitbox.maxs - hitbox.mins ) * 0.5f;
-				auto distance = 8192.0f;
-
-				if ( std::fabs( local_dir.x ) > 1.0e-6f ) distance = std::min( distance, std::fabs( extents.x / local_dir.x ) );
-				if ( std::fabs( local_dir.y ) > 1.0e-6f ) distance = std::min( distance, std::fabs( extents.y / local_dir.y ) );
-				if ( std::fabs( local_dir.z ) > 1.0e-6f ) distance = std::min( distance, std::fabs( extents.z / local_dir.z ) );
-
-				if ( distance < 8192.0f )
+				else
 				{
-					return center + dir * distance;
-				}
-			}
+					// Intersect box hitboxes in bone space using their directional support.
+					auto inverse = bone_rot;
+					inverse.x = -inverse.x;
+					inverse.y = -inverse.y;
+					inverse.z = -inverse.z;
+					const auto local_dir = inverse.rotate_vector( dir );
+					const auto extents = ( hitbox.maxs - hitbox.mins ) * 0.5f;
+					auto distance = 8192.0f;
 
-			return center;
-		};
+					if ( std::fabs( local_dir.x ) > 1.0e-6f ) distance = std::min( distance, std::fabs( extents.x / local_dir.x ) );
+					if ( std::fabs( local_dir.y ) > 1.0e-6f ) distance = std::min( distance, std::fabs( extents.y / local_dir.y ) );
+					if ( std::fabs( local_dir.z ) > 1.0e-6f ) distance = std::min( distance, std::fabs( extents.z / local_dir.z ) );
+
+					if ( distance < 8192.0f )
+					{
+						return center + dir * distance;
+					}
+				}
+
+				return center;
+			};
 
 		const auto scaled_surface = [ & ]( const math::vector3& direction )
-		{
-			const auto surface = surface_point( direction );
-			return center + ( surface - center ) * scale;
-		};
+			{
+				const auto surface = surface_point( direction );
+				return center + ( surface - center ) * scale;
+			};
 
 		// Extra-point sets carry their own scale (0 disables the set).
 		const auto scaled_surface_at = [ & ]( const math::vector3& direction, float s )
-		{
-			const auto surface = surface_point( direction );
-			return center + ( surface - center ) * s;
-		};
+			{
+				const auto surface = surface_point( direction );
+				return center + ( surface - center ) * s;
+			};
 
 		switch ( hitbox.index )
 		{

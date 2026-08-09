@@ -1,4 +1,4 @@
-﻿#include <pch/pch.hpp>
+#include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
 #include <utilities/diag.hpp>
@@ -1012,7 +1012,7 @@ namespace hooks {
 	char __fastcall cheat::set_info( std::uintptr_t rcx, std::uintptr_t a2 )
 	{
 		const auto& cfg = settings::g_misc.m_name_changer;
-		const auto should_override = cfg.clantag.value || cfg.override_name.value || features::misc::other::s_name_change_pending;
+		const auto should_override = cfg.clantag.value || cfg.override_name.value || features::misc::other::s_name_change_pending || features::misc::other::s_name_restoring;
 		if ( should_override && a2 )
 		{
 			const auto arg_list = memory::safe_read<std::uintptr_t>( a2 + 0x440 ).value_or( 0 );

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <utilities/math/math.hpp>
 #include <external/config.hpp>
@@ -1264,6 +1264,8 @@ namespace settings {
 		struct name_changer
 		{
 			xui::setting clantag{ false, {}, "clantag", "name changer" };
+			// Custom clantag text (empty falls back to the default tag).
+			config::str clantag_text{ "velocity plus", "name changer", "clantag text" };
 			xui::setting override_name{ false, {}, "override name", "name changer" };
 			config::str name{ "Player", "name changer", "name" };
 		} m_name_changer{};

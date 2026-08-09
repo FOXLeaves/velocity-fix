@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
 #include <utilities/logging/logging.hpp>
@@ -106,6 +106,8 @@ namespace features::combat {
 	{
 		return detail::guarded( [ & ]( ) -> bool
 		{
+		out = {};
+
 		if ( this->m_weapon_data.damage <= 0.0f )
 		{
 			return false;
@@ -114,6 +116,7 @@ namespace features::combat {
 		const auto direction = ( end - start ).normalized( );
 		const auto trace_delta = direction * this->m_weapon_data.range;
 
+		// --- 1. Trace preparation -------------------------------------------
 		auto filter = systems::g_tracing.make_filter( local_pawn, 0x1c300b, 3, 15 );
 		// Rage scanning calls this hundreds of times in a frame. Reuse the large
 		// trace buffer per worker instead of allocating and freeing 7 KB per
@@ -141,24 +144,12 @@ namespace features::combat {
 		g_shared.m_autowalling = false;
 		g_shared.m_current_autowall_record = nullptr;
 
-		const auto num_hits = trace->num_hits;
-		const auto hit_array = reinterpret_cast< std::uintptr_t >( trace->hit_array_pointer );
-
-		if ( num_hits <= 0 || num_hits > 64 )
-		{
-			// A garbage hit count from a drifted engine signature would walk
-			// the hit array out of bounds below.
-			out = {};
-			return false;
-		}
-
-		const auto surface_array = reinterpret_cast< std::uintptr_t >( trace->array_pointer );
-
-		// Penetration budget of 4, matching the old known-good build (the
-		// server's own budget is a separate quantity; the old build worked
-		// with 4, so the value is not what makes walls disagree).
-		memory::call<void> (PATTERN (patterns::trace_bullet), trace, this->m_weapon_data.damage, this->m_weapon_data.penetration, this->m_weapon_data.range_modifier, 4, local_team, static_cast<std::uintptr_t>(0));
-
+		// --- 2. Geometric target match ---------------------------------------
+		// The engine resolves the trace against the LIVE pose (the marker is
+		// dropped by design), while the server rewinds the target to the
+		// record tick when the attack fires. Cross-check the ray against the
+		// rewound RECORD skeleton: the closest intersected hitbox is the one
+		// the server would resolve the shot through.
 		auto actual_hitbox{ -1 };
 		auto closest_hitbox_fraction{ 1.0f };
 		if ( ctx.record )
@@ -182,6 +173,7 @@ namespace features::combat {
 				}
 				else
 				{
+					// Box hitboxes: slab test in bone space.
 					auto inverse = bone.rotation;
 					inverse.x = -inverse.x;
 					inverse.y = -inverse.y;
@@ -221,56 +213,72 @@ namespace features::combat {
 			}
 		}
 
-		auto penetrated{ false };
+		// --- 3. Engine bullet simulation --------------------------------------
+		const auto num_hits = trace->num_hits;
+		const auto hit_array = reinterpret_cast< std::uintptr_t >( trace->hit_array_pointer );
+		const auto surface_array = reinterpret_cast< std::uintptr_t >( trace->array_pointer );
 
-		// State for the through-wall geometry fallback (see below).
-		auto last_record_damage{ 0.0f };
-		auto penetrated_exit{ false };
-		auto damage_depleted{ false };
-
-		if ( !hit_array || !surface_array )
+		// Garbage hit counts from a drifted engine signature would walk the
+		// hit array out of bounds below.
+		if ( num_hits <= 0 || num_hits > 64 || !hit_array || !surface_array )
 		{
-			out = {};
 			return false;
 		}
+
+		memory::call<void> (PATTERN (patterns::trace_bullet), trace, this->m_weapon_data.damage, this->m_weapon_data.penetration, this->m_weapon_data.range_modifier, 4, local_team, static_cast<std::uintptr_t>(0));
+
+		// --- 4. Hit resolution ------------------------------------------------
+		// State machine over the engine's hit records:
+		//   flying  - still travelling, no entity hit yet
+		//   struck  - a physical hit record tied back to the target pawn
+		//   blocked - the bullet stopped inside cover (exit fraction 1)
+		//   spent   - damage ran out before reaching the target
+		//   missed  - the whole pass never touched the target
+		enum class phase : std::uint8_t
+		{
+			flying,
+			struck,
+			blocked,
+			spent,
+			missed
+		};
+
+		auto current_phase{ phase::flying };
+		auto last_damage{ 0.0f };
+		auto wall_hits{ 0 };
 
 		for ( auto i = 0; i < num_hits; ++i )
 		{
 			auto hit = reinterpret_cast< detail::bullet_trace_record* >( hit_array + i * sizeof( detail::bullet_trace_record ) );
-			const auto damage = *reinterpret_cast< float* >( reinterpret_cast< std::uintptr_t >( hit ) + 8 );
+			const auto damage = hit->damage_applied;
 
 			if ( !std::isfinite( damage ) || damage <= 0.0f )
 			{
-				// The bullet ran out of damage before reaching the
-				// target - the geometry fallback must not fire through
-				// a wall that exhausted the shot.
-				damage_depleted = true;
+				// The bullet ran out of damage before reaching the target -
+				// the geometry fallback must not fire through a wall that
+				// exhausted the shot.
+				current_phase = phase::spent;
 				break;
 			}
 
-			last_record_damage = damage;
+			last_damage = damage;
 
 			if ( ( hit->can_penetrate & 1 ) != 0 )
 			{
-				penetrated = true;
-
-				if ( *reinterpret_cast< float* >( reinterpret_cast< std::uintptr_t >( hit ) + 4 ) == 1.0f )
+				// Penetration record: an exit fraction of 1 means the bullet
+				// did not make it through that surface.
+				if ( hit->exit_fraction == 1.0f )
 				{
-					// The bullet stopped inside the cover - it never
-					// reached the target, so the fallback below must
-					// not treat this as a successful wallbang.
-					penetrated_exit = false;
+					current_phase = phase::blocked;
 					break;
 				}
 
-				// A can_penetrate record with an exit fraction < 1 is
-				// the client simulation confirming the bullet got
-				// through that surface (same semantics as penetration::
-				// can()).
-				penetrated_exit = true;
+				++wall_hits;
 				continue;
 			}
 
+			// Physical hit record: the contact index resolves back to a
+			// surface array entry holding the hit entity handle.
 			const auto trace_holder = surface_array + sizeof( systems::tracing::trace_array_element ) * ( hit->enter_contact_ix & 0x7fff );
 			const auto hit_handle = memory::read<std::uint32_t>( trace_holder + 0x2c );
 
@@ -289,10 +297,16 @@ namespace features::combat {
 				continue;
 			}
 
+			current_phase = phase::struck;
+			break;
+		}
+
+		// --- 5. Commit ---------------------------------------------------------
+		if ( current_phase == phase::struck )
+		{
 			if ( actual_hitbox < 0 )
 			{
-				// The engine trace resolved against the LIVE pose (the
-				// mid-trace hook is dropped by design), while the
+				// The engine trace resolved against the LIVE pose, while the
 				// intersection test above ran against the rewound RECORD
 				// skeleton - on a moving target the stale record can miss
 				// a trace that visibly hit the body, and the hit was
@@ -303,45 +317,43 @@ namespace features::combat {
 				actual_hitbox = fallback_hitbox;
 				if ( actual_hitbox < 0 )
 				{
-					continue;
+					return false;
 				}
 			}
 
 			out.hitbox = actual_hitbox;
 			out.hitgroup = systems::g_hitboxes.hitgroup_from_hitbox( actual_hitbox );
-			out.penetrated = penetrated;
-			out.damage = damage;
+			out.penetrated = wall_hits > 0;
+			out.damage = last_damage;
 
 			this->scale_damage( out.hitgroup, ctx.target_armor, ctx.has_helmet, ctx.target_team, ctx.armor_ratio, ctx.headshot_multiplier, ctx.scales, out.damage );
 
 			return true;
 		}
 
-		// Geometry fallback for wallbangs: the entity-hit records are
-		// tied back to the pawn through surface contact handles, and a
-		// penetration pass frequently produces records whose contact
-		// index resolves to the COVER's surface - the hit is then
-		// silently dropped even though the shot visibly connects (the
-		// player can hit it manually). When the client simulation
-		// confirmed the bullet passed through cover (penetrated_exit),
-		// the bullet had damage left (not damage_depleted) AND the ray
-		// geometrically crosses the target's record hitboxes, the
-		// server resolves that same trajectory against the same pose -
-		// accept the hit with the last recorded damage instead of
-		// staring at the wall.
-		if ( actual_hitbox >= 0 && penetrated_exit && !damage_depleted && last_record_damage > 0.0f )
+		// --- 6. Wallbang geometry fallback -------------------------------------
+		// Physical hit records are tied back to the pawn through surface
+		// contact handles, and a penetration pass frequently produces
+		// records whose contact index resolves to the COVER's surface - the
+		// hit is then silently dropped even though the shot visibly connects
+		// (the player can hit it manually). When the client simulation
+		// confirmed the bullet passed through cover (wall_hits > 0, no
+		// blocked/spent phase), the bullet had damage left AND the ray
+		// geometrically crosses the target's record hitboxes, the server
+		// resolves that same trajectory against the same pose - accept the
+		// hit with the last recorded damage instead of staring at the wall.
+		if ( actual_hitbox >= 0 && current_phase == phase::flying && wall_hits > 0 && last_damage > 0.0f )
 		{
 			out.hitbox = actual_hitbox;
 			out.hitgroup = systems::g_hitboxes.hitgroup_from_hitbox( actual_hitbox );
 			out.penetrated = true;
-			out.damage = last_record_damage;
+			out.damage = last_damage;
 
 			this->scale_damage( out.hitgroup, ctx.target_armor, ctx.has_helmet, ctx.target_team, ctx.armor_ratio, ctx.headshot_multiplier, ctx.scales, out.damage );
 
 			return true;
 		}
 
-		out = {};
 		return false;
 		} );
 	}
@@ -370,23 +382,21 @@ namespace features::combat {
 		systems::g_tracing.setup_trace( trace, start, trace_delta, filter, 4, true );
 
 		const auto num_hits = trace->num_hits;
+		const auto hit_array = reinterpret_cast< std::uintptr_t >( trace->hit_array_pointer );
 
 		// A garbage hit count from a drifted engine call would walk the hit
 		// array out of bounds below - the crosshair draw ran this every tick
 		// and crashed on such a value.
-		if ( num_hits <= 0 || num_hits > 64 )
-		{
-			return false;
-		}
-
-		const auto hit_array = reinterpret_cast< std::uintptr_t >( trace->hit_array_pointer );
-		if ( !hit_array )
+		if ( num_hits <= 0 || num_hits > 64 || !hit_array )
 		{
 			return false;
 		}
 
 		memory::call<void> (PATTERN (patterns::trace_bullet), trace, this->m_weapon_data.damage, this->m_weapon_data.penetration, this->m_weapon_data.range_modifier, 4, local_team, static_cast<std::uintptr_t>(0));
 
+		// Same penetration semantics as run(): the first penetration record
+		// whose exit fraction is not 1 confirms the bullet got through, and
+		// that record's damage is the remaining post-wall damage.
 		for ( auto i = 0; i < num_hits; ++i )
 		{
 			auto hit = reinterpret_cast< detail::bullet_trace_record* >( hit_array + i * sizeof( detail::bullet_trace_record ) );
@@ -399,8 +409,6 @@ namespace features::combat {
 
 			if ( ( hit->can_penetrate & 1 ) != 0 )
 			{
-				// Match run(): bit 0 marks a penetration record and an exit
-				// fraction of 1 means the bullet did not make it through.
 				if ( hit->exit_fraction == 1.0f )
 				{
 					break;
@@ -1214,6 +1222,22 @@ namespace features::combat {
 					return {};
 				}
 
+				// Diagnostic: verify the engine spread function actually
+				// responds to the accuracy input. A large accuracy (0.02+
+				// rad cone) MUST produce a large spread vector - if it
+				// comes back tiny, the hitchance computed from it is
+				// systematically inflated and every "accurate" shot
+				// misses on the real cone.
+				if ( accuracy > 0.02f && seed == 0 )
+				{
+					static bool spread_warned{};
+					if ( !spread_warned )
+					{
+						spread_warned = true;
+						diag::writef( diag::level::info, "[spread] WARNING: accuracy {:.4f} spread_in {:.5f} -> engine out ({:.4f},{:.4f})", accuracy, spread, out.x, out.y );
+					}
+				}
+
 				return out;
 			} );
 	}
@@ -1366,7 +1390,12 @@ namespace features::combat {
 				const auto threshold_total = threshold * static_cast< float >( samples );
 				if ( static_cast< float >( hits ) >= threshold_total )
 				{
-					return static_cast< float >( hits ) / static_cast< float >( i + 1 );
+					// Return the conservative lower bound (every remaining
+					// sample misses) instead of hits/(i+1): the latter is
+					// the rate of the samples actually drawn and reads as
+					// ~100% on early exits, which inflated the reported
+					// hitchance and the force-shot eligibility checks.
+					return static_cast< float >( hits ) / static_cast< float >( samples );
 				}
 
 				if ( static_cast< float >( hits + ( samples - i - 1 ) ) < threshold_total )

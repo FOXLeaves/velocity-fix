@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <limits>
 
@@ -459,6 +459,9 @@ namespace features::misc {
 
 		static inline std::string s_display_name{};
 		static inline bool s_name_change_pending{};
+		// Name-restore flag: the setinfo hook must rewrite the submitted
+		// name to the player's own name even when clantag/override are off.
+		static inline bool s_name_restoring{};
 
 	private:
 		void do_autobuy( ) const;
@@ -477,6 +480,9 @@ namespace features::misc {
 		std::uintptr_t m_auto_accept_set_ready{};
 		std::string m_original_name{};
 		std::string m_last_sent_name{};
+		// Name-restore retry pacing (server rename cooldowns swallow the
+		// first submit - keep retrying until the server name matches).
+		int m_last_restore_tick{};
 		float m_last_spawntime{};
 		float m_cached_vm_x{ std::numeric_limits<float>::quiet_NaN( ) };
 		float m_cached_vm_y{ std::numeric_limits<float>::quiet_NaN( ) };

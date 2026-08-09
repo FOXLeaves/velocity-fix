@@ -583,7 +583,7 @@ namespace config {
 			"nightcore", "dreamcore", "weirdcore", "moonlit", "twilight", "spooky", "radiant", "divine",
 			"stockings", "choker", "collar", "bell", "ribbon", "bow", "paws", "thighs",
 			"blush", "garter", "hello kitty", "strawberry", "peachy", "candy", "sugar", "boba",
-			"someone tried to leave a 'was here'", "weener", "velocity.cat core1!!11", "spiderman 3", "ironman 3", "//^_^//", "wiggle", "tappy",
+			"someone tried to leave a 'was here'", "weener", "velocity plus core1!!11", "spiderman 3", "ironman 3", "//^_^//", "wiggle", "tappy",
 			"resolver", "antiaim", "fakelag", "doubletap", "hideshot", "onshot", "hitchance", "multipoint",
 			"safepoint", "baim", "lagcomp", "backtrack", "tickbase", "exploit", "autopeek", "quickpeek",
 			"duckpeek", "autostop", "wallbang", "cfg diff", "force body", "min damage", "silent aim", "prediction error",

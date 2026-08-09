@@ -204,7 +204,7 @@ namespace features::misc {
 
 		bool chat_print_velocity( const char* msg )
 		{
-			return chat_print( "[velocity]", k_periwinkle_start_r, k_periwinkle_start_g, k_periwinkle_start_b, k_periwinkle_end_r, k_periwinkle_end_g, k_periwinkle_end_b, msg );
+			return chat_print( "[velocity plus]", k_periwinkle_start_r, k_periwinkle_start_g, k_periwinkle_start_b, k_periwinkle_end_r, k_periwinkle_end_g, k_periwinkle_end_b, msg );
 		}
 
 	} // namespace detail
@@ -1623,6 +1623,16 @@ namespace features::misc {
 	void impacts::add_miss_log( const shot_record& shot, const miss_analysis& analysis )
 	{
 		if ( !shot.ragebot )
+		if ( !shot.ragebot )
+		{
+			return;
+		}
+
+		// Shots the server never confirmed (no fire event) are not useful
+		// misses - they are usually an attack-expression rejection (e.g.
+		// double-tap claim issues), not a trajectory problem, and every
+		// one of them spamming a log only masks the real misses.
+		if ( analysis.reason == miss_reason::server_rejected )
 		{
 			return;
 		}
@@ -1667,7 +1677,7 @@ namespace features::misc {
 					: std::format( "S{}-Q{}", shot.session_epoch, shot.sequence );
 
 				output.console_message = std::format(
-					"[velocity][ragebot miss] id={} seq={} target=\"{}\" target_pawn=0x{:X} controller_handle=0x{:X} "
+					"[velocity plus][ragebot miss] id={} seq={} target=\"{}\" target_pawn=0x{:X} controller_handle=0x{:X} "
 					"weapon={} weapon_type={} reason={} label=\"{}\" confidence={} cmd={} record_tick={} stamp_tick={} bt={} "
 					"expected_hg={} expected_dmg={:.1f} target_hp={} hc={:.1f}% flags={} pred_inacc={:.6f} fire_inacc={} spread={:.6f} "
 					"shoot={} server_shoot={} origin_delta={} aim_angle={} aim={} impact_count={} impact_seq={} impact={} angular={} cone={} "
@@ -1746,13 +1756,37 @@ namespace features::misc {
 		}
 
 		const auto now = std::chrono::steady_clock::now( );
-		std::vector<pending_miss_output> retries{};
 
+		// Miss output is budgeted by the number of bullets actually in
+		// flight: one shot may only ever produce its FASTEST miss log (the
+		// earliest finalization), two shots two logs, and so on. Any
+		// excess logs from the same volley are dropped instead of queued -
+		// this kills the storm while keeping one log per real miss.
+		// Only CONFIRMED (committed) bullets that are still unresolved
+		// count toward the quota - uncommitted scan intents must not
+		// inflate the budget (that is what let the storm through before).
+		const auto bullet_quota = static_cast< int >( std::count_if( this->m_pending_shots.begin( ), this->m_pending_shots.end( ),
+			[ ]( const shot_record& s ) { return s.ragebot && s.committed && !s.resolved; } ) );
+
+		std::vector<pending_miss_output> retries{};
+		auto console_printed{ 0 };
 		for ( auto& output : outputs )
 		{
 			if ( !output.console_message.empty( ) )
 			{
-				logging::console::print_severity( 3, xs( "{}" ), output.console_message );
+				// Earliest-finalized logs come first in the queue, so the
+				// first bullet_quota entries are the fastest logs for the
+				// shots in flight. Beyond the quota the entry is dropped
+				// (unless it still carries a chat payload below).
+				if ( console_printed < bullet_quota )
+				{
+					logging::console::print_severity( 3, xs( "{}" ), output.console_message );
+					++console_printed;
+				}
+				else
+				{
+					output.console_message.clear( );
+				}
 			}
 
 			if ( !output.chat_message.empty( ) )

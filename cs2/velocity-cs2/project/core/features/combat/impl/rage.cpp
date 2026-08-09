@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
 #include <utilities/logging/logging.hpp>
@@ -38,6 +38,10 @@ namespace features::combat {
 
 		this->m_should_stop = false;
 		this->m_firing_this_tick = false;
+
+		// Ammo-confirmation console output: one queued shot log per bullet
+		// that actually left the clip (see flush_console_shot_logs).
+		this->flush_console_shot_logs( );
 
 		if ( !settings::g_combat.m_duckpeek.enabled.value )
 		{
@@ -240,637 +244,6 @@ namespace features::combat {
 		}
 	}
 
-	// --- double tap ----------------------------------------------------------
-
-	void rage::double_tap::reset( ) noexcept
-	{
-		this->m_state = charge_state::charging;
-		this->m_fail_reason = fail_reason::none;
-		this->m_shot_count = 0;
-		this->m_last_fire_tick = -1;
-		// Full fire-state reset on weapon switch: a stale rhythm flag or
-		// pending auto second shot must not carry over to the new weapon.
-		this->m_fired = false;
-		this->m_auto_second = false;
-		this->m_ready_tick = -1;
-		this->m_state_hold = 0;
-		this->m_ticks_to_ready = 0;
-		this->m_progress = 0.0f;
-	}
-
-	void rage::double_tap::fail( fail_reason reason ) noexcept
-	{
-		this->m_state = charge_state::failed;
-		this->m_fail_reason = reason;
-		this->m_state_hold = 60;
-		this->m_progress = 0.0f;
-	}
-
-	void rage::double_tap::on_create_move( systems::input::usercmd* cmd )
-	{
-		const auto& cfg = settings::g_combat.m_ragebot.m_double_tap;
-		const auto& ctx = g_shared.ctx( );
-
-		if ( !cfg.enabled.value || !ctx.valid )
-		{
-			this->reset( );
-			return;
-		}
-
-		const auto is_gun = ctx.weapon_type >= cstypes::weapon_type::pistol && ctx.weapon_type <= cstypes::weapon_type::lmg;
-		const auto is_knife = ctx.weapon_type == cstypes::weapon_type::knife;
-		if ( ( !is_gun && !is_knife ) || !ctx.weapon )
-		{
-			this->reset( );
-			return;
-		}
-
-		const auto local = systems::g_local.get( );
-		if ( !local.controller )
-		{
-			this->reset( );
-			return;
-		}
-
-		const auto tick_base = memory::read<int>( local.controller + SCHEMA( "CBasePlayerController", "m_nTickBase"_hash ) );
-
-		// Safety: if the auto second shot does not resolve within one fire
-		// interval (plus a small buffer), the request is dropped and the
-		// charge restarts - a stale request must not open a shot on its
-		// own later.
-		if ( this->m_auto_second && tick_base - this->m_last_fire_tick > std::max( this->m_cycle_ticks, 1 ) + 5 )
-		{
-			this->m_auto_second = false;
-		}
-
-		if ( ctx.weapon != this->m_weapon )
-		{
-			this->m_weapon = ctx.weapon;
-			this->reset( );
-		}
-
-		const auto next_off = SCHEMA( "C_BasePlayerWeapon", "m_nNextPrimaryAttackTick"_hash );
-		const auto ratio_off = SCHEMA( "C_BasePlayerWeapon", "m_flNextPrimaryAttackTickRatio"_hash );
-		if ( !next_off || !ratio_off )
-		{
-			this->reset( );
-			return;
-		}
-
-		const auto next_opt = memory::safe_read<int>( ctx.weapon + next_off );
-		const auto ratio_opt = memory::safe_read<float>( ctx.weapon + ratio_off );
-		if ( !next_opt || !ratio_opt || !std::isfinite( *ratio_opt ) || std::abs( *next_opt ) > 100000 )
-		{
-			// Cooldown fields unreadable (schema drift or stale weapon):
-			// charge is unusable this tick.
-			this->reset( );
-			return;
-		}
-
-		this->m_next_attack = *next_opt;
-		this->m_ratio = *ratio_opt;
-
-		// Claimed tick for the wire AND the aim alignment. Normally the
-		// weapon-ready tick; in the second-shot window (1-2 ticks after the
-		// last delivered attack) the PREDICTED server cooldown - the server
-		// sets next to exactly that value when it accepts the first shot,
-		// so claim == next passes immediately and the second bullet fires
-		// reliably without waiting for the local sync. Keeping the aim on
-		// the same tick (claimed_tick()) makes the rewound pose match the
-		// aimed one.
-		//
-		// The prediction is gated on the local ready tick NOT having synced
-		// yet (still equal to the last delivered claim): on local/zero-
-		// latency servers (practice maps with bots) the sync is nearly
-		// instant, so predicting there would overshoot by a full cycle and
-		// the server would rewind the target to a future pose - the second
-		// bullet then flies past a moving target.
-		const auto since_last_claim = tick_base - this->m_last_fire_tick;
-		const auto predicted_next = this->m_next_attack + this->m_cycle_ticks;
-		this->m_claim_predicted = since_last_claim >= 1 && since_last_claim <= 2
-			&& this->m_next_attack == this->m_last_claimed_tick;
-		this->m_claimed_for_aim = this->m_claim_predicted
-			? predicted_next
-			: this->m_next_attack;
-
-		// m_flWatTickOffset is a newer schema field; when it is missing or
-		// reads garbage the charge arithmetic simply ignores it.
-		this->m_wat_offset = 0.0f;
-		if ( const auto wat_off = SCHEMA( "C_BasePlayerWeapon", "m_flWatTickOffset"_hash ) )
-		{
-			if ( const auto wat = memory::safe_read<float>( ctx.weapon + wat_off ) )
-			{
-				if ( std::isfinite( *wat ) && std::abs( *wat ) < 1000.0f )
-				{
-					this->m_wat_offset = *wat;
-				}
-			}
-		}
-
-		// Weapon-ready tick (classic charge arithmetic): the sub-tick part
-		// of the weapon's attack-time offset joins the ratio, and the
-		// integer part shifts the cooldown base.
-		double offset_tick{};
-		const auto wat_fraction = std::modf( static_cast< double >( this->m_wat_offset ), &offset_tick );
-		const auto temp = static_cast< double >( this->m_ratio ) + wat_fraction;
-
-		auto shoot_tick = this->m_next_attack + static_cast< int >( offset_tick );
-		if ( temp >= 1.0 )
-		{
-			++shoot_tick;
-		}
-		else if ( temp < 0.0 )
-		{
-			--shoot_tick;
-		}
-		this->m_shoot_tick = shoot_tick;
-		this->m_ticks_to_ready = std::max( this->m_shoot_tick - tick_base, 0 );
-
-		float cycle{ 0.1f };
-		if ( ctx.weapon_vdata )
-		{
-			cycle = memory::read<float>( ctx.weapon_vdata + SCHEMA( "CCSWeaponBaseVData", "m_flCycleTime"_hash ) );
-		}
-		this->m_cycle_ticks = std::max( 1, static_cast< int >( std::ceil( cycle / cstypes::tick_interval ) ) );
-
-		const auto clip = memory::read<int>( ctx.weapon + SCHEMA( "C_BasePlayerWeapon", "m_iClip1"_hash ) );
-		const auto reloading = memory::read<bool>( ctx.weapon + SCHEMA( "C_CSWeaponBase", "m_bInReload"_hash ) );
-		const auto ready_ok = tick_base >= this->m_shoot_tick && clip > 0 && !reloading;
-
-		// Charge tracking by AMMO, not by attack-expression bookkeeping:
-		// the clip difference between ticks is exactly how many rounds
-		// really left the barrel (server-synced), so a real two-shot pair
-		// always counts two and the bar resets - expression counting
-		// missed shots delivered outside the alternation and left the bar
-		// stuck at 50%.
-		if ( this->m_prev_clip >= 0 && clip < this->m_prev_clip )
-		{
-			this->m_shot_count = std::min( this->m_shot_count + ( this->m_prev_clip - clip ), 2 );
-		}
-		this->m_prev_clip = clip;
-
-		switch ( this->m_state )
-		{
-		case charge_state::charging:
-		case charge_state::ready:
-			if ( reloading )
-			{
-				this->fail( fail_reason::reloading );
-			}
-			else if ( clip <= 0 )
-			{
-				this->fail( fail_reason::empty_clip );
-			}
-			else
-			{
-				this->m_state = ready_ok ? charge_state::ready : charge_state::charging;
-			}
-			break;
-		case charge_state::failed:
-			if ( this->m_state_hold > 0 )
-			{
-				--this->m_state_hold;
-			}
-			if ( this->m_state_hold == 0 )
-			{
-				this->m_fail_reason = fail_reason::none;
-				this->m_state = ready_ok ? charge_state::ready : charge_state::charging;
-			}
-			break;
-		default:
-			break;
-		}
-
-		// Knife: the bar is pinned at 100%; a melee attack resets it to
-		// zero for a tick, then it jumps straight back to 100%.
-		if ( g_shared.ctx( ).weapon_type == cstypes::weapon_type::knife )
-		{
-			this->m_state = charge_state::ready;
-			this->m_progress = ( tick_base - this->m_last_fire_tick ) <= 1 ? 0.0f : 1.0f;
-			return;
-		}
-
-		// Preview progress - charge state machine for the pair:
-		//   shot_count == 0: linear charge 0 -> 100% over TWO weapon
-		//                    cycles (one shot charged = 50%, both = 100%)
-		//   shot_count == 1: stuck at 50% - one bullet left, the bar does
-		//                    NOT recharge: only firing the second bullet,
-		//                    reloading or switching weapons resets it
-		//   shot_count >= 2: both bullets gone - reset to 0 and recharge
-		//                    from zero
-		switch ( this->m_state )
-		{
-		case charge_state::charging:
-		case charge_state::ready:
-		{
-			const auto window = std::max( this->m_cycle_ticks, 1 );
-
-			// Manual reload (or the ragebot auto-reloading between fights)
-			// restarts the charge from zero.
-			if ( reloading )
-			{
-				this->m_shot_count = 0;
-			}
-
-			// Both shots of the pair delivered: recharge from zero.
-			if ( this->m_shot_count >= 2 )
-			{
-				this->m_shot_count = 0;
-			}
-
-			if ( this->m_shot_count == 1 )
-			{
-				// One bullet fired, one left: stuck at 50% until the
-				// second bullet leaves (or reload / weapon switch).
-				this->m_progress = 0.5f;
-				break;
-			}
-
-			// Linear charge from zero: two weapon cycles fill the bar.
-			float charge{};
-			if ( this->m_ticks_to_ready > 1 )
-			{
-				// First cycle: weapon cooldown, 0 -> 50%. The 1-tick
-				// tolerance absorbs the predicted ready-tick jitter.
-				this->m_ready_tick = -1;
-				const auto elapsed = static_cast< float >( window - std::max( this->m_ticks_to_ready - 1, 0 ) );
-				charge = elapsed / ( 2.0f * static_cast< float >( window ) );
-			}
-			else
-			{
-				// Second cycle: pre-load after ready, 50 -> 100%.
-				if ( this->m_ready_tick < 0 )
-				{
-					this->m_ready_tick = tick_base;
-				}
-
-				const auto since_ready = std::max( tick_base - this->m_ready_tick, 0 );
-				const auto elapsed = static_cast< float >( window ) + static_cast< float >( std::min( since_ready, window ) );
-				charge = elapsed / ( 2.0f * static_cast< float >( window ) );
-			}
-
-			this->m_progress = std::clamp( charge, 0.0f, 1.0f );
-			break;
-		}
-		case charge_state::failed:
-		default:
-			this->m_progress = 0.0f;
-			break;
-		}
-	}
-	void rage::double_tap::on_fired( systems::input::usercmd* cmd, bool fired )
-	{
-		// UC reference (Pa1nt4r): static bool Fired, NextAttackTick claim,
-		// subtick attack edge, RemoveButton on the skipped beat and
-		// InvalidatetAttackIndex - kept structurally identical, only the
-		// API calls are adapted to this codebase.
-		//
-		// Two mirrored rhythms, one per firing source:
-		//  - Manual rhythm  (fired == false): the engine produces the
-		//    attack (button + index), DT alternates and claims the ticks.
-		//  - Ragebot rhythm (fired == true ): fire_gun only writes the
-		//    silent-aim angles into the entries; this block is the SOLE
-		//    attack expression (button + index + edge), alternated the
-		//    same way so the server resolves each edge against its
-		//    claimed tick instead of treating the stream as auto-fire.
-
-		const auto& ctx = g_shared.ctx( );
-		if ( this->m_weapon != ctx.weapon )
-		{
-			return;
-		}
-
-		const auto local = systems::g_local.get( );
-		if ( !local.controller )
-		{
-			return;
-		}
-
-		const auto tick_base = memory::read<int>( local.controller + SCHEMA( "CBasePlayerController", "m_nTickBase"_hash ) );
-
-		// Knife: only the attack tick matters for the bar; the DT attack
-		// logic does not apply to melee.
-		if ( g_shared.ctx( ).weapon_type == cstypes::weapon_type::knife )
-		{
-			if ( fired )
-			{
-				this->m_last_fire_tick = tick_base;
-			}
-			return;
-		}
-
-		const auto dt_active = settings::g_combat.m_ragebot.m_double_tap.enabled.value;
-		const auto history_size = cmd->csgo_user_cmd.input_history_size( );
-
-		const auto stamp_entries = [ & ]( int claimed_tick )
-			{
-				for ( auto i = 0; i < history_size; ++i )
-				{
-					if ( auto* entry = cmd->csgo_user_cmd.mutable_input_history( i ) )
-					{
-						entry->set_player_tick_count( claimed_tick );
-						entry->set_player_tick_fraction( 0.0f );
-					}
-				}
-			};
-
-		if ( fired )
-		{
-			// ============================================================
-			// Ragebot double-tap rhythm - wire pattern identical to the
-			// manual rhythm (Pa1nt4r reference), fire_gun provides the aim:
-			//   ShouldAttack = CanAttack && dt   (dt = ragebot decision)
-			//   claim on every entry = m_claimed_for_aim:
-			//     1st shot = weapon-ready tick
-			//     2nd shot = predicted cooldown (1st + cycle) - the server
-			//                accepts it right after the 1st
-			//   if (ShouldAttack && !Fired) { subtick IN_ATTACK pressed }
-			//   Fired = ShouldAttack && !Fired
-			//   InvalidatetAttackIndex()
-			// The alternation keeps the edge stream off the wire: a
-			// continuous edge stream would be resolved as plain auto-fire
-			// and the claimed ticks would stop mattering.
-			// The SECOND shot of the pair bypasses the alternation on the
-			// very next tick (1-tick pair): its claim equals the server's
-			// next, so it is accepted immediately and the pair lands 1 tick
-			// apart. m_fired stays latched through that tick so no third
-			// edge follows and the wire does not become a stream.
-			// ============================================================
-			const auto should_attack = g_shared.can_shoot( cmd, local.controller, !dt_active );
-
-			// Claim sanity: a claim far ahead of the local tick means the
-			// synced ready tick (or the prediction) is garbage - expressing
-			// the attack anyway would be silently rejected by the server
-			// (an empty shot that still plays the fire animation) or push
-			// its cooldown onto a wrong frame. No lower bound: a weapon
-			// that has been ready for a long time legitimately claims an
-			// old ready tick and the server accepts it (old >= old).
-			const auto claim_valid = this->m_claimed_for_aim <= tick_base + 256;
-
-			const auto& attack_config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
-			const auto no_spread_comp = attack_config.no_spread.value
-				|| attack_config.no_spread_mode.value == settings::combat::ragebot::weapon_group::no_spread_mode::seed;
-
-			// No-spread stamps its own entries with the exact tick the
-			// seed correction was computed against (m_no_spread_claim_tick
-			// set by fire_gun): overwriting them with the DT claim (or 0
-			// when the claim is invalid / DT is off) desyncs the server's
-			// spread seed from the correction and every bullet flies off.
-			stamp_entries( no_spread_comp
-				? this->no_spread_claim_tick( )
-				: ( should_attack && claim_valid ? this->m_claimed_for_aim : 0 ) );
-
-			const auto immediate_second = should_attack && ( tick_base - this->m_last_fire_tick ) == 1;
-
-			if ( should_attack && claim_valid && ( !this->m_fired || immediate_second ) )
-			{
-				this->m_last_fire_tick = tick_base;
-				this->m_last_shot_manual = false;
-				this->m_last_claimed_tick = this->m_claimed_for_aim;
-
-				// Attack edge: subtick only, exactly like the reference.
-				// fire_gun wrote the silent-aim angles into EVERY entry, so
-				// the server resolves the shot against the ragebot's aim
-				// whichever entry it matches to the claimed tick.
-				//
-				// Fresh-angle guard: fire_gun only refreshes the entries on
-				// ticks its fire decision passes - on a beat where the
-				// decision flickers, the entries would keep the PREVIOUS
-				// shot's angles and this bullet would fly at the old aim
-				// point. m_dt_aim is updated by run_gun every tick from the
-				// live scan, so stamp it over the entries as the fallback.
-				// No-spread keeps fire_gun's corrected angles untouched.
-				{
-					const auto& config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
-					if ( !config.no_spread.value && this->m_has_dt_aim && history_size > 0 )
-					{
-						const auto& angles = this->m_dt_aim;
-						for ( auto i = 0; i < history_size; ++i )
-						{
-							if ( auto* entry = cmd->csgo_user_cmd.mutable_input_history( i ) )
-							{
-								if ( auto* va = entry->mutable_view_angles( ) )
-								{
-									va->set_x( angles.x );
-									va->set_y( angles.y );
-									va->set_z( angles.z );
-								}
-							}
-						}
-					}
-				}
-
-				// Attack edge: the subtick move only, exactly like the
-				// reference. No-spread expresses its shot through the
-				// button + attack index that fire_gun set (the index is
-				// what makes the server use the corrected entry angles), so
-				// no extra subtick edge is added for it.
-				auto attack_committed = !dt_active || attack_config.no_spread.value;
-
-				if ( !attack_config.no_spread.value )
-				{
-					if ( auto* base = cmd->csgo_user_cmd.mutable_base( ) )
-					{
-						if ( auto* step = systems::g_input.acquire_subtick_step( base->mutable_subtick_moves( ) ) )
-						{
-							step->set_button( cstypes::command_buttons::in_attack );
-							step->set_pressed( true );
-							attack_committed = true;
-						}
-					}
-				}
-
-				if ( attack_committed )
-				{
-					features::misc::g_impacts.on_shot_committed( cmd->command_number );
-				}
-
-				// Remember the freshest aim angles.
-				if ( history_size > 0 )
-				{
-					if ( auto* e0 = cmd->csgo_user_cmd.mutable_input_history( 0 ) )
-					{
-						if ( e0->has_view_angles( ) )
-						{
-							this->m_last_angles = math::vector3{ e0->view_angles( )->x( ), e0->view_angles( )->y( ), e0->view_angles( )->z( ) };
-							this->m_has_last_angles = true;
-						}
-					}
-				}
-
-				// Latch through the immediate second shot so the following
-				// tick skips the attack (no third consecutive edge).
-				if ( immediate_second )
-				{
-					this->m_fired = true;
-				}
-			}
-
-			if ( !immediate_second )
-			{
-				this->m_fired = should_attack && !this->m_fired;
-			}
-
-			// Cmd->InvalidatetAttackIndex() - kept for the regular path.
-			// No-spread keeps the index fire_gun pointed at the corrected
-			// entry (that index is what resolves the shot through the
-			// compensated angles).
-			if ( !attack_config.no_spread.value )
-			{
-				cmd->csgo_user_cmd.set_attack1_start_history_index( -1 );
-			}
-			return;
-		}
-
-		// ================================================================
-		// Manual rhythm - reference structure (Pa1nt4r):
-		//   ShouldAttack = CanAttack(nClientTick) && dt
-		//   nPlayerTickCount = ShouldAttack ? NextAttackTick : 0 (all entries)
-		//   if (ShouldAttack && !Fired) { subtick IN_ATTACK pressed }
-		//   else { RemoveButton(IN_ATTACK); dt = false; }
-		//   Fired = ShouldAttack && !Fired
-		//   InvalidatetAttackIndex()
-		// dt is driven by the engine-delivered attack / the held button;
-		// the alternating subtick edge is the ONLY attack expression, and
-		// the claimed tick compresses the server cooldown so the next
-		// attempt is accepted right after the sync - that is what makes
-		// the pair land ~one beat apart.
-		// ================================================================
-		const auto manual_attack = cmd->csgo_user_cmd.attack1_start_history_index( ) >= 0;
-		const auto button_held = ( cmd->buttons.value & cstypes::command_buttons::in_attack ) != 0;
-
-		const auto dt = manual_attack || button_held;
-		const auto should_attack = dt && g_shared.can_shoot( cmd, local.controller, !dt_active );
-
-		stamp_entries( should_attack ? this->m_next_attack : 0 );
-
-		if ( should_attack && !this->m_fired )
-		{
-			this->m_last_fire_tick = tick_base;
-			this->m_last_shot_manual = true;
-			this->m_last_claimed_tick = this->m_next_attack;
-
-			// A manual attack must fire along the player's OWN view.
-			// fire_gun may have written silent-aim angles into the entries
-			// on an earlier ragebot decision (and it is not running this
-			// tick), so without restoring them the manual shot would be
-			// resolved against the LAST bot aim point - the "fires at the
-			// previous aim point" bug. The wire base viewangles are left
-			// untouched (anti-aim owns them).
-			if ( dt && history_size > 0 )
-			{
-				const auto view = systems::g_input.get_view_angles( );
-
-				for ( auto i = 0; i < history_size; ++i )
-				{
-					if ( auto* entry = cmd->csgo_user_cmd.mutable_input_history( i ) )
-					{
-						if ( auto* va = entry->mutable_view_angles( ) )
-						{
-							va->set_x( view.x );
-							va->set_y( view.y );
-							va->set_z( view.z );
-						}
-					}
-				}
-			}
-
-			// Attack edge: the subtick move only, exactly like the
-			// reference - the engine button (if any) stays as-is.
-			if ( auto* base = cmd->csgo_user_cmd.mutable_base( ) )
-			{
-				if ( auto* step = systems::g_input.acquire_subtick_step( base->mutable_subtick_moves( ) ) )
-				{
-					step->set_button( cstypes::command_buttons::in_attack );
-					step->set_pressed( true );
-				}
-			}
-
-			// Remember the freshest aim angles.
-			if ( history_size > 0 )
-			{
-				if ( auto* e0 = cmd->csgo_user_cmd.mutable_input_history( 0 ) )
-				{
-					if ( e0->has_view_angles( ) )
-					{
-						this->m_last_angles = math::vector3{ e0->view_angles( )->x( ), e0->view_angles( )->y( ), e0->view_angles( )->z( ) };
-						this->m_has_last_angles = true;
-					}
-				}
-			}
-		}
-		else
-		{
-			// Cmd->nButtons.RemoveButton(IN_ATTACK); dt = false;
-			cmd->buttons.value &= ~cstypes::command_buttons::in_attack;
-			cmd->buttons.value_changed &= ~cstypes::command_buttons::in_attack;
-			cmd->buttons.value_scroll &= ~cstypes::command_buttons::in_attack;
-		}
-
-		// Fired = ShouldAttack && !Fired;
-		this->m_fired = should_attack && !this->m_fired;
-
-		// Cmd->InvalidatetAttackIndex();
-		cmd->csgo_user_cmd.set_attack1_start_history_index( -1 );
-	}
-	void rage::double_tap::on_render( xdraw::draw_list& draw_list ) const
-	{
-		const auto& cfg = settings::g_combat.m_ragebot.m_double_tap;
-		if ( !cfg.enabled.value || !cfg.preview.value )
-		{
-			return;
-		}
-
-		if ( systems::g_local.is_in_cinematic( ) || systems::g_local.is_in_time_freeze( ) )
-		{
-			return;
-		}
-
-		const auto local = systems::g_local.get( );
-		if ( !local.controller || !local.is_alive )
-		{
-			return;
-		}
-
-		const auto [ screen_w, screen_h ] = xdraw::viewport_size( );
-		const auto cx = static_cast< float >( screen_w ) * 0.5f;
-		const auto& s = xui::ctx( ).style;
-
-		// State is expressed purely through the bar color.
-		xdraw::color state_col{ 255, 255, 255, 255 };
-		switch ( this->m_state )
-		{
-		case charge_state::charging: state_col = cfg.charging_color; break;
-		case charge_state::ready:    state_col = cfg.ready_color;    break;
-		case charge_state::failed:   state_col = cfg.failed_color;   break;
-		default: break;
-		}
-
-		constexpr auto bar_w{ 214.0f };
-		constexpr auto bar_h{ 16.0f };
-		constexpr auto pad{ 2.0f };
-		constexpr auto r{ 8.0f };
-		constexpr auto bottom_offset{ 170.0f };
-
-		const auto bar_x = std::floor( cx - bar_w * 0.5f );
-		const auto bar_y = std::floor( static_cast< float >( screen_h ) - bottom_offset - bar_h );
-
-		draw_list.rect_filled_blurred( bar_x - pad, bar_y - pad, bar_w + pad * 2.0f, bar_h + pad * 2.0f, xdraw::corner_radius{ r } );
-		draw_list.rect_filled( bar_x - pad, bar_y - pad, bar_w + pad * 2.0f, bar_h + pad * 2.0f, s.window_bg, xdraw::corner_radius{ r } );
-		draw_list.rect_filled( bar_x, bar_y, bar_w, bar_h, s.child_bg, xdraw::corner_radius{ r - pad } );
-
-		const auto fill_w = std::floor( bar_w * this->m_progress );
-		if ( fill_w >= 1.0f )
-		{
-			draw_list.rect_filled( bar_x, bar_y, fill_w, bar_h, state_col.alpha( 220 ), xdraw::corner_radius{ r - pad } );
-		}
-
-		char pct_buf[ 8 ]{};
-		std::snprintf( pct_buf, sizeof( pct_buf ), "%.0f%%", this->m_progress * 100.0f );
-		const auto [ pct_w, pct_h ] = xdraw::measure_text( pct_buf );
-		draw_list.text( bar_x + bar_w - pct_w - 6.0f, bar_y + ( bar_h - pct_h ) * 0.5f + 0.5f, pct_buf, s.text );
-	}
-
 	rage::aim_context rage::build_context( systems::input::usercmd* cmd, const systems::local::snapshot& local ) const
 	{
 		auto& ctx = g_shared.ctx( );
@@ -886,9 +259,27 @@ namespace features::combat {
 				g_shared.sh( ).snapshot( local.pawn, ctx.weapon_services );
 
 				out.velocity = memory::read<math::vector3>( local.pawn + SCHEMA( "C_BaseEntity", "m_vecAbsVelocity"_hash ) );
+				out.predicted_velocity = out.velocity;
 				out.spread = g_shared.get_spread( );
 				out.predicted_inaccuracy = g_shared.get_inaccuracy( true );
 			} );
+
+		// Diagnostic: standing still must never report a 7-degree cone.
+		// A large inaccuracy while the predicted velocity is (near) zero
+		// means the weapon accuracy state is being corrupted somewhere
+		// (engine getter drift / snapshot restore damage).
+		{
+			const auto speed = out.predicted_velocity.length_2d( );
+			if ( out.predicted_inaccuracy > 0.02f && speed < 10.0f )
+			{
+				static bool inaccuracy_warned{};
+				if ( !inaccuracy_warned )
+				{
+					inaccuracy_warned = true;
+					diag::writef( diag::level::info, "[accuracy] WARNING: inaccuracy {:.4f} while standing (speed {:.2f} u/s) - weapon accuracy state corrupted", out.predicted_inaccuracy, speed );
+				}
+			}
+		}
 
 		ctx.spread = out.spread;
 		ctx.inaccuracy = out.predicted_inaccuracy;
@@ -915,82 +306,36 @@ namespace features::combat {
 		cmd->csgo_user_cmd.set_attack1_start_history_index( -1 );
 	}
 
-	std::optional<rage::stop_prediction> rage::predict_stop( const aim_context& ctx, const math::vector3& current_eye, const systems::local::snapshot& local ) const
+	bool rage::plan_stop( const aim_context& ctx, const target& best, const systems::local::snapshot& local, float needed_hc, float head_tolerance ) const
 	{
-		const auto& shared_ctx = g_shared.ctx( );
-		const auto& prestate = systems::g_prediction.pre( );
-		const auto speed = prestate.networked_velocity.length_2d( );
-		const auto will_stop = ctx.on_ground && ( speed > ctx.accurate_threshold || ( ctx.is_scoped && speed > 1.0f ) );
+		// Stop planning: a locked target while moving is always worth
+		// stopping for. Gating the stop on a "would the stopped shot
+		// land" evaluation is wrong - that evaluation runs against the
+		// MOVING scan's aim data (interpolated shoot-history eye, moving
+		// multipoints), which sits noticeably off at range and rejected
+		// every stop until the target was point-blank. Stopping itself
+		// is harmless (the player can keep moving any tick), so the stop
+		// decision only asks "is there a target". The hit chance gate
+		// lives where it belongs: the fire gate, evaluated with the REAL
+		// standing accuracy once the velocity has landed.
 
-		if ( !will_stop )
+		if ( !best.valid )
 		{
-			return std::nullopt;
+			// Nothing to stop for - the geometry says no.
+			return false;
 		}
 
-		auto sim_vel = prestate.networked_velocity;
-		sim_vel.z = 0.0f;
-
-		const auto sv_friction = CONVAR("sv_friction")->get<float>( );
-		const auto sv_stopspeed = CONVAR("sv_stopspeed")->get<float>( );
-		const auto sv_accelerate = CONVAR("sv_accelerate")->get<float>( );
-		const auto surface_friction = prestate.surface_friction;
-
-		const auto movement_services = memory::read<std::uintptr_t>( local.pawn + SCHEMA( "C_BasePlayerPawn", "m_pMovementServices"_hash ) );
-		const auto max_move_speed = movement_services ? memory::read<float>( movement_services + SCHEMA( "CPlayer_MovementServices", "m_flMaxspeed"_hash ) ) : 250.0f;
-
-		for ( auto i = 0; i < 15; ++i )
+		// Airborne: the deceleration is executed by the airstrafe shift
+		// air-stop, so any locked target arms it.
+		if ( !ctx.on_ground )
 		{
-			const auto sim_speed = sim_vel.length_2d( );
-			if ( sim_speed < 1.0f )
-			{
-				break;
-			}
-
-			const auto control = std::fmaxf( sim_speed, sv_stopspeed );
-			const auto drop = sv_friction * surface_friction * control * cstypes::tick_interval;
-			auto new_speed = std::fmaxf( sim_speed - drop, 0.0f );
-			auto accel = sv_accelerate;
-
-			if ( shared_ctx.is_scoped )
-			{
-				const auto weapon_ratio = std::fminf( 1.0f, shared_ctx.weapon_max_speed / 250.0f );
-				const auto scoped_max = std::fmaxf( 250.0f, max_move_speed ) * weapon_ratio * 0.52f;
-
-				if ( new_speed > scoped_max - 5.0f )
-				{
-					const auto t = 1.0f - std::fmaxf( 0.0f, new_speed - ( scoped_max - 5.0f ) ) / std::fmaxf( 0.01f, 5.0f );
-					accel *= std::clamp( t, 0.0f, 1.0f );
-				}
-			}
-
-			const auto accel_speed = std::fminf( accel * shared_ctx.weapon_max_speed * surface_friction * cstypes::tick_interval, new_speed );
-			new_speed = std::fmaxf( new_speed - accel_speed, 0.0f );
-
-			if ( new_speed > 0.0f )
-			{
-				sim_vel *= ( new_speed / sim_speed );
-			}
-			else
-			{
-				sim_vel = {};
-				break;
-			}
+			return true;
 		}
 
-		const auto avg_vel = ( prestate.networked_velocity + sim_vel ) * 0.5f;
-		const auto stop_ticks = g_shared.calculate_stop_ticks( prestate.networked_velocity, shared_ctx.weapon_max_speed, local.pawn );
-		const auto stop_time = static_cast< float >( stop_ticks ) * cstypes::tick_interval;
-
-		return stop_prediction
-		{
-			.eye =
-			{
-				current_eye.x + avg_vel.x * stop_time,
-				current_eye.y + avg_vel.y * stop_time,
-				current_eye.z
-			},
-			.inaccuracy = g_shared.get_inaccuracy_at_velocity( local.pawn, sim_vel )
-		};
+		// Ground: locked target + moving = stop. The fire gate (speed
+		// landed + standing-accuracy hitchance) decides when the shot
+		// actually leaves.
+		return true;
 	}
 
 	std::vector<rage::candidate> rage::gather_candidates( const systems::local::snapshot& local, float max_distance_sq ) const
@@ -1320,86 +665,26 @@ namespace features::combat {
 			eye_candidates.count = 1;
 		}
 
-		const auto scan_from_eye_candidates = [ & ]( std::vector<candidate>& scan_set, const math::vector3& eye_offset, float inaccuracy, int max_traces )
-		{
-			std::vector<scan_hit> hits_out;
-
-			for ( auto i = 0; i < eye_candidates.count; ++i )
-			{
-				const auto eye = eye_candidates.entries[ i ].position + eye_offset;
-				// Secondary eye candidates are only reached when the
-				// primary found no direct hit - halve their budget so the
-				// fallback pass cannot double the per-tick trace cost.
-				const auto pass_budget = i == 0 ? max_traces : max_traces / 2;
-				auto hits = this->scan_players( eye, inaccuracy, ctx, scan_set, local, pass_budget );
-				auto found_direct{ false };
-
-				for ( auto& hit : hits )
-				{
-					auto source_eye = eye_candidates.entries[ i ];
-					source_eye.position = eye;
-					hit.source_eye = source_eye;
-					found_direct = found_direct || !hit.penetrated;
-					hits_out.push_back( std::move( hit ) );
-				}
-
-				if ( found_direct )
-				{
-					break;
-				}
-			}
-
-			return hits_out;
-		};
-
 		if ( config.no_spread.value )
 		{
-			shared_ctx.inaccuracy = g_shared.get_inaccuracy( false );
-			auto all_hits = scan_from_eye_candidates( candidates, {}, shared_ctx.inaccuracy, k_max_scan_traces );
+			return this->run_no_spread( cmd, ctx, candidates, eye_candidates, local, allow_fire );
+		}
 
-			if ( all_hits.empty( ) )
-			{
-				return false;
-			}
-
-			const auto best = this->select_best( ctx, all_hits, shared_ctx.inaccuracy );
-			if ( !best.valid )
-			{
-				this->update_auto_scope( cmd, false );
-				return false;
-			}
-
-			this->m_double_tap.update_aim( best.hit.aim_angle - g_shared.get_aim_punch( local.pawn ) );
-
-			this->update_auto_scope( cmd, true );
-
-			// Seed mode carries only a small, legal spread correction - fire
-			// it from a stop like the regular path, otherwise the moving
-			// spread floor can exceed the correction and the shot misses.
-			if ( config.no_spread_mode.value == settings::combat::ragebot::weapon_group::no_spread_mode::seed
-				&& this->should_stop_movement( ctx ) )
-			{
-				this->m_should_stop = true;
-				return false;
-			}
-
-			if ( !allow_fire )
-			{
-				return true;
-			}
-
-		diag::set_exception_phase( "rage: fire_gun" );
-		this->fire_gun( cmd, best, false, best.hit.source_eye.position, local, false );
-		return true;
-	}
-
-		const auto primary_eye = eye_candidates.entries[ 0 ].position;
 		const auto& prestate = systems::g_prediction.pre( );
 
 		// Current-shot selection is always based on current engine shoot-history.
-		auto current_hits = scan_from_eye_candidates( candidates, {}, ctx.predicted_inaccuracy, k_max_scan_traces );
+		auto current_hits = this->scan_from_eye_candidates( eye_candidates, candidates, {}, ctx.predicted_inaccuracy, k_max_scan_traces, ctx, local );
 		const auto best = this->select_best( ctx, current_hits, ctx.predicted_inaccuracy );
-		this->m_double_tap.update_aim( best.hit.aim_angle - g_shared.get_aim_punch( local.pawn ) );
+
+		// DT fresh-aim guard: only feed the live aim decision when the scan
+		// produced a target. On an empty tick best.hit is the zero vector -
+		// feeding it would overwrite m_dt_aim with garbage, and on_fired
+		// stamps every entry with m_dt_aim whenever m_has_dt_aim is set
+		// (regardless of the DT switch), so the next shot would fly off.
+		if ( best.valid )
+		{
+			this->m_double_tap.update_aim( best.hit.aim_angle - g_shared.get_aim_punch( local.pawn ) );
+		}
 
 		this->update_auto_scope( cmd, best.valid );
 
@@ -1430,7 +715,16 @@ namespace features::combat {
 		// fire decision on every beat while the aligned pose still puts
 		// the bullet inside the hitbox.
 		const auto dt_hc_boost = settings::g_combat.m_ragebot.m_double_tap.enabled.value ? 0.03f : 0.0f;
-		const auto accurate = best.valid && standing_hc >= needed_hc - 0.01f - head_tolerance - dt_hc_boost;
+		// Speed gate (movement-fix aware): the autostop executes the stop
+		// by writing counter-movement into the usercmd, and it takes
+		// several ticks for the velocity to actually land - during that
+		// window the accuracy penalty is still live no matter what the
+		// sampled hitchance says. A grounded shot is only allowed once
+		// the predicted velocity (what the server executes this command)
+		// is inside the accurate threshold. Force shots stay exempt (the
+		// player explicitly asked to fire anyway).
+		const auto stop_landed = !ctx.on_ground || ctx.predicted_velocity.length_2d( ) <= ctx.accurate_threshold;
+		const auto accurate = best.valid && stop_landed && standing_hc >= needed_hc - 0.01f - head_tolerance - dt_hc_boost;
 		const auto max_acc = g_shared.is_max_accuracy( standing_inaccuracy );
 		// Force shot: by default only at max accuracy; when a minimum force
 		// hitchance is configured, fire as soon as the standing hitchance
@@ -1440,52 +734,33 @@ namespace features::combat {
 		const auto force = best.valid && ( ctx.on_ground ? ( config.force_shot.value && force_eligible ) : ( config.force_shot_air.value && force_eligible ) );
 		auto shot_viable = accurate || force;
 
-		// Autostop planning is independent from firing. Ground movement can use a
-		// predicted stopped eye; airborne stopping keeps the current target context.
-		//
-		// Planning runs on every moving frame in both modes: the "fire stop"
-		// mode arms once the stopped-position scan finds a viable shot (the
-		// moving hitchance may look sufficient at e.g. 13% while the real
-		// moving spread misses - "reason=spread"); the "early stop" mode arms
-		// earlier, at a fraction of the required hitchance. The speed gate
-		// below then holds the trigger until the player is actually
-		// stationary, so the bullet always leaves from the stopped spread.
+		// One-shot diagnostic: a shot considered accurate while the player
+		// is moving fast is only possible when the sampled hitchance is
+		// inflated (stale accuracy getters / zero inaccuracy). Surface it
+		// once so the root cause is visible in the console instead of
+		// guessing at "shots fire while moving".
+		if ( best.valid && shot_viable && ctx.on_ground
+			&& prestate.networked_velocity.length_2d( ) > ctx.accurate_threshold * 2.0f
+			&& best.hitchance > 0.85f )
+		{
+			static bool hc_warned{};
+			if ( !hc_warned )
+			{
+				hc_warned = true;
+				diag::writef( diag::level::info, "[hitchance] WARNING: accurate shot while moving (hc {:.2f} at {:.0f} u/s) - accuracy getters may be stale", best.hitchance, prestate.networked_velocity.length_2d( ) );
+			}
+		}
+
+		// Autostop planning (rewritten): stopping only shrinks the spread
+		// cone, so the plan re-evaluates the CURRENT best hit with the
+		// zero-velocity standing accuracy instead of re-scanning from a
+		// predicted stop eye (O(1) per frame, works even when the moving
+		// scan produced no hit at all). When the stopped shot becomes
+		// viable, arm the stop and let the autostop / air-stop decelerate -
+		// the bullet then leaves from the stopped spread.
 		if ( !shot_viable && this->should_stop_movement( ctx ) )
 		{
-			// The stop-plan re-scan is a refinement of THIS tick's scan:
-			// the stopped eye only shifts a few units and the hitbox
-			// points are unchanged, so a target the current eye could
-			// not hit at all will not appear from the stopped one.
-			// Restricting the plan pass to the candidates the current
-			// scan already saw turns the second full-scan into a ~1-2
-			// target pass - halving the worst-case trace cost of a stop
-			// tick, which is exactly when the scan runs twice.
-			std::vector<candidate> plan_candidates;
-			plan_candidates.reserve( 2 );
-			for ( const auto& cand : candidates )
-			{
-				const auto seen = std::any_of( current_hits.begin( ), current_hits.end( ),
-					[ & ]( const scan_hit& h ) { return h.pawn == cand.pawn; } );
-				if ( seen )
-				{
-					plan_candidates.push_back( cand );
-				}
-			}
-
-			const auto stop = this->predict_stop( ctx, primary_eye, local );
-			if ( stop )
-			{
-				const auto future_offset = stop->eye - primary_eye;
-				auto planned_hits = plan_candidates.empty( )
-					? std::vector<scan_hit>{}
-					: scan_from_eye_candidates( plan_candidates, future_offset, stop->inaccuracy, k_max_scan_traces );
-				const auto planned = this->select_best( ctx, planned_hits, stop->inaccuracy );
-				this->m_should_stop = planned.valid;
-			}
-			else
-			{
-				this->m_should_stop = best.valid;
-			}
+			this->m_should_stop = this->plan_stop( ctx, best, local, needed_hc, head_tolerance );
 
 			// Air stop: while airborne the deceleration is executed by the
 			// airstrafe shift air-stop - auto-hold shift so it engages
@@ -1769,244 +1044,22 @@ namespace features::combat {
 
 		const auto seed_mode = config.no_spread_mode.value == settings::combat::ragebot::weapon_group::no_spread_mode::seed;
 
-		// Seed mode is independent of the no-spread switch: it never
-		// touches the view angles (zero compensation), it only verifies
-		// the server-side spread seed lands on the hitbox naturally. That
-		// is fully legal on servers that reject no-spread, so the mode
-		// stays usable with the switch off - in that case a scattered
-		// seed simply drops the shot (no compensation fallback, since
-		// corrected angles are not allowed there).
 		if ( config.no_spread.value || seed_mode )
 		{
-			// The spread seed uses the tick the server consumes the shot on
-			// (the attack stamp above); the compensation must match it.
-			//
-			// Double tap rewrites the entry claim to the weapon-ready tick
-			// (m_next_attack), so the server derives its seed from THAT
-			// tick - a correction computed against the local interpolated
-			// stamp would target the wrong seed bucket, fail its own
-			// self-consistency check and drop the shot. Use the claimed
-			// tick when double tap is active so the compensation always
-			// matches what the server resolves.
-			auto claim_tick = stamp_tick;
-			if ( settings::g_combat.m_ragebot.m_double_tap.enabled.value
-				&& shared_ctx.item_def_idx != cstypes::item_definition_index::weapon_r8_revolver )
+			if ( !this->apply_no_spread( aim_angle, tgt, shoot_eye, stamp_tick, tick_base ) )
 			{
-				const auto dt_claim = this->m_double_tap.claimed_tick( );
-				// Same sanity bound as the DT rhythm (claim_valid): a
-				// garbage claim must not feed the seed math.
-				if ( dt_claim >= 0 && dt_claim <= tick_base + 256 )
-				{
-					claim_tick = dt_claim;
-				}
+				return;
 			}
 
-			// on_fired stamps the entries with this exact tick (the DT
-			// rhythm would otherwise overwrite them with the claim or 0
-			// and desync the server-side seed from the correction).
-			this->m_double_tap.set_no_spread_claim_tick( claim_tick );
-
-			// Seed mode (legit-style, non-forced): no angle compensation at
-			// all - the view keeps the plain aim at the target. Instead,
-			// mirror the legit triggerbot seed constraint: predict the
-			// server-side spread seed for this shot and only fire when the
-			// natural bullet direction still lands on the target's hitbox.
-			// When the seed scatters the bullet off the body, drop the shot
-			// and let the next tick re-roll the seed.
-			//
-			// On servers that block client/server seed sync the predicted
-			// seed never matches the server's, so the verification would
-			// gate shots on a random check. The shot-result tracker
-			// (shared::note_seed_shot) detects the collapsed hit rate and
-			// flips seed_synced() false - the mode then degrades to the
-			// plain ragebot instead of dropping shots.
-			if ( seed_mode && g_shared.seed_synced( ) )
+			if ( shared_ctx.item_def_idx == cstypes::item_definition_index::weapon_r8_revolver )
 			{
-				math::vector3 forward{}, left{}, up{};
-				math::helpers::angle_vectors_left( aim_angle, &forward, &left, &up );
-
-				const auto seed = g_shared.get_spread_seed( aim_angle, claim_tick );
-				const auto spread = g_shared.calculate_spread(
-					static_cast< int >( seed ),
-					shared_ctx.inaccuracy,
-					shared_ctx.spread,
-					shared_ctx.recoil_index,
-					shared_ctx.item_def_idx,
-					shared_ctx.num_bullets );
-
-				const auto bullet_dir = ( forward + left * spread.x + up * spread.y ).normalized( );
-
-				if ( !tgt.hit.record || tgt.hit.bone_index < 0 || tgt.hit.bone_index >= 28 )
-				{
-					this->m_firing_this_tick = false;
-					return;
-				}
-
-				const auto& bone = tgt.hit.record->bones[ tgt.hit.bone_index ];
-				const auto& hb = tgt.hit.hitbox;
-				const auto capsule_start = bone.rotation.rotate_vector( hb.mins ) + bone.position;
-				const auto capsule_end = bone.rotation.rotate_vector( hb.maxs ) + bone.position;
-				const auto radius = hb.radius > 0.0f ? hb.radius * 0.9f : 1.8f;
-
-				auto fraction{ 1.0f };
-				if ( !g_shared.ray_vs_capsule( shoot_eye, bullet_dir * shared_ctx.range, capsule_start, capsule_end, radius, fraction ) )
-				{
-					// The seed scattered off the body. Waiting for a lucky
-					// seed is weak (moving targets almost never get one);
-					// when no-spread is enabled fall back to a focused
-					// angle compensation for this tick so the shot count
-					// stays up. Without no-spread (servers that reject
-					// corrected angles) drop the shot instead.
-					if ( config.no_spread.value )
-					{
-						const auto corrected = g_shared.find_spread_correction( aim_angle, claim_tick, seed );
-						if ( corrected.x == 0.0f && corrected.y == 0.0f && corrected.z == 0.0f )
-						{
-							this->m_firing_this_tick = false;
-							return;
-						}
-
-						aim_angle = corrected;
-					}
-					else
-					{
-						this->m_firing_this_tick = false;
-						return;
-					}
-				}
-			}
-			else
-			{
-				// Forced no-spread (rewritten): the correction is computed
-				// DIRECTLY from the shot's own seed - pitch raised by the
-				// spread cone and rolled opposite the spread vector, so
-				// "corrected angle + spread" lands exactly on the aim. The
-				// seed tick must match what the SERVER consumes: double tap
-				// rewrites the entry claim to the weapon-ready tick
-				// (m_claimed_for_aim), so the server derives its seed from
-				// THAT tick - correcting against the local interpolated
-				// stamp would target a different seed and every bullet
-				// would drift. Without DT the claim is the stamp itself.
-				// The result must stay inside the same seed bucket as the
-				// original angle (otherwise the server, resolving through
-				// the corrected entry angle, would apply a different seed's
-				// spread); when it does not, fall back to the full
-				// 720-probe bucket search.
-				const auto seed = g_shared.get_spread_seed( aim_angle, claim_tick );
-				if ( seed == 0 )
-				{
-					this->m_firing_this_tick = false;
-					return;
-				}
-
-				const auto spread = g_shared.calculate_spread(
-					static_cast< int >( seed ),
-					shared_ctx.inaccuracy,
-					shared_ctx.spread,
-					shared_ctx.recoil_index,
-					shared_ctx.item_def_idx,
-					shared_ctx.num_bullets );
-
-				auto corrected = aim_angle;
-				corrected.x += math::helpers::rad_to_deg( std::atan( std::sqrt( spread.x * spread.x + spread.y * spread.y ) ) );
-				corrected.z = -math::helpers::rad_to_deg( std::atan2( spread.x, spread.y ) );
-
-				if ( g_shared.get_spread_seed( corrected, claim_tick ) != seed )
-				{
-					// Different bucket: fall back to the full sweep.
-					corrected = g_shared.find_spread_correction( aim_angle, claim_tick, seed );
-					if ( corrected.x == 0.0f && corrected.y == 0.0f && corrected.z == 0.0f )
-					{
-						this->m_firing_this_tick = false;
-						return;
-					}
-				}
-
-				aim_angle = corrected;
-
-				// Trajectory verification: the bucket match above only
-				// guarantees the server derives the SAME spread seed from
-				// the corrected angle - it does not guarantee the
-				// corrected bullet geometrically crosses the hitbox. The
-				// pitch-lift + roll compensation is an approximation, so
-				// verify the actual bullet direction (corrected angle +
-				// that seed's spread) against the RECORD pose capsule the
-				// server rewinds to. A miss here means the shot would
-				// whiff - drop it instead of firing a guaranteed miss.
-				if ( tgt.hit.bone_index >= 0 && tgt.hit.bone_index < 28 )
-				{
-					const auto& bone = tgt.hit.record->bones[ tgt.hit.bone_index ];
-					const auto& hb = tgt.hit.hitbox;
-					const auto capsule_start = bone.rotation.rotate_vector( hb.mins ) + bone.position;
-					const auto capsule_end = bone.rotation.rotate_vector( hb.maxs ) + bone.position;
-					const auto radius = hb.radius > 0.0f ? hb.radius : 1.8f;
-
-					math::vector3 fwd{}, lft{}, up{};
-					math::helpers::angle_vectors_left( aim_angle, &fwd, &lft, &up );
-					const auto dir = ( fwd + lft * spread.x + up * spread.y ).normalized( );
-
-					auto fraction{ 1.0f };
-					if ( !g_shared.ray_vs_capsule( shoot_eye, dir * shared_ctx.range, capsule_start, capsule_end, radius, fraction ) )
-					{
-						this->m_firing_this_tick = false;
-						return;
-					}
-				}
-			}
-
-			if ( settings::g_misc.m_impacts.console_log.value && shared_ctx.item_def_idx == cstypes::item_definition_index::weapon_r8_revolver )
-			{
-				logging::console::print(
-					xs( "[r8] aim ({:.2f},{:.2f}) -> final ({:.2f},{:.2f}) tick {}" ),
-					tgt.hit.aim_angle.x, tgt.hit.aim_angle.y,
-					aim_angle.x, aim_angle.y,
-					stamp_tick
-				);
+				this->log_revolver_aim( tgt, aim_angle, stamp_tick );
 			}
 		}
 
 		g_shared.last_shoot_tick( ) = tick_base;
 
-		if ( settings::g_misc.m_impacts.console_log.value )
-		{
-			const auto hitgroup_name = systems::g_hitboxes.hitgroup_to_name( tgt.hit.hitgroup );
-			const auto bt_delta = std::max( stamp_tick - tgt.hit.record->tick, 0 );
-				logging::console::print_severity(
-				2,
-				xs( "[velocity] 射击 {}，生命 {}，伤害 {:.0f}（{}），命中率 {:.0f}%，回溯 {}t{}" ),
-				hitgroup_name,
-				tgt.hit.health,
-				tgt.hit.damage,
-				hitgroup_name,
-				tgt.hitchance * 100.0f,
-				bt_delta,
-				was_forced ? xs( "（强制）" ) : ""
-			);
-		}
-
-		features::misc::g_impacts.on_boom(
-			{
-				.victim_pawn = tgt.hit.pawn,
-				.command_number = cmd->command_number,
-				.hitgroup = tgt.hit.hitgroup,
-				.target_health = tgt.hit.health,
-				.damage = tgt.hit.damage,
-				.hitchance = tgt.hitchance,
-				.inaccuracy = shared_ctx.inaccuracy,
-				.spread = shared_ctx.spread,
-				.aim_angle = aim_angle,
-				.aim_position = aim_position,
-				.shoot_position = shoot_eye,
-				.tick = tgt.hit.record->tick,
-				.stamp_tick = stamp_tick,
-				.skeleton = g_shared.lc( ).get_skeleton( *tgt.hit.record ),
-				.forced = was_forced,
-				.extrapolated = tgt.hit.record->extrapolated,
-				.penetrated = tgt.hit.penetrated,
-				.seed_mode = seed_mode,
-				.dt = settings::g_combat.m_ragebot.m_double_tap.enabled.value
-					&& shared_ctx.item_def_idx != cstypes::item_definition_index::weapon_r8_revolver,
-			} );
+		this->log_shot( cmd, tgt, aim_angle, aim_position, shoot_eye, stamp_tick, was_forced, seed_mode );
 		features::esp::player::g_chams.os ().push (tgt.hit.pawn);
 		const auto record_time = cstypes::tick_fraction::from_value( tgt.hit.record->simulation_time / cstypes::tick_interval );
 		const auto history_size = cmd->csgo_user_cmd.input_history_size( );
@@ -2171,16 +1224,13 @@ namespace features::combat {
 
 		if ( ctx.on_ground )
 		{
-			const auto speed_2d = velocity.length_2d( );
-			if ( speed_2d <= 0.1f )
-			{
-				return false;
-			}
-
-			const auto inaccuracy_move = memory::read<float>( shared_ctx.weapon_vdata + SCHEMA( "CCSWeaponBaseVData", "m_flInaccuracyMove"_hash ) );
-			const auto inaccuracy_stand = memory::read<float>( shared_ctx.weapon_vdata + SCHEMA( "CCSWeaponBaseVData", "m_flInaccuracyStand"_hash ) );
-
-			return speed_2d * inaccuracy_move > inaccuracy_stand;
+			// Rewritten: the old gate (speed * m_flInaccuracyMove >
+			// m_flInaccuracyStand) depends on weapon-vdata schema offsets
+			// that silently break on game updates and kill the autostop
+			// entirely. The speed-vs-accurate-threshold comparison needs
+			// no schema data at all and matches the fire speed gate, so
+			// the stop plan and the fire gate agree on what "moving" is.
+			return velocity.length_2d( ) > ctx.accurate_threshold;
 		}
 
 		// Airborne stopping is sniper-only by default; the "air stop" setting

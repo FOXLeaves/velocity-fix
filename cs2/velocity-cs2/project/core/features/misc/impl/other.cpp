@@ -20,7 +20,7 @@ namespace features::misc {
 			return memory::read_string( name_ptr, 127 );
 		}
 
-		void submit_name_change( const std::string& display_name )
+		void submit_name_change( const std::string& display_name, bool restoring = false )
 		{
 			if ( display_name.empty( ) )
 			{
@@ -29,8 +29,10 @@ namespace features::misc {
 
 			other::s_display_name = display_name;
 			other::s_name_change_pending = true;
+			other::s_name_restoring = restoring;
 			memory::call<void>( PATTERN( patterns::engine_client_cmd ), addresses::globals::source2engine_to_client, 0, xs( "setinfo name x" ), 0x7ffef001 );
 			other::s_name_change_pending = false;
+			other::s_name_restoring = false;
 		}
 
 	} // namespace
@@ -405,17 +407,35 @@ namespace features::misc {
 		const auto enabled = cfg.clantag.value || cfg.override_name.value;
 
 		if ( !enabled )
+		if ( !enabled )
 		{
+			// Restore the player's own name. The first submit can be
+			// swallowed by the server rename cooldown, so keep retrying at
+			// a fixed interval until the server-side name actually matches
+			// the captured original - only then clear the state (a stale
+			// m_original_name.clear() after one submit left the fake name
+			// stuck forever).
 			if ( this->m_name_changer_active && local.controller && !this->m_original_name.empty( ) )
 			{
-				submit_name_change( this->m_original_name );
+				if ( controller_name( local.controller ) == this->m_original_name )
+				{
+					this->m_name_changer_active = false;
+					this->m_name_changer_controller = 0;
+					this->m_original_name.clear( );
+					this->m_last_sent_name.clear( );
+					other::s_display_name.clear( );
+				}
+				else
+				{
+					const auto now_tick = features::combat::g_shared.ctx( ).current_tick;
+					if ( now_tick - this->m_last_restore_tick >= 200 )
+					{
+						submit_name_change( this->m_original_name, true );
+						this->m_last_restore_tick = now_tick;
+					}
+				}
 			}
 
-			this->m_name_changer_active = false;
-			this->m_name_changer_controller = 0;
-			this->m_original_name.clear( );
-			this->m_last_sent_name.clear( );
-			other::s_display_name.clear( );
 			return;
 		}
 
@@ -451,9 +471,10 @@ namespace features::misc {
 		std::string display_name = base_name;
 		if ( cfg.clantag.value )
 		{
-			constexpr std::string_view tag{ "velocity" };
+			const auto custom_tag = cfg.clantag_text.value;
+			const std::string_view tag{ custom_tag.empty( ) ? "velocity plus" : custom_tag };
+			const auto phase_count = static_cast<int>( tag.size( ) * 2 );
 			constexpr auto ticks_per_step{ 16 }; // 0.25 seconds at CS2's 64-tick interval.
-			constexpr auto phase_count{ static_cast<int>( tag.size( ) * 2 ) };
 
 			const auto global_vars = memory::safe_read<std::uintptr_t>( addresses::globals::global_vars ).value_or( 0 );
 			const auto current_tick = global_vars

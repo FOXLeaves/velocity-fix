@@ -590,6 +590,14 @@ namespace features::combat {
 			math::vector3 view_angles{};
 			math::vector3 velocity{};
 
+			// Post-simulation state (what the server executes for this
+			// command): the autostop / movement modules write into the
+			// usercmd BEFORE rage runs, so the simulated velocity carries
+			// the actual stop execution. The fire gate uses it to wait
+			// for the stop to land instead of trusting the sampled
+			// accuracy alone.
+			math::vector3 predicted_velocity{};
+
 			float predicted_inaccuracy{};
 			float spread{};
 
@@ -597,12 +605,6 @@ namespace features::combat {
 			float accurate_threshold{};
 			bool on_ground{};
 			bool is_scoped{};
-		};
-
-		struct stop_prediction
-		{
-			math::vector3 eye{};
-			float inaccuracy{};
 		};
 
 		struct candidate
@@ -665,7 +667,13 @@ namespace features::combat {
 		};
 
 		[[nodiscard]] aim_context build_context( systems::input::usercmd* cmd, const systems::local::snapshot& local ) const;
-		[[nodiscard]] std::optional<stop_prediction> predict_stop( const aim_context& ctx, const math::vector3& current_eye, const systems::local::snapshot& local ) const;
+		// Stop planning (new): with the best target already locked, decide
+		// whether standing still makes THAT shot viable. Stopping only
+		// shrinks the spread cone (the predicted eye shift is a few units
+		// at most), so the stopping accuracy - velocity driven to zero -
+		// is re-applied to the existing best hit instead of re-scanning
+		// from the predicted stop point.
+		[[nodiscard]] bool plan_stop( const aim_context& ctx, const target& best, const systems::local::snapshot& local, float needed_hc, float head_tolerance ) const;
 		[[nodiscard]] std::vector<candidate> gather_candidates( const systems::local::snapshot& local, float max_distance_sq = 0.0f ) const;
 
 		bool run_gun( systems::input::usercmd* cmd, const aim_context& ctx, const systems::local::snapshot& local, bool allow_fire = true );
@@ -705,6 +713,31 @@ namespace features::combat {
 		void draw_penetration_crosshair( xdraw::draw_list& draw_list ) const;
 
 		void clear_attack_button( systems::input::usercmd* cmd ) const;
+
+		// --- no-spread module (rage.no_spread.cpp) ---
+		// Eye-candidate scan helper shared by both fire paths (the regular
+		// scan and the no-spread pass).
+		[[nodiscard]] std::vector<scan_hit> scan_from_eye_candidates( const shared::shoot_history::eye_candidates& eye_candidates, std::vector<candidate>& scan_set, const math::vector3& eye_offset, float inaccuracy, int max_traces, const aim_context& ctx, const systems::local::snapshot& local );
+		// No-spread scan branch of run_gun: scan + selection without
+		// hitchance gating, fires through fire_gun when allowed.
+		bool run_no_spread( systems::input::usercmd* cmd, const aim_context& ctx, std::vector<candidate>& candidates, const shared::shoot_history::eye_candidates& eye_candidates, const systems::local::snapshot& local, bool allow_fire );
+		// Seed-correction pass of fire_gun: computes the compensated aim
+		// angle (seed/forced mode) and drops the shot when no valid
+		// correction exists. Returns false when the shot must be aborted.
+		// The double-tap linkage is preserved: the DT claim tick feeds the
+		// seed bucket and is stamped on the entries (set_no_spread_claim_tick).
+		bool apply_no_spread( math::vector3& aim_angle, const target& tgt, const math::vector3& shoot_eye, int stamp_tick, int tick_base );
+
+		// --- shot log module (rage.log.cpp) ---
+		// Console output + impacts (hit/miss tracker) linkage for a shot
+		// delivered by fire_gun.
+		void log_shot( systems::input::usercmd* cmd, const target& tgt, const math::vector3& aim_angle, const math::vector3& aim_position, const math::vector3& shoot_eye, int stamp_tick, bool was_forced, bool seed_mode );
+		// Revolver no-spread aim debug output (console only).
+		void log_revolver_aim( const target& tgt, const math::vector3& aim_angle, int stamp_tick );
+		// Ammo-confirmation pass: prints exactly as many queued console
+		// shot logs as bullets actually left the clip this tick (one
+		// bullet = one line, double tap = two), dropping the rest.
+		void flush_console_shot_logs( );
 
 		bool m_should_stop{};
 		bool m_firing_this_tick{};

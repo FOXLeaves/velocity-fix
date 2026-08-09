@@ -144,7 +144,10 @@
     <ClCompile Include="project\core\features\combat\impl\legit.cpp" />
     <ClCompile Include="project\core\features\combat\impl\misc.cpp" />
     <ClCompile Include="project\core\features\combat\impl\rage.cpp" />
+    <ClCompile Include="project\core\features\combat\impl\rage.double_tap.cpp" />
+    <ClCompile Include="project\core\features\combat\impl\rage.log.cpp" />
     <ClCompile Include="project\core\features\combat\impl\rage.melee.cpp" />
+    <ClCompile Include="project\core\features\combat\impl\rage.no_spread.cpp" />
     <ClCompile Include="project\core\features\combat\impl\rage.scan.cpp" />
     <ClCompile Include="project\core\features\combat\impl\shared.cpp" />
     <ClCompile Include="project\core\features\combat\impl\vac_bypass.cpp" />

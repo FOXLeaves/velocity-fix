@@ -1,4 +1,4 @@
-﻿#include <pch/pch.hpp>
+#include <pch/pch.hpp>
 #include <utilities/math/math.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
@@ -307,7 +307,7 @@ namespace rendering {
 		const auto logo_draw_w = static_cast<float>( logo_w );
 
 		// ── measure text ─────────────────────────────────────────────────────
-		const auto [name_tw, name_th] = xdraw::measure_text( "velocity.cat" );
+		const auto [name_tw, name_th] = xdraw::measure_text( "velocity plus" );
 		const auto [user_tw, user_th] = xdraw::measure_text( "developer" );
 		const auto [ping_vw, ping_vh] = xdraw::measure_text( ping_val );
 		const auto [ping_uw, ping_uh] = xdraw::measure_text( " ms" );
@@ -388,7 +388,7 @@ namespace rendering {
 			draw_list.image( cx + logo_icon_pad, y + ( h - static_cast<float>( logo_h ) ) * 0.5f,
 				static_cast<float>( logo_w ), static_cast<float>( logo_h ), logo.Get( ), s.checkbox_mark_icon );
 		draw_list.text( cx + logo_icon_pad + logo_draw_w + logo_icon_pad,
-			y + ( h - name_th ) * 0.5f + text_nudge, "velocity.cat", s.checkbox_mark_icon );
+			y + ( h - name_th ) * 0.5f + text_nudge, "velocity plus", s.checkbox_mark_icon );
 		cx += logo_pill_w + section_spacing;
 
 		if ( wm.show_user.value ) draw_pill( "developer", user_tw, user_th, user_pill_w );

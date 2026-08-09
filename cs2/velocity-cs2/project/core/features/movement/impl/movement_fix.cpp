@@ -633,24 +633,23 @@ namespace features::movement {
 			|| move_type == cstypes::move_type::noclip
 			|| move_type == cstypes::move_type::observer;
 
-		// Grounded moves resolve against the opposite rotation direction:
-		// the field-tested result is a full reversal on the ground only
-		// (air movement is unaffected). Flip the frame pair for grounded
-		// commands so the world-space wish comes out on the player's
-		// intent instead of mirrored.
+		// Frame conversion is a pure world-space re-expression: the command
+		// source frame (real view yaw) and the wire frame (AA yaw) both use
+		// a positive-forward / positive-left basis, so no reversal is ever
+		// needed. A grounded reversal only LOOKED correct - at exactly 180°
+		// (back AA) cos(180°) = -1 makes flipping a no-op, which is why the
+		// old ground flip passed field tests with back-AA but mirrored every
+		// non-180° yaw (side-head, custom offsets, jitter) on the ground.
 		const auto on_ground = ( systems::g_prediction.pre( ).flags & cstypes::entity_flags::on_ground ) != 0;
+		// Grounded commands keep the quantized trajectory path disabled: the
+		// yaw sandwich assumes a frame pair that is only exercised air-side.
 		const auto ground_flip = on_ground && !uses_3d_movement;
-		const auto yaw_delta = ground_flip ? -yaw_delta_raw : yaw_delta_raw;
 		const auto frame_changed = !uses_3d_movement && std::fabsf( yaw_delta_raw ) > k_move_epsilon;
 		auto movement_source_yaw = uses_3d_movement ? target_yaw : this->m_source_yaw;
-		// Frame-reframing helper with the grounded reversal applied at every
-		// conversion point (base fields and analog trajectory alike).
+		// Frame-reframing helper used at every conversion point (base fields
+		// and analog trajectory alike).
 		const auto reframe = [ & ]( const math::vector2& move, float source_yaw, float target_yaw )
 		{
-			if ( ground_flip )
-			{
-				return reframe_move( move, target_yaw, source_yaw );
-			}
 			return reframe_move( move, source_yaw, target_yaw );
 		};
 		auto target_base = reframe( source_base, movement_source_yaw, target_yaw );

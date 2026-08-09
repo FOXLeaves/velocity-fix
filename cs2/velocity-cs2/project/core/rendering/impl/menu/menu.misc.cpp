@@ -1,4 +1,4 @@
-﻿#include <pch/pch.hpp>
+#include <pch/pch.hpp>
 #include <core/settings.hpp>
 #include <core/features/features.hpp>
 
@@ -306,6 +306,11 @@ namespace rendering {
 				}
 
 				xui::checkbox( "队标", m.m_name_changer.clantag );
+				if ( xui::begin_popup( "##clantag_popup", 220.0f ) )
+				{
+					xui::text_input( "队标文本##ct", m.m_name_changer.clantag_text.value, 32, "tag text..." );
+					xui::end_popup( );
+				}
 				xui::checkbox( "改名", m.m_name_changer.override_name );
 				if ( xui::begin_popup( "##override_name_popup", 220.0f ) )
 				{
