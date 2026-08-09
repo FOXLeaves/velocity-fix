@@ -454,12 +454,20 @@ namespace features::combat {
 			[[nodiscard]] bool is_second_pending( ) const noexcept { return this->m_auto_second; }
 			// The ragebot feeds its latest aim decision here every tick;
 			// the auto second shot reuses it so it follows the CURRENT
-			// target, not the first shot's stale angles.
-			void update_aim( const math::vector3& angles ) noexcept
+			// target, not the first shot's stale angles. The feed tick is
+			// recorded so on_fired can reject a stale angle (target died /
+			// switched) instead of firing at the old aim point.
+			void update_aim( const math::vector3& angles, int tick ) noexcept
 			{
 				this->m_dt_aim = angles;
 				this->m_has_dt_aim = true;
+				this->m_dt_aim_tick = tick;
 			}
+			// Tick the current aim decision was fed. on_fired compares it
+			// against the live tick; a gap of more than 2 ticks means the
+			// angle belongs to a dead / lost target and the attack is
+			// suppressed (an empty "spread" miss on the corpse).
+			[[nodiscard]] int aim_tick( ) const noexcept { return this->m_dt_aim_tick; }
 
 			// Weapon-ready tick claimed on the input history. The server
 			// resolves the attack against this tick, so the ragebot aligns
@@ -521,6 +529,8 @@ namespace features::combat {
 			// - the auto second shot follows the CURRENT target.
 			math::vector3 m_dt_aim{};
 			bool m_has_dt_aim{};
+			// Tick m_dt_aim was last fed (g_shared.ctx().current_tick).
+			int m_dt_aim_tick{ -1 };
 			// Whether the last attack edge was manual (false = ragebot).
 			// The auto second shot picks its angles accordingly: manual
 			// pairs reuse the first shot's aim, ragebot pairs follow the

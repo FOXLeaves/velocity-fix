@@ -68,7 +68,7 @@ namespace features::combat {
 			return false;
 		}
 
-		this->m_double_tap.update_aim( best.hit.aim_angle - g_shared.get_aim_punch( local.pawn ) );
+		this->m_double_tap.update_aim( best.hit.aim_angle - g_shared.get_aim_punch( local.pawn ), g_shared.ctx( ).current_tick );
 
 		this->update_auto_scope( cmd, true );
 

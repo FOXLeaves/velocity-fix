@@ -683,7 +683,19 @@ namespace features::combat {
 		// (regardless of the DT switch), so the next shot would fly off.
 		if ( best.valid )
 		{
-			this->m_double_tap.update_aim( best.hit.aim_angle - g_shared.get_aim_punch( local.pawn ) );
+			this->m_double_tap.update_aim( best.hit.aim_angle - g_shared.get_aim_punch( local.pawn ), g_shared.ctx( ).current_tick );
+		}
+		else if ( !current_hits.empty( ) )
+		{
+			// DT second-shot window / target switch: the predicted claim
+			// sits ahead of the record grid, so select_best is gated empty
+			// even though the scan found hits - the next bullet must still
+			// follow the CURRENT target. Feed the highest-damage scanned
+			// hit (closest to what select_best would pick) so the pair
+			// tracks a moving / freshly-switched target.
+			const auto freshest = std::max_element( current_hits.begin( ), current_hits.end( ),
+				[ ]( const scan_hit& a, const scan_hit& b ) { return a.damage < b.damage; } );
+			this->m_double_tap.update_aim( freshest->aim_angle - g_shared.get_aim_punch( local.pawn ), g_shared.ctx( ).current_tick );
 		}
 
 		this->update_auto_scope( cmd, best.valid );

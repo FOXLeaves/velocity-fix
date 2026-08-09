@@ -229,9 +229,9 @@ namespace features::combat {
 		// Preview progress - charge state machine for the pair:
 		//   shot_count == 0: linear charge 0 -> 100% over TWO weapon
 		//                    cycles (one shot charged = 50%, both = 100%)
-		//   shot_count == 1: stuck at 50% - one bullet left, the bar does
-		//                    NOT recharge: only firing the second bullet,
-		//                    reloading or switching weapons resets it
+		//   shot_count == 1: one bullet fired - the second half recharges
+		//                    over ONE weapon cycle (50% -> 100%), the bar
+		//                    keeps moving instead of freezing
 		//   shot_count >= 2: both bullets gone - reset to 0 and recharge
 		//                    from zero
 		switch ( this->m_state )
@@ -256,9 +256,28 @@ namespace features::combat {
 
 			if ( this->m_shot_count == 1 )
 			{
-				// One bullet fired, one left: stuck at 50% until the
-				// second bullet leaves (or reload / weapon switch).
-				this->m_progress = 0.5f;
+				// One bullet fired: the second half recharges over ONE
+				// weapon cycle (50% -> 100%) instead of the two-cycle
+				// charge from zero - the bar keeps moving.
+				float charge{ 0.5f };
+				if ( this->m_ticks_to_ready > 1 )
+				{
+					this->m_ready_tick = -1;
+					const auto elapsed = static_cast< float >( window - std::max( this->m_ticks_to_ready - 1, 0 ) );
+					charge = 0.5f + 0.5f * ( elapsed / static_cast< float >( window ) );
+				}
+				else
+				{
+					if ( this->m_ready_tick < 0 )
+					{
+						this->m_ready_tick = tick_base;
+					}
+
+					const auto since_ready = std::max( tick_base - this->m_ready_tick, 0 );
+					charge = 0.5f + 0.5f * ( std::min( since_ready, window ) / static_cast< float >( window ) );
+				}
+
+				this->m_progress = std::clamp( charge, 0.0f, 1.0f );
 				break;
 			}
 
@@ -398,7 +417,14 @@ namespace features::combat {
 
 			const auto immediate_second = should_attack && ( tick_base - this->m_last_fire_tick ) == 1;
 
-			if ( should_attack && claim_valid && ( !this->m_fired || immediate_second ) )
+			// Aim-freshness gate: after the target dies and the scan
+			// switches, the fed angle belongs to the OLD target until the
+			// new scan lands. Expressing the attack with that stale angle
+			// fires at the corpse ("spread" miss). Only commit when the
+			// aim decision is at most 2 ticks old.
+			const auto aim_fresh = g_shared.ctx( ).current_tick - this->m_dt_aim_tick <= 2;
+
+			if ( should_attack && claim_valid && aim_fresh && ( !this->m_fired || immediate_second ) )
 			{
 				this->m_last_fire_tick = tick_base;
 				this->m_last_shot_manual = false;
@@ -603,7 +629,10 @@ namespace features::combat {
 		}
 
 		const auto local = systems::g_local.get( );
-		if ( !local.controller || !local.is_alive )
+		// Lobby / waiting room: not in a match (no controller, or no team
+		// assigned yet). In-match the bar stays visible at all times -
+		// alive, dead or spectating.
+		if ( !local.controller || local.team < 2 )
 		{
 			return;
 		}

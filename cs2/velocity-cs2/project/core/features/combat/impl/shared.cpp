@@ -1312,52 +1312,42 @@ namespace features::combat {
 		math::vector3 forward{}, left{}, up{};
 		math::helpers::angle_vectors_left( aim_angle, &forward, &left, &up );
 
-		// Every candidate in a scan uses the same weapon state. The engine spread
-		// function is much more expensive than the capsule test, so calculate each
-		// deterministic seed once and reuse it for all candidate points.
-		struct spread_cache
-		{
-			std::uintptr_t weapon{};
-			float inaccuracy{};
-			float spread{};
-			float recoil_index{};
-			int item_def_idx{};
-			int num_bullets{};
-			int count{};
-			bool initialized{};
-			std::array<math::vector2, 512> values{};
-		};
+		// Spread sampling: client-side analytic cone model, replacing the
+		// engine weapon_calculate_spread call inside the hit-chance pass.
+		// The engine function's signature drifted on game updates and
+		// stopped responding to the accuracy input - the sampled hitchance
+		// read a constant ~71% under every cone (0.025..0.126 rad) while
+		// the server resolved the real spread, so "accurate" shots whiffed
+		// whenever the player was not standing perfectly still. The
+		// analytic model draws a deterministic uniform-disc inside the
+		// cone (angle offset = tan(cone) * sqrt(u), azimuth = 2*pi*v) -
+		// the same distribution the engine uses - so the accuracy/spread
+		// parameters genuinely drive the result. The fixed seed keeps the
+		// sample directions stable tick-to-tick: the hitchance moves
+		// smoothly with the accuracy instead of sampling-noise flapping.
+		const auto cone_tan = std::tan( total );
 
-		thread_local spread_cache cache{};
-		if ( !cache.initialized || cache.weapon != this->m_ctx.weapon || cache.inaccuracy != inaccuracy || cache.spread != spread ||
-			cache.recoil_index != this->m_ctx.recoil_index || cache.item_def_idx != this->m_ctx.item_def_idx ||
-			cache.num_bullets != this->m_ctx.num_bullets )
-		{
-			cache.weapon = this->m_ctx.weapon;
-			cache.inaccuracy = inaccuracy;
-			cache.spread = spread;
-			cache.recoil_index = this->m_ctx.recoil_index;
-			cache.item_def_idx = this->m_ctx.item_def_idx;
-			cache.num_bullets = this->m_ctx.num_bullets;
-			cache.count = 0;
-			cache.initialized = true;
-		}
+		const auto hash01 = [ ]( std::uint32_t seed, std::uint32_t index, std::uint32_t salt ) -> float
+			{
+				auto x = static_cast< std::uint64_t >( seed ) + static_cast< std::uint64_t >( index ) * 0x9E3779B97F4A7C15ull + static_cast< std::uint64_t >( salt ) * 0xBF58476D1CE4E5B9ull;
+				x = ( x ^ ( x >> 30 ) ) * 0xBF58476D1CE4E5B9ull;
+				x = ( x ^ ( x >> 27 ) ) * 0x94D049BB133111EBull;
+				x = x ^ ( x >> 31 );
+				return static_cast< float >( x >> 40 ) * ( 1.0f / 0x100000000ull );
+			};
 
-		const auto cached_samples = std::min( samples, static_cast< int >( cache.values.size( ) ) );
-		for ( auto i = cache.count; i < cached_samples; ++i )
-		{
-			cache.values[ i ] = this->calculate_spread( i, inaccuracy, spread, this->m_ctx.recoil_index, this->m_ctx.item_def_idx, this->m_ctx.num_bullets );
-		}
-		cache.count = std::max( cache.count, cached_samples );
+		const auto sample_seed = static_cast< std::uint32_t >( this->m_ctx.weapon >> 4 );
 
 		auto hits{ 0 };
 
 		for ( auto i = 0; i < samples; ++i )
 		{
-			const auto calculated_spread = i < cached_samples
-				? cache.values[ i ]
-				: this->calculate_spread( i, inaccuracy, spread, this->m_ctx.recoil_index, this->m_ctx.item_def_idx, this->m_ctx.num_bullets );
-			const auto direction = forward + ( left * calculated_spread.x ) + ( up * calculated_spread.y );
+			const auto theta = hash01( sample_seed, static_cast< std::uint32_t >( i ), 1u ) * 2.0f * std::numbers::pi_v<float>;
+			const auto radius = std::sqrt( hash01( sample_seed, static_cast< std::uint32_t >( i ), 2u ) );
+			const auto offset = cone_tan * radius;
+			const auto direction = forward
+				+ ( left * ( std::cos( theta ) * offset ) )
+				+ ( up * ( std::sin( theta ) * offset ) );
 			const auto ray_end = direction.normalized( ) * 8192.0f;
 
 			auto hit{ false };
