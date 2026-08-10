@@ -486,7 +486,7 @@ namespace features::combat {
 
 				const auto& bone = group.record->bones[ h.bone_index ];
 				float hc{ 1.0f };
-				if ( !config.no_spread.value )
+				if ( !settings::g_combat.m_ragebot.no_spread.value )
 				{
 					// Adaptive sampling with threshold focus: 256 samples keep
 					// the common case fast, and when the estimate lands near
@@ -526,7 +526,7 @@ namespace features::combat {
 				// instead of being stared at.
 				const auto is_head = systems::g_hitboxes.hitgroup_from_hitbox( h.hitbox_index ) == 1;
 				const auto head_tolerance = is_head ? ( can_kill ? 0.25f : 0.10f ) : 0.0f;
-				const auto passes_hitchance = config.no_spread.value || hc >= needed_hc - 0.01f - head_tolerance;
+				const auto passes_hitchance = settings::g_combat.m_ragebot.no_spread.value || hc >= needed_hc - 0.01f - head_tolerance;
 				auto score = passes_hitchance ? k_feasibility_scale : 0.0f;
 
 				if ( can_kill )

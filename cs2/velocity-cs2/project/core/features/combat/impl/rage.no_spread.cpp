@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
 #include <utilities/logging/logging.hpp>
@@ -75,7 +75,7 @@ namespace features::combat {
 		// Seed mode carries only a small, legal spread correction - fire
 		// it from a stop like the regular path, otherwise the moving
 		// spread floor can exceed the correction and the shot misses.
-		if ( config.no_spread_mode.value == settings::combat::ragebot::weapon_group::no_spread_mode::seed
+		if ( settings::g_combat.m_ragebot.no_spread_mode.value == settings::combat::ragebot::no_spread_mode::seed
 			&& this->should_stop_movement( ctx ) )
 		{
 			this->m_should_stop = true;
@@ -104,7 +104,7 @@ namespace features::combat {
 		// stays usable with the switch off - in that case a scattered
 		// seed simply drops the shot (no compensation fallback, since
 		// corrected angles are not allowed there).
-		const auto seed_mode = config.no_spread_mode.value == settings::combat::ragebot::weapon_group::no_spread_mode::seed;
+		const auto seed_mode = settings::g_combat.m_ragebot.no_spread_mode.value == settings::combat::ragebot::no_spread_mode::seed;
 
 			// The spread seed uses the tick the server consumes the shot on
 			// (the attack stamp above); the compensation must match it.
@@ -185,7 +185,7 @@ namespace features::combat {
 					// angle compensation for this tick so the shot count
 					// stays up. Without no-spread (servers that reject
 					// corrected angles) drop the shot instead.
-					if ( config.no_spread.value )
+					if ( settings::g_combat.m_ragebot.no_spread.value )
 					{
 						const auto corrected = g_shared.find_spread_correction( aim_angle, claim_tick, seed );
 						if ( corrected.x == 0.0f && corrected.y == 0.0f && corrected.z == 0.0f )

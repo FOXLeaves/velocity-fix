@@ -453,7 +453,7 @@ namespace rendering {
 			for ( auto i = 0u; i < settings::combat::ragebot::k_group_count; ++i )
 			{
 				const auto& g = settings::g_combat.m_ragebot.groups[ i ];
-				if ( setting == &g.min_damage_override || setting == &g.hitchance_override || setting == &g.force_shot || setting == &g.force_shot_air || setting == &g.body_aim || setting == &g.silent || setting == &g.no_spread )
+				if ( setting == &g.min_damage_override || setting == &g.hitchance_override || setting == &g.force_shot || setting == &g.force_shot_air || setting == &g.body_aim || setting == &g.silent )
 				{
 					is_rage_group = true;
 					break;

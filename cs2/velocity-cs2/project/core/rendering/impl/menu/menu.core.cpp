@@ -1101,7 +1101,6 @@ namespace rendering {
 
 		const float dt = xdraw::delta_time( );
 		this->m_intro_elapsed += dt;
-		this->m_intro_bar_phase += dt;
 
 		const auto [screen_w, screen_h] = xdraw::viewport_size( );
 		const float sw = static_cast< float >( screen_w );
@@ -1122,13 +1121,26 @@ namespace rendering {
 			this->m_intro_assets_ready_at = this->m_intro_elapsed;
 		}
 
-		if ( this->m_intro_assets_ready_at >= 0.0f )
+		// The intro always plays for a fixed minimum duration: even when the
+		// UI asset pack finishes early (usually a few frames after injection),
+		// the animation still completes before the menu is allowed to appear.
+		constexpr float k_intro_min_duration{ 2.6f };
+		if ( this->m_intro_assets_ready_at >= 0.0f
+			&& this->m_intro_elapsed >= k_intro_min_duration )
 		{
 			this->m_intro_finished = true;
 			return false;
 		}
 
-		dl.rect_filled( 0.0f, 0.0f, sw, sh, xdraw::color{ 36, 36, 40, 153 } );
+		// Once the assets are ready the progress bar fast-forwards its final
+		// loop as a "loading done" beat; the whole scene then fades out just
+		// before the UI takes over.
+		const auto bar_speed = pack_ready ? 3.5f : 1.0f;
+		this->m_intro_bar_phase += dt * bar_speed;
+
+		const auto fade_out = smoothstep( k_intro_min_duration, k_intro_min_duration - 0.4f, this->m_intro_elapsed );
+
+		dl.rect_filled( 0.0f, 0.0f, sw, sh, xdraw::color{ 36, 36, 40, static_cast< std::uint8_t >( 153.0f * fade_out ) } );
 
 		const auto reveal = smoothstep( 0.0f, 0.30f, this->m_intro_elapsed );
 
@@ -1166,7 +1178,7 @@ namespace rendering {
 				const float dh = draw_h * eased_scale;
 				const auto lx = std::floor( ( sw - dw ) * 0.5f );
 				const auto ly = std::floor( ( sh - dh ) * 0.5f );
-				const auto img_a = static_cast< std::uint8_t >( 255.0f * reveal );
+				const auto img_a = static_cast< std::uint8_t >( 255.0f * reveal * fade_out );
 
 				dl.image( lx, ly, dw, dh, this->m_textures.intro_splash.resource.Get( ), xdraw::color{ 255, 255, 255, img_a } );
 
@@ -1199,7 +1211,7 @@ namespace rendering {
 		const float k_bar_round = track_h * 0.5f;
 		const auto bar_round = xdraw::corner_radius{ k_bar_round };
 
-		const auto track_fill_a = static_cast< std::uint8_t >( static_cast< float >( tokens::col_accent.a ) * 0.2f * emergence );
+		const auto track_fill_a = static_cast< std::uint8_t >( static_cast< float >( tokens::col_accent.a ) * 0.2f * emergence * fade_out );
 		dl.rect_filled( track_left, track_y, track_w, track_h, tokens::col_accent.alpha( track_fill_a ), bar_round );
 
 		const float clip_x = track_left;
@@ -1230,7 +1242,7 @@ namespace rendering {
 		if ( bar_w >= 1.0f )
 		{
 			const float bar_r = std::min( k_bar_round, bar_w * 0.5f );
-			const auto value_a = static_cast< std::uint8_t >( static_cast< float >( tokens::col_accent.a ) * emergence );
+			const auto value_a = static_cast< std::uint8_t >( static_cast< float >( tokens::col_accent.a ) * emergence * fade_out );
 
 			dl.rect_filled( bar_x, clip_y, bar_w, clip_h, tokens::col_accent.alpha( value_a ), xdraw::corner_radius{ bar_r } );
 		}

@@ -1,4 +1,4 @@
-#include <pch/pch.hpp>
+﻿#include <pch/pch.hpp>
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
 #include <utilities/logging/logging.hpp>
@@ -403,8 +403,8 @@ namespace features::combat {
 			const auto claim_valid = this->m_claimed_for_aim <= tick_base + 256;
 
 			const auto& attack_config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
-			const auto no_spread_comp = attack_config.no_spread.value
-				|| attack_config.no_spread_mode.value == settings::combat::ragebot::weapon_group::no_spread_mode::seed;
+			const auto no_spread_comp = settings::g_combat.m_ragebot.no_spread.value
+				|| settings::g_combat.m_ragebot.no_spread_mode.value == settings::combat::ragebot::no_spread_mode::seed;
 
 			// No-spread stamps its own entries with the exact tick the
 			// seed correction was computed against (m_no_spread_claim_tick
@@ -444,7 +444,7 @@ namespace features::combat {
 				// No-spread keeps fire_gun's corrected angles untouched.
 				{
 					const auto& config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
-					if ( !config.no_spread.value && this->m_has_dt_aim && history_size > 0 )
+					if ( !settings::g_combat.m_ragebot.no_spread.value && this->m_has_dt_aim && history_size > 0 )
 					{
 						const auto& angles = this->m_dt_aim;
 						for ( auto i = 0; i < history_size; ++i )
@@ -467,9 +467,9 @@ namespace features::combat {
 				// button + attack index that fire_gun set (the index is
 				// what makes the server use the corrected entry angles), so
 				// no extra subtick edge is added for it.
-				auto attack_committed = !dt_active || attack_config.no_spread.value;
+				auto attack_committed = !dt_active || settings::g_combat.m_ragebot.no_spread.value;
 
-				if ( !attack_config.no_spread.value )
+				if ( !settings::g_combat.m_ragebot.no_spread.value )
 				{
 					if ( auto* base = cmd->csgo_user_cmd.mutable_base( ) )
 					{
@@ -517,7 +517,7 @@ namespace features::combat {
 			// No-spread keeps the index fire_gun pointed at the corrected
 			// entry (that index is what resolves the shot through the
 			// compensated angles).
-			if ( !attack_config.no_spread.value )
+			if ( !settings::g_combat.m_ragebot.no_spread.value )
 			{
 				cmd->csgo_user_cmd.set_attack1_start_history_index( -1 );
 			}

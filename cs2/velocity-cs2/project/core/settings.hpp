@@ -11,6 +11,10 @@ namespace settings {
 		{
 			static constexpr auto k_group_count{ 6u };
 
+			// No-spread mode: off = 0, forced = 1 (classic correction),
+			// seed = 2 (legit-style, no angle compensation).
+			enum class no_spread_mode : int { off = 0, forced = 1, seed = 2 };
+
 			xui::setting enabled{ true, {}, "enabled", "ragebot" };
 			// VAC live bypass: hides the modified view angles from the
 			// outgoing usercmd (original angles are sent; the aim is carried
@@ -35,16 +39,16 @@ namespace settings {
 				config::col failed_color{ { 255, 90, 90, 255 }, "ragebot", "dt failed color" };
 			} m_double_tap{};
 
+			// No-spread is a global switch (one button for every weapon
+			// group at once). Mode: forced (classic angle compensation) or
+			// seed (legit-style, no angle compensation - the view aims at
+			// the target and the bullet keeps its natural spread).
+			xui::setting no_spread{ false, {}, "no spread", "ragebot" };
+			config::enm<no_spread_mode> no_spread_mode{ no_spread_mode::forced };
+
 			struct weapon_group
 			{
-				enum class no_spread_mode : int { off = 0, forced = 1, seed = 2 };
-
 				xui::setting silent{ true, {}, "silent", "ragebot" };
-				xui::setting no_spread{ false, {}, "no spread", "ragebot" };
-				// 1 = forced (classic correction), 2 = seed mode (legit-style,
-				// no angle compensation - the view aims at the target and the
-				// bullet keeps its natural spread).
-				config::enm<no_spread_mode> no_spread_mode{ no_spread_mode::forced };
 				xui::setting body_aim{ false, {}, "force b-aim", "ragebot" };
 				xui::setting force_shot_air{ false, {}, "force shot in air", "ragebot" };
 				xui::setting force_shot{ false, {}, "force shot on ground", "ragebot" };
@@ -82,8 +86,6 @@ namespace settings {
 				const auto s = std::string( cat );
 
 				this->silent.category = s;
-				this->no_spread.category = s;
-				this->no_spread_mode.reg( s, "no spread mode" );
 				this->body_aim.category = s;
 				this->force_shot_air.category = s;
 				this->force_shot.category = s;
@@ -120,6 +122,8 @@ namespace settings {
 			ragebot( )
 			{
 				constexpr const char* weapon_names[ ]{ "pistol", "smg", "rifle", "shotgun", "sniper", "lmg" };
+
+				this->no_spread_mode.reg( "ragebot", "no spread mode" );
 
 				for ( std::uint32_t i = 0; i < k_group_count; ++i )
 				{

@@ -159,7 +159,7 @@ namespace features::combat {
 
 		if ( settings::g_combat.m_autos.scope.value
 			&& shared_ctx.weapon_type == cstypes::weapon_type::sniper
-			&& !( config.no_spread.value && config.no_spread_mode.value == settings::combat::ragebot::weapon_group::no_spread_mode::forced ) )
+			&& !( settings::g_combat.m_ragebot.no_spread.value && settings::g_combat.m_ragebot.no_spread_mode.value == settings::combat::ragebot::no_spread_mode::forced ) )
 		{
 			// Scope registered (toggle-based): lock the session and let go
 			// entirely. Any further edge would cycle to the 2.5x->5x level
@@ -665,7 +665,7 @@ namespace features::combat {
 			eye_candidates.count = 1;
 		}
 
-		if ( config.no_spread.value )
+		if ( settings::g_combat.m_ragebot.no_spread.value )
 		{
 			return this->run_no_spread( cmd, ctx, candidates, eye_candidates, local, allow_fire );
 		}
@@ -977,7 +977,7 @@ namespace features::combat {
 		// the wall, and pushing it sideways by the lead slides it off the
 		// hitbox onto wall - the bullet clips the cover and the shot that
 		// would have connected whiffs instead.
-		if ( config.no_spread.value && tgt.hit.record && !tgt.hit.record->extrapolated && !tgt.hit.penetrated )
+		if ( settings::g_combat.m_ragebot.no_spread.value && tgt.hit.record && !tgt.hit.record->extrapolated && !tgt.hit.penetrated )
 		{
 			const auto target_velocity = memory::read<math::vector3>( tgt.hit.pawn + SCHEMA( "C_BaseEntity", "m_vecVelocity"_hash ) );
 			if ( target_velocity.length_2d( ) > 1.0f )
@@ -1030,7 +1030,7 @@ namespace features::combat {
 			}
 		}
 
-		auto aim_angle = config.no_spread.value
+		auto aim_angle = settings::g_combat.m_ragebot.no_spread.value
 			? math::helpers::calculate_angle( shoot_eye, aim_position )
 			: tgt.hit.aim_angle;
 
@@ -1054,9 +1054,9 @@ namespace features::combat {
 			std::tie( stamp_tick, stamp_frac ) = tick_add( tgt.hit.source_eye.player_tick, tgt.hit.source_eye.player_frac, tgt.hit.source_eye.lerp_ticks_int, tgt.hit.source_eye.lerp_ticks_frac );
 		}
 
-		const auto seed_mode = config.no_spread_mode.value == settings::combat::ragebot::weapon_group::no_spread_mode::seed;
+		const auto seed_mode = settings::g_combat.m_ragebot.no_spread_mode.value == settings::combat::ragebot::no_spread_mode::seed;
 
-		if ( config.no_spread.value || seed_mode )
+		if ( settings::g_combat.m_ragebot.no_spread.value || seed_mode )
 		{
 			if ( !this->apply_no_spread( aim_angle, tgt, shoot_eye, stamp_tick, tick_base ) )
 			{
@@ -1088,7 +1088,7 @@ namespace features::combat {
 				angles->set_x( aim_angle.x - aim_punch.x );
 				angles->set_y( aim_angle.y - aim_punch.y );
 
-				if ( config.no_spread.value )
+				if ( settings::g_combat.m_ragebot.no_spread.value )
 				{
 					angles->set_z( aim_angle.z );
 				}
@@ -1156,7 +1156,7 @@ namespace features::combat {
 			// and it worked, so restore that expression for it.
 			if ( !settings::g_combat.m_ragebot.m_double_tap.enabled.value
 				|| shared_ctx.item_def_idx == cstypes::item_definition_index::weapon_r8_revolver
-				|| config.no_spread.value )
+				|| settings::g_combat.m_ragebot.no_spread.value )
 			{
 				cmd->buttons.value |= cstypes::command_buttons::in_attack;
 				cmd->buttons.value_changed |= cstypes::command_buttons::in_attack;
