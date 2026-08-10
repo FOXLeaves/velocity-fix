@@ -36,15 +36,12 @@ namespace features::movement {
 		const bool shift_held = current_buttons & static_cast< std::uintptr_t >( cstypes::command_buttons::in_sprint );
 
 		const auto& prestate = systems::g_prediction.pre( );
-		const bool in_air = !( prestate.flags & cstypes::entity_flags::on_ground );
-
 
 		const auto wants_stop = shift_held
 			|| features::combat::g_rage.should_stop( )
 			|| features::misc::g_projectile_trajectory.should_stop( );
 
-		if ( ( !settings::g_movement.airstrafe.value && !wants_stop )
-			|| features::combat::g_rage.is_firing_this_tick( ) )
+		if ( !settings::g_movement.airstrafe.value && !wants_stop )
 		{
 			return;
 		}
@@ -107,8 +104,17 @@ namespace features::movement {
 		const auto cmd_move_backup = math::vector3{ base->forwardmove( ), base->leftmove( ), 0.0f };
 		const auto effective_maxspeed = memory::read<float>( movement_services + SCHEMA( "CPlayer_MovementServices", "m_flMaxspeed"_hash ) );
 
-		constexpr auto subtick_count{ 32 };
-		constexpr auto frame_time{ cstypes::tick_interval / static_cast< float >( subtick_count ) };
+		// Rage/DT can already own a time-zero attack step (and bhop/jumpbug can
+		// own others). Fill only the remaining protocol slots so a firing tick
+		// keeps the same air trajectory without overflowing the 32-step command.
+		constexpr auto max_subtick_moves{ 32 };
+		const auto subtick_count = std::min( max_subtick_moves,
+			max_subtick_moves - subtick_moves->size( ) );
+		if ( subtick_count <= 0 )
+		{
+			return;
+		}
+		const auto frame_time = cstypes::tick_interval / static_cast< float >( subtick_count );
 
 		auto yaw_offset{ 0.0f };
 
@@ -346,8 +352,7 @@ namespace features::movement {
 
 		const auto wants_stop = features::combat::g_rage.should_stop( ) || features::misc::g_projectile_trajectory.should_stop( );
 
-		if ( ( !settings::g_movement.airstrafe.value && !wants_stop )
-			|| features::combat::g_rage.is_firing_this_tick( ) )
+		if ( !settings::g_movement.airstrafe.value && !wants_stop )
 		{
 			return;
 		}

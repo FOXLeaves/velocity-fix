@@ -10,6 +10,7 @@ namespace features::movement {
 
 		constexpr auto k_move_epsilon{ 1.0e-6f };
 		constexpr auto k_when_epsilon{ 1.0e-5f };
+		constexpr auto k_post_attack_when{ 1.0f / 65536.0f };
 		constexpr auto k_quantize_epsilon{ 1.0e-4f };
 		constexpr auto k_max_subtick_moves{ 32 };
 		constexpr auto k_movement_mask = static_cast<std::uintptr_t>(
@@ -248,18 +249,19 @@ namespace features::movement {
 			return anchor;
 		}
 
-		[[nodiscard]] bool install_quantized_yaw_frame(
+		[[nodiscard]] proto::subtick_move_step* install_quantized_yaw_frame(
 			proto::base_usercmd_pb* base,
 			proto::repeated_ptr_field<proto::subtick_move_step>* moves,
 			float source_yaw,
 			float target_yaw,
 			float source_terminal_yaw,
 			proto::subtick_move_step* preferred_anchor,
-			bool reverse )
+			bool reverse,
+			bool post_attack_anchor )
 		{
 			if ( !base || !moves )
 			{
-				return false;
+				return nullptr;
 			}
 
 			// Fractional forward/left components are rounded when movement input
@@ -267,7 +269,12 @@ namespace features::movement {
 			// and temporarily put the server's movement frame back on source_yaw.
 			const auto restore_delta = std::remainderf( target_yaw - source_terminal_yaw, 360.0f ) * ( reverse ? -1.0f : 1.0f );
 
-			proto::subtick_move_step* anchor{ preferred_anchor };
+			// A firing command needs a dedicated coordinate-frame event. Reusing
+			// the IN_ATTACK step would apply the yaw rebase to the same event that
+			// resolves the bullet. Append a small, serializable post-zero anchor:
+			// unlike a denormal nextafter(0), it cannot be flushed back to zero by
+			// the server, so the attack is unambiguously consumed first.
+			proto::subtick_move_step* anchor{ post_attack_anchor ? nullptr : preferred_anchor };
 			if ( anchor )
 			{
 				auto found{ false };
@@ -283,10 +290,10 @@ namespace features::movement {
 				const auto when = anchor->m_has_bits.test( 0x4u ) ? anchor->when( ) : 1.0f;
 				if ( !found || !std::isfinite( when ) || when > k_when_epsilon )
 				{
-					return false;
+					return nullptr;
 				}
 			}
-			else
+			else if ( !post_attack_anchor )
 			{
 				for ( auto i = 0; i < moves->size( ); ++i )
 				{
@@ -304,16 +311,30 @@ namespace features::movement {
 			const auto required_slots = ( anchor ? 0 : 1 ) + ( needs_restore ? 1 : 0 );
 			if ( moves->size( ) > k_max_subtick_moves - required_slots )
 			{
-				return false;
+				return nullptr;
 			}
 
 			if ( !anchor )
 			{
-				anchor = prepend_anchor( moves );
+				if ( post_attack_anchor )
+				{
+					const auto old_size = moves->size( );
+					anchor = systems::g_input.acquire_subtick_step( moves );
+					if ( !anchor || moves->size( ) != old_size + 1
+						|| moves->mutable_at( old_size ) != anchor )
+					{
+						return nullptr;
+					}
+					anchor->set_when( k_post_attack_when );
+				}
+				else
+				{
+					anchor = prepend_anchor( moves );
+				}
 			}
 			if ( !anchor )
 			{
-				return false;
+				return nullptr;
 			}
 
 			proto::subtick_move_step* restore{};
@@ -326,7 +347,7 @@ namespace features::movement {
 				{
 					// The newly created anchor is still a harmless time-zero no-op;
 					// the caller can safely fall back to analog rotation.
-					return false;
+					return nullptr;
 				}
 				restore->set_when( std::nextafter( 1.0f, 0.0f ) );
 			}
@@ -344,7 +365,7 @@ namespace features::movement {
 			}
 
 			base->m_cached_size = 0;
-			return true;
+			return anchor;
 		}
 
 	} // namespace
@@ -669,28 +690,47 @@ namespace features::movement {
 			&& discrete_axis( source_base.y );
 		const auto attack_mask = static_cast<std::uintptr_t>(
 			cstypes::command_buttons::in_attack | cstypes::command_buttons::in_second_attack );
-		auto firing = ( ( cmd->buttons.value
-			| cmd->buttons.value_changed
-			| cmd->buttons.value_scroll ) & attack_mask ) != 0
-			|| features::combat::g_rage.is_firing_this_tick( )
-			|| ( cmd->csgo_user_cmd.m_has_bits.test( 0x20u )
-				&& cmd->csgo_user_cmd.attack1_start_history_index( ) >= 0 )
+		const auto indexed_attack_isolated = [ & ]( int index )
+		{
+			if ( index < 0 || index >= cmd->csgo_user_cmd.input_history_size( ) )
+			{
+				return false;
+			}
+
+			const auto entry = cmd->csgo_user_cmd.mutable_input_history( index );
+			const auto view = entry && entry->has_view_angles( ) ? entry->view_angles( ) : nullptr;
+			return view && std::isfinite( view->x( ) ) && std::isfinite( view->y( ) );
+		};
+		const auto indexed_attack = ( cmd->csgo_user_cmd.m_has_bits.test( 0x20u )
+			&& indexed_attack_isolated( cmd->csgo_user_cmd.attack1_start_history_index( ) ) )
 			|| ( cmd->csgo_user_cmd.m_has_bits.test( 0x40u )
-				&& cmd->csgo_user_cmd.attack2_start_history_index( ) >= 0 );
-		if ( !firing && moves )
+				&& indexed_attack_isolated( cmd->csgo_user_cmd.attack2_start_history_index( ) ) );
+		const auto base_attack = ( ( cmd->buttons.value | cmd->buttons.value_scroll ) & attack_mask ) != 0;
+		auto subtick_attack_pressed{ false };
+		auto subtick_attack_at_zero{ true };
+		if ( moves )
 		{
 			for ( auto i = 0; i < moves->size( ); ++i )
 			{
 				const auto step = moves->mutable_at( i );
 				if ( step
 					&& step->m_has_bits.test( 0x1u )
+					&& step->m_has_bits.test( 0x2u )
+					&& step->pressed( )
 					&& ( step->button( ) & attack_mask ) != 0 )
 				{
-					firing = true;
-					break;
+					subtick_attack_pressed = true;
+					subtick_attack_at_zero = subtick_attack_at_zero
+						&& step_when( step ) <= k_when_epsilon;
 				}
 			}
 		}
+		// Only final wire evidence counts as a shot. The Ragebot intent flag is
+		// set before DT alternation/claim gates and value_changed also contains
+		// releases, so neither can safely select the firing path here.
+		const auto firing = base_attack || indexed_attack || subtick_attack_pressed;
+		const auto shot_yaw_isolated = indexed_attack
+			|| ( subtick_attack_pressed && subtick_attack_at_zero );
 
 		auto owned_trajectory_valid = this->m_quantized_trajectory_claimed
 			&& this->m_quantized_trajectory_base == base
@@ -806,17 +846,20 @@ namespace features::movement {
 			return false;
 		};
 
+		proto::subtick_move_step* quantized_frame_anchor{};
 		auto quantized_yaw_frame{ false };
 		if ( owned_trajectory_valid )
 		{
-			quantized_yaw_frame = install_quantized_yaw_frame(
+			quantized_frame_anchor = install_quantized_yaw_frame(
 				base,
 				moves,
 				this->m_source_yaw,
 				target_yaw,
 				source_terminal_yaw,
 				this->m_quantized_trajectory[ 0 ].step,
+				false,
 				false );
+			quantized_yaw_frame = quantized_frame_anchor != nullptr;
 			if ( !quantized_yaw_frame )
 			{
 				remove_claimed_trajectory( );
@@ -829,19 +872,21 @@ namespace features::movement {
 			&& frame_changed
 			&& quantized_input
 			&& subtick_movement_view
-			&& !firing
+			&& ( !firing || shot_yaw_isolated )
 			&& !ground_flip
 			&& discrete_source_move
 			&& !contains_analog_trajectory( ) )
 		{
-			quantized_yaw_frame = install_quantized_yaw_frame(
+			quantized_frame_anchor = install_quantized_yaw_frame(
 				base,
 				moves,
 				this->m_source_yaw,
 				target_yaw,
 				source_terminal_yaw,
 				nullptr,
-				false );
+				false,
+				firing );
+			quantized_yaw_frame = quantized_frame_anchor != nullptr;
 		}
 
 		if ( quantized_yaw_frame )
@@ -896,12 +941,18 @@ namespace features::movement {
 		if ( moves && ( frame_changed || impulse_frame_changed || base_changed ) )
 		{
 
-			proto::subtick_move_step* anchor{};
-			for ( auto i = 0; i < moves->size( ); ++i )
+			// The installer owns the exact movement-frame boundary. In particular,
+			// a firing command must use the dedicated post-attack anchor rather
+			// than rediscovering and polluting the preceding IN_ATTACK step.
+			proto::subtick_move_step* anchor{ quantized_frame_anchor };
+			for ( auto i = 0; !anchor && i < moves->size( ); ++i )
 			{
 				auto step = moves->mutable_at( i );
 				const auto when = step && step->m_has_bits.test( 0x4u ) ? step->when( ) : 0.0f;
-				if ( step && ( !std::isfinite( when ) || when <= k_when_epsilon ) )
+				const auto attack_step = step && step->m_has_bits.test( 0x1u )
+					&& step->m_has_bits.test( 0x2u ) && step->pressed( )
+					&& ( step->button( ) & attack_mask ) != 0;
+				if ( step && !attack_step && ( !std::isfinite( when ) || when <= k_when_epsilon ) )
 				{
 					anchor = step;
 					break;
