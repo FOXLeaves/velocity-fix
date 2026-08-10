@@ -37,11 +37,14 @@ namespace features::combat {
 					auto& candidate_hits = per_candidate[ ci ];
 					candidate_hits.reserve( 24 );
 
-					auto local_budget = share;
+					// Single-candidate scans get the per-point parallel
+					// pass inside scan_player; multi-candidate scans keep
+					// this outer parallel split.
+					std::atomic<int> local_budget{ share };
 
 					for ( auto ri = 0; ri < cand.record_count; ++ri )
 					{
-						if ( local_budget <= 0 )
+						if ( local_budget.load( std::memory_order_relaxed ) <= 0 )
 						{
 							break;
 						}
@@ -51,7 +54,7 @@ namespace features::combat {
 							continue;
 						}
 
-						auto hits = this->scan_player( eye, inaccuracy, ctx, cand, cand.records[ ri ], local, trace_budget, local_budget );
+						auto hits = this->scan_player( eye, inaccuracy, ctx, cand, cand.records[ ri ], local, trace_budget, local_budget, candidate_count == 1 );
 						const auto has_direct_hit = std::any_of( hits.begin( ), hits.end( ), [ ]( const scan_hit& hit )
 							{
 								return !hit.penetrated;
@@ -110,7 +113,7 @@ namespace features::combat {
 		return flat;
 	}
 
-	std::vector<rage::scan_hit> rage::scan_player( const math::vector3& eye, float inaccuracy, const aim_context& ctx, candidate& cand, shared::lagcomp::record* record, const systems::local::snapshot& local, std::atomic<int>& trace_budget, int& local_budget ) const
+	std::vector<rage::scan_hit> rage::scan_player( const math::vector3& eye, float inaccuracy, const aim_context& ctx, candidate& cand, shared::lagcomp::record* record, const systems::local::snapshot& local, std::atomic<int>& trace_budget, std::atomic<int>& local_budget, bool inner_parallel ) const
 	{
 		const auto& skeleton = record->bones;
 		const auto& hitbox_set = cand.hitboxes;
@@ -181,9 +184,6 @@ namespace features::combat {
 			scan_order[ scan_count++ ] = idx;
 		}
 
-		std::vector<scan_hit> results;
-		results.reserve( static_cast< std::size_t >( scan_count ) * 2 );
-
 		// Index lookup table for the hitbox set (linear search per hitbox
 		// was O(count^2) on every scan).
 		std::array<const systems::hitboxes::entry*, 20> hb_by_index{};
@@ -195,12 +195,20 @@ namespace features::combat {
 			}
 		}
 
-		// Per-hitbox two-phase scan: the center point is traced first, and
-		// when it is sufficient (direct hit, damage floor met) the whole
-		// multipoint set for that hitbox is skipped - no multipoint
-		// generation, no extra trace_bullet calls. This is the dominant
-		// ragebot cost (one engine trace per scan point), so direct-hit
-		// scenarios drop to a fraction of the old trace count.
+		// Phase one (serial, no engine calls): build the full probe-point
+		// list - center plus multipoints per enabled hitbox. The old
+		// per-hitbox "sufficient" short-circuit is dropped so every point
+		// can be traced in parallel; the verdict set only grows (more
+		// points compete in select_best), it never shrinks.
+		struct scan_point
+		{
+			const systems::hitboxes::entry* hitbox{};
+			math::vector3 position{};
+			bool is_center{};
+		};
+		std::vector<scan_point> points;
+		points.reserve( static_cast< std::size_t >( scan_count ) * 2 );
+
 		for ( auto idx = 0; idx < scan_count; ++idx )
 		{
 			const auto hitbox_index = scan_order[ idx ];
@@ -231,85 +239,13 @@ namespace features::combat {
 				continue;
 			}
 
-			const auto process_point = [ & ]( const math::vector3& position, bool is_center, bool& out_sufficient ) -> bool
-				{
-					out_sufficient = false;
-
-					const auto aim = math::helpers::calculate_angle( eye, position );
-					const auto fov = math::helpers::angle_distance( ctx.view_angles, aim );
-
-					if ( fov > fov_limit )
-					{
-						return false;
-					}
-
-					shared::penetration::result pen{};
-					// Consume one trace from the shared budget before the
-					// engine call - the hottest per-point cost. The local
-					// slice stops this candidate once its fair share is
-					// spent so crowded servers cannot starve later targets.
-					if ( trace_budget.fetch_sub( 1, std::memory_order_relaxed ) <= 0 || --local_budget <= 0 )
-					{
-						return false;
-					}
-
-					if ( !g_shared.pen( ).run( eye, position, pen_ctx, local.pawn, local.team, pen, hitbox_index ) )
-					{
-						return false;
-					}
-
-					// Head hits that reach the hitbox through penetration frequently
-					// land on a different hitgroup (neck/generic) once the wall drags
-					// the trajectory off the capsule. Re-derive the damage from the
-					// actual hitgroup instead of trusting the head figure.
-					if ( hitbox_index == 0 && pen.hitgroup != systems::g_hitboxes.hitgroup_from_hitbox( hitbox_index ) )
-					{
-						const auto& weapon_data = g_shared.pen( ).get_weapon_data( );
-						if ( weapon_data.headshot_multiplier > 1.0f )
-						{
-							pen.damage = pen.damage / weapon_data.headshot_multiplier;
-						}
-						else
-						{
-							return false;
-						}
-					}
-
-					if ( pen.damage < cand.min_damage )
-					{
-						return false;
-					}
-
-					// A direct (non-penetrated) hit with lethal damage is as
-					// good as this hitbox gets - the caller can stop tracing
-					// further multipoints on it.
-					out_sufficient = !pen.penetrated || pen.damage >= static_cast< float >( cand.health );
-
-					scan_hit h{};
-					h.position = position;
-					h.aim_angle = aim;
-					h.damage = pen.damage;
-					h.fov = fov;
-					h.hitbox_index = hitbox_index;
-					h.hitgroup = pen.hitgroup;
-					h.bone_index = hb->bone;
-					h.hitbox = *hb;
-					h.is_center = is_center;
-					h.penetrated = pen.penetrated;
-					h.pawn = cand.pawn;
-					h.health = cand.health;
-					h.target_velocity = cand.velocity;
-					h.record = record;
-
-					results.push_back( std::move( h ) );
-					return true;
-				};
-
 			if ( config.debug_multipoints.value )
 			{
 				std::lock_guard lock( m_debug_mtx );
 				m_debug_points.push_back( { center, hitbox_index, true } );
 			}
+
+			points.push_back( { hb, center, true } );
 
 			// Multipoints only for moving targets: they absorb the
 			// pose/velocity residual that shifts the surface between the
@@ -334,18 +270,120 @@ namespace features::combat {
 						m_debug_points.push_back( { mp, hitbox_index, false } );
 					}
 
-					bool sufficient = false;
-					if ( process_point( mp, false, sufficient ) && sufficient )
-					{
-						break;
-					}
+					points.push_back( { hb, mp, false } );
 				}
 			}
+		}
 
-			// Center point: geometric fallback, always scanned so the
-			// best point wins on score in select_best.
-			bool center_sufficient = false;
-			process_point( center, true, center_sufficient );
+		if ( points.empty( ) )
+		{
+			return {};
+		}
+
+		std::vector<scan_hit> results;
+		results.reserve( points.size( ) );
+		std::mutex collect_mtx;
+
+		// Phase two: trace every probe point. With a single candidate the
+		// outer parallel_for collapses to one serial chunk (~400 engine
+		// traces on the create_move thread - the recurring slow fire), so
+		// the per-point pass is parallelized here when no outer
+		// parallelism is active. Multi-candidate scans keep the outer
+		// record-level split and run this pass serially (no nested pool
+		// usage).
+		const auto trace_point = [ & ]( const scan_point& pt, std::vector<scan_hit>& out )
+			{
+				const auto aim = math::helpers::calculate_angle( eye, pt.position );
+				const auto fov = math::helpers::angle_distance( ctx.view_angles, aim );
+				if ( fov > fov_limit )
+				{
+					return;
+				}
+
+				shared::penetration::result pen{};
+				// Consume one trace from the shared budget before the
+				// engine call - the hottest per-point cost. The local
+				// slice stops this candidate once its fair share is
+				// spent so crowded servers cannot starve later targets.
+				if ( trace_budget.fetch_sub( 1, std::memory_order_relaxed ) <= 0
+					|| local_budget.fetch_sub( 1, std::memory_order_relaxed ) <= 0 )
+				{
+					return;
+				}
+
+				if ( !g_shared.pen( ).run( eye, pt.position, pen_ctx, local.pawn, local.team, pen, pt.hitbox->index ) )
+				{
+					return;
+				}
+
+				// Head hits that reach the hitbox through penetration frequently
+				// land on a different hitgroup (neck/generic) once the wall drags
+				// the trajectory off the capsule. Re-derive the damage from the
+				// actual hitgroup instead of trusting the head figure.
+				if ( pt.hitbox->index == 0 && pen.hitgroup != systems::g_hitboxes.hitgroup_from_hitbox( pt.hitbox->index ) )
+				{
+					const auto& weapon_data = g_shared.pen( ).get_weapon_data( );
+					if ( weapon_data.headshot_multiplier > 1.0f )
+					{
+						pen.damage = pen.damage / weapon_data.headshot_multiplier;
+					}
+					else
+					{
+						return;
+					}
+				}
+
+				if ( pen.damage < cand.min_damage )
+				{
+					return;
+				}
+
+				scan_hit h{};
+				h.position = pt.position;
+				h.aim_angle = aim;
+				h.damage = pen.damage;
+				h.fov = fov;
+				h.hitbox_index = pt.hitbox->index;
+				h.hitgroup = pen.hitgroup;
+				h.bone_index = pt.hitbox->bone;
+				h.hitbox = *pt.hitbox;
+				h.is_center = pt.is_center;
+				h.penetrated = pen.penetrated;
+				h.pawn = cand.pawn;
+				h.health = cand.health;
+				h.target_velocity = cand.velocity;
+				h.record = record;
+
+				out.push_back( std::move( h ) );
+			};
+
+		const auto point_count = static_cast< int >( points.size( ) );
+		if ( inner_parallel )
+		{
+			threadpool::parallel_for( 0, point_count, [ & ]( int begin, int end )
+				{
+					thread_local std::vector<scan_hit> local_hits;
+					local_hits.clear( );
+					local_hits.reserve( static_cast< std::size_t >( end - begin ) );
+
+					for ( auto i = begin; i < end; ++i )
+					{
+						trace_point( points[ i ], local_hits );
+					}
+
+					if ( !local_hits.empty( ) )
+					{
+						std::lock_guard lock( collect_mtx );
+						results.insert( results.end( ), local_hits.begin( ), local_hits.end( ) );
+					}
+				}, 1 );
+		}
+		else
+		{
+			for ( const auto& pt : points )
+			{
+				trace_point( pt, results );
+			}
 		}
 
 		return results;

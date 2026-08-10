@@ -52,8 +52,8 @@ namespace rendering {
 				xui::color_picker( "充能失败颜色##dt", rb.m_double_tap.failed_color );
 				xui::end_popup( );
 			}
-			static const char* no_spread_items[ ] = { "强制", "种子" };
-			xui::checkbox( "无扩散 (全局)", rb.no_spread );
+			static const char* no_spread_items[ ] = { "正常", "合法" };
+			xui::checkbox( "扩散预测 (全局)", rb.no_spread );
 			if ( xui::begin_popup( "##nospread_popup", 200.0f ) )
 			{
 				xui::combo( "模式##nospread", rb.no_spread_mode.value, no_spread_items, 2 );

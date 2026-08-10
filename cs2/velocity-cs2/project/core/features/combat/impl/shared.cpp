@@ -2,6 +2,7 @@
 #include <utilities/memory/memory.hpp>
 #include <utilities/addresses/addresses.hpp>
 #include <utilities/logging/logging.hpp>
+#include <utilities/threadpool/threadpool.hpp>
 #include <utilities/diag.hpp>
 #include <core/systems/systems.hpp>
 #include <core/features/features.hpp>
@@ -1416,76 +1417,160 @@ namespace features::combat {
 		// back to the full legal pitch range (-89.5..89.5) when the
 		// neighborhood misses - the common case drops from 720 engine
 		// calls to ~40.
-		const auto try_pitch = [ & ]( float pitch ) -> std::optional<math::vector3>
-			{
-				const auto test_angles = math::vector3{ pitch, aim_angle.y, 0.0f };
-				const auto seed = this->get_spread_seed( test_angles, tick );
-
-				// The engine call is SEH-guarded and returns 0 on failure;
-				// skip rather than build a correction on a garbage seed.
-				if ( seed == 0 )
-				{
-					return std::nullopt;
-				}
-
-				const auto spread = this->calculate_spread( seed, this->m_ctx.inaccuracy, this->m_ctx.spread, this->m_ctx.recoil_index, this->m_ctx.item_def_idx, this->m_ctx.num_bullets );
-
-				auto adj_angle = aim_angle;
-				adj_angle.x += math::helpers::rad_to_deg( std::atan( std::sqrt( spread.x * spread.x + spread.y * spread.y ) ) );
-				adj_angle.z = -math::helpers::rad_to_deg( std::atan2( spread.x, spread.y ) );
-
-				if ( this->get_spread_seed( adj_angle, tick ) == seed )
-				{
-					return adj_angle;
-				}
-
-				return std::nullopt;
-			};
+		//
+		// Every probe pays two SEH-guarded engine calls (seed + verify);
+		// the seed->spread engine call is cached per probe block (the same
+		// bucket - same seed - is frequently re-probed across the grid).
+		// The probe grid itself now runs PARALLEL over the thread pool -
+		// the engine seed/spread functions are pure (they share no mutable
+		// state), exactly like the parallel penetration traces the scan
+		// already runs - so a wide-cone correction that used to serialize
+		// ~200 engine calls now finishes in one small batch. Verdicts are
+		// unchanged: every pitch probe still runs the exact same check.
+		const auto& ctx = this->m_ctx;
 
 		// Spread-cone lift of the aim itself (reuses the caller's seed
 		// when available) - the neighborhood center.
 		auto lift{ 0.0f };
 		if ( const auto aim_seed = known_seed != 0 ? known_seed : this->get_spread_seed( aim_angle, tick ) )
 		{
-			const auto aim_spread = this->calculate_spread( aim_seed, this->m_ctx.inaccuracy, this->m_ctx.spread, this->m_ctx.recoil_index, this->m_ctx.item_def_idx, this->m_ctx.num_bullets );
+			const auto aim_spread = this->calculate_spread( aim_seed, ctx.inaccuracy, ctx.spread, ctx.recoil_index, ctx.item_def_idx, ctx.num_bullets );
 			lift = math::helpers::rad_to_deg( std::atan( std::sqrt( aim_spread.x * aim_spread.x + aim_spread.y * aim_spread.y ) ) );
 		}
 
 		const auto center = aim_angle.x + lift;
 
-		// Tight neighborhood: +-2 deg in 0.5 deg steps (9 probes) around
-		// the lifted pitch - the target bucket sits right there.
+		// Probe grid: tight neighborhood (+-2 deg), a lift-scaled wider
+		// neighborhood (large spread cones push the matching bucket far
+		// from the aim) and the full legal pitch range as the fallback.
+		// Pitches are deduplicated once while building the grid.
+		std::array<float, 512> candidates{};
+		auto candidate_count{ 0 };
+		std::array<float, 512> tried_pitch{};
+		auto tried_count{ 0 };
+		const auto push_pitch = [ & ]( float pitch )
+			{
+				for ( auto i = 0; i < tried_count; ++i )
+				{
+					if ( std::fabsf( tried_pitch[ i ] - pitch ) < 0.25f )
+					{
+						return;
+					}
+				}
+				if ( tried_count < static_cast< int >( tried_pitch.size( ) ) )
+				{
+					tried_pitch[ tried_count++ ] = pitch;
+				}
+				if ( candidate_count < static_cast< int >( candidates.size( ) ) )
+				{
+					candidates[ candidate_count++ ] = pitch;
+				}
+			};
+
 		for ( auto i = -4; i <= 4; ++i )
 		{
-			if ( auto correction = try_pitch( center + static_cast< float >( i ) * 0.5f ) )
-			{
-				return *correction;
-			}
+			push_pitch( center + static_cast< float >( i ) * 0.5f );
 		}
 
-		// Wider neighborhood: +-6 deg (24 more probes) for weapons with
-		// a large cone whose lift shifts across buckets.
-		for ( auto i = -12; i <= 12; ++i )
+		const auto wide_radius = std::clamp( lift * 1.5f + 4.0f, 6.0f, 24.0f );
+		const auto wide_steps = static_cast< int >( std::ceil( wide_radius * 2.0f ) );
+		for ( auto i = -wide_steps; i <= wide_steps; ++i )
 		{
 			if ( std::abs( i ) <= 4 )
 			{
 				continue;
 			}
-
-			if ( auto correction = try_pitch( center + static_cast< float >( i ) * 0.5f ) )
-			{
-				return *correction;
-			}
+			push_pitch( center + static_cast< float >( i ) * 0.5f );
 		}
 
-		// Full legal pitch range: 0..179.5 deg (0.5 deg steps) covers
-		// every pitch after the +-90 normalize - no duplicates.
 		for ( auto i = 0; i < 360; ++i )
 		{
-			if ( auto correction = try_pitch( static_cast< float >( i ) / 2.0f ) )
+			push_pitch( static_cast< float >( i ) / 2.0f );
+		}
+
+		// Parallel probe pass. Each worker keeps its own seed->spread cache
+		// (no shared writes); the first probe that verifies wins and stops
+		// the rest. The result is published with release/acquire so the
+		// winning correction is visible to the caller.
+		struct probe_cache
+		{
+			std::array<std::pair<std::uint32_t, math::vector2>, 128> entries{};
+			int count{};
+		};
+
+		const auto try_pitch = [ & ]( float pitch, probe_cache& cache ) -> std::optional<math::vector3>
 			{
-				return *correction;
-			}
+				return detail::guarded( [ & ]( ) -> std::optional<math::vector3>
+				{
+					const auto test_angles = math::vector3{ pitch, aim_angle.y, 0.0f };
+					const auto seed = this->get_spread_seed( test_angles, tick );
+
+					// The engine call is SEH-guarded and returns 0 on failure;
+					// skip rather than build a correction on a garbage seed.
+					if ( seed == 0 )
+					{
+						return std::nullopt;
+					}
+
+					math::vector2 spread{};
+					auto found{ false };
+					for ( auto i = 0; i < cache.count; ++i )
+					{
+						if ( cache.entries[ i ].first == seed )
+						{
+							spread = cache.entries[ i ].second;
+							found = true;
+							break;
+						}
+					}
+					if ( !found )
+					{
+						spread = this->calculate_spread( seed, ctx.inaccuracy, ctx.spread, ctx.recoil_index, ctx.item_def_idx, ctx.num_bullets );
+						if ( cache.count < static_cast< int >( cache.entries.size( ) ) )
+						{
+							cache.entries[ cache.count++ ] = { seed, spread };
+						}
+					}
+
+					auto adj_angle = aim_angle;
+					adj_angle.x += math::helpers::rad_to_deg( std::atan( std::sqrt( spread.x * spread.x + spread.y * spread.y ) ) );
+					adj_angle.z = -math::helpers::rad_to_deg( std::atan2( spread.x, spread.y ) );
+
+					if ( this->get_spread_seed( adj_angle, tick ) == seed )
+					{
+						return adj_angle;
+					}
+
+					return std::nullopt;
+				} );
+			};
+
+		std::atomic<bool> found{ false };
+		math::vector3 correction{};
+		if ( candidate_count > 0 )
+		{
+			threadpool::parallel_for( 0, candidate_count, [ & ]( int begin, int end )
+				{
+					probe_cache cache{};
+					for ( auto i = begin; i < end; ++i )
+					{
+						if ( found.load( std::memory_order_relaxed ) )
+						{
+							return;
+						}
+						if ( auto c = try_pitch( candidates[ i ], cache ) )
+						{
+							correction = *c;
+							found.store( true, std::memory_order_release );
+							return;
+						}
+					}
+				}, 1 );
+		}
+
+		if ( found.load( std::memory_order_acquire ) )
+		{
+			return correction;
 		}
 
 		return {};

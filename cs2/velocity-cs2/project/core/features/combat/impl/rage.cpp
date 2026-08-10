@@ -69,7 +69,16 @@ namespace features::combat {
 			return;
 		}
 
-		auto aim_ctx = this->build_context( cmd, local );
+		// Forced no-spread never plans stops and never reads the simulated
+		// velocity, so it runs the light (no-RunCommand) context - the full
+		// prediction simulation was the fixed per-tick cost that delayed
+		// every corrected shot. Seed mode keeps the full context (its stop
+		// gate needs the simulated velocity).
+		const auto forced_no_spread = settings::g_combat.m_ragebot.no_spread.value
+			&& settings::g_combat.m_ragebot.no_spread_mode.value != settings::combat::ragebot::no_spread_mode::seed;
+		auto aim_ctx = forced_no_spread
+			? this->build_context_light( cmd, local )
+			: this->build_context( cmd, local );
 
 		if ( is_knife )
 		{
@@ -280,6 +289,37 @@ namespace features::combat {
 				}
 			}
 		}
+
+		ctx.spread = out.spread;
+		ctx.inaccuracy = out.predicted_inaccuracy;
+
+		out.view_angles = systems::g_input.get_view_angles( );
+		out.on_ground = ( prestate.flags & cstypes::entity_flags::on_ground ) != 0;
+		out.is_scoped = ctx.is_scoped;
+		out.weapon_max_speed = ctx.weapon_max_speed;
+		out.accurate_threshold = ctx.weapon_max_speed * 0.34f;
+
+		return out;
+	}
+
+	rage::aim_context rage::build_context_light( systems::input::usercmd* cmd, const systems::local::snapshot& local ) const
+	{
+		auto& ctx = g_shared.ctx( );
+		const auto& prestate = systems::g_prediction.pre( );
+
+		// The forced no-spread path never plans stops and never consumes
+		// the simulated velocity, so the engine RunCommand simulation is
+		// skipped entirely - it was the largest fixed per-tick cost and
+		// made the corrected shot leave visibly late (the target was
+		// already a stride away before the client even fired). The shoot
+		// history ring and the live accuracy sample are still refreshed.
+		aim_context out{};
+		out.velocity = prestate.velocity;
+		out.predicted_velocity = prestate.velocity;
+		out.spread = g_shared.get_spread( );
+		out.predicted_inaccuracy = g_shared.get_inaccuracy( true );
+
+		g_shared.sh( ).snapshot( local.pawn, ctx.weapon_services );
 
 		ctx.spread = out.spread;
 		ctx.inaccuracy = out.predicted_inaccuracy;
@@ -665,6 +705,33 @@ namespace features::combat {
 			eye_candidates.count = 1;
 		}
 
+		// Double-tap follow-up shoot origin: the server resolves the attack
+		// at the claimed tick and rewinds the ATTACKER to it as well, so its
+		// shoot origin sits at the claimed (future) pose while the scan eye
+		// is the current one - a moving player then gets every second bullet
+		// classified as a "shoot position mismatch". Project the scan eye by
+		// the local velocity over (claim - now) ticks so the scan, the
+		// recorded shoot origin and the server agree on one pose.
+		const auto tick_base = memory::read<int>( local.controller + SCHEMA( "CBasePlayerController", "m_nTickBase"_hash ) );
+		const auto dt_followup = settings::g_combat.m_ragebot.m_double_tap.enabled.value
+			&& tick_base - this->m_double_tap.last_fire_tick( ) == 1;
+		if ( dt_followup )
+		{
+			const auto lead_ticks = this->m_double_tap.claimed_tick( ) - tick_base;
+			if ( lead_ticks > 0 && lead_ticks <= 64 )
+			{
+				const auto local_velocity = memory::read<math::vector3>( local.pawn + SCHEMA( "C_BaseEntity", "m_vecVelocity"_hash ) );
+				if ( local_velocity.length_2d( ) > 1.0f )
+				{
+					const auto eye_lead = local_velocity * ( static_cast< float >( lead_ticks ) * cstypes::tick_interval );
+					for ( auto i = 0; i < eye_candidates.count; ++i )
+					{
+						eye_candidates.entries[ i ].position += eye_lead;
+					}
+				}
+			}
+		}
+
 		if ( settings::g_combat.m_ragebot.no_spread.value )
 		{
 			return this->run_no_spread( cmd, ctx, candidates, eye_candidates, local, allow_fire );
@@ -683,7 +750,35 @@ namespace features::combat {
 		// (regardless of the DT switch), so the next shot would fly off.
 		if ( best.valid )
 		{
-			this->m_double_tap.update_aim( best.hit.aim_angle - g_shared.get_aim_punch( local.pawn ), g_shared.ctx( ).current_tick );
+			auto fed_angle = best.hit.aim_angle;
+
+			// Double-tap follow-up aim point: the server rewinds the victim
+			// to the claimed tick (last delivered claim + cycle), which sits
+			// ahead of every record. Aiming at the scan pose makes the
+			// second bullet of the pair land behind a moving target, so
+			// extrapolate the aim point by the victim's velocity over
+			// (claim - pose) ticks - that is the pose the server actually
+			// resolves the follow-up against. Penetration points are exempt
+			// (a led ray slides off the wall aperture); stationary targets
+			// are unaffected by construction.
+			const auto dt_followup = settings::g_combat.m_ragebot.m_double_tap.enabled.value
+				&& tick_base - this->m_double_tap.last_fire_tick( ) == 1;
+			if ( dt_followup && best.hit.record && !best.hit.penetrated )
+			{
+				const auto lead_ticks = this->m_double_tap.claimed_tick( ) - best.hit.record->tick;
+				if ( lead_ticks > 0 && lead_ticks <= 64 )
+				{
+					const auto target_velocity = memory::read<math::vector3>( best.hit.pawn + SCHEMA( "C_BaseEntity", "m_vecVelocity"_hash ) );
+					if ( target_velocity.length_2d( ) > 1.0f )
+					{
+						const auto led_point = best.hit.position
+							+ target_velocity * ( static_cast< float >( lead_ticks ) * cstypes::tick_interval );
+						fed_angle = math::helpers::calculate_angle( best.hit.source_eye.position, led_point );
+					}
+				}
+			}
+
+			this->m_double_tap.update_aim( fed_angle - g_shared.get_aim_punch( local.pawn ), g_shared.ctx( ).current_tick );
 		}
 		else if ( !current_hits.empty( ) )
 		{
@@ -993,14 +1088,28 @@ namespace features::combat {
 					}
 				}
 
+				// Double-tap follow-up: the server rewinds the victim to the
+				// claimed tick (last claim + cycle) instead of the local
+				// attack tick, so the aim must also lead by the full cycle -
+				// otherwise the second corrected bullet lands behind the
+				// moving victim exactly like the un-led scan pose.
+				const auto dt_followup = settings::g_combat.m_ragebot.m_double_tap.enabled.value
+					&& tick_base - this->m_double_tap.last_fire_tick( ) == 1;
+				if ( dt_followup )
+				{
+					lead_time += static_cast< float >( this->m_double_tap.cycle_ticks( ) ) * cstypes::tick_interval;
+				}
+
 				auto lead = target_velocity * std::min( lead_time, 0.25f );
 
 				// Jittering targets: a sideways lead pushes the aim point
 				// across the hitbox edge and every corrected bullet misses.
 				// Verify the led ray still crosses the RECORD capsule (the
 				// pose the server rewinds to) and halve the lead until it
-				// does; the un-led point is the fallback.
-				if ( tgt.hit.bone_index >= 0 && tgt.hit.bone_index < 28 )
+				// does; the un-led point is the fallback. The DT follow-up
+				// is exempt: its aim point deliberately targets the future
+				// rewound pose, which the OLD record capsule cannot cross.
+				if ( !dt_followup && tgt.hit.bone_index >= 0 && tgt.hit.bone_index < 28 )
 				{
 					const auto& bone = tgt.hit.record->bones[ tgt.hit.bone_index ];
 					const auto& hb = tgt.hit.hitbox;

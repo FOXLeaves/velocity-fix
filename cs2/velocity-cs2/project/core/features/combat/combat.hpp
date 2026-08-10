@@ -677,6 +677,11 @@ namespace features::combat {
 		};
 
 		[[nodiscard]] aim_context build_context( systems::input::usercmd* cmd, const systems::local::snapshot& local ) const;
+		// No-prediction variant for forced no-spread: skips the engine
+		// RunCommand simulation (the biggest per-tick fixed cost) because
+		// that path never uses the stop planning / simulated velocity - it
+		// keeps the live accuracy sample and the shoot-history snapshot.
+		[[nodiscard]] aim_context build_context_light( systems::input::usercmd* cmd, const systems::local::snapshot& local ) const;
 		// Stop planning (new): with the best target already locked, decide
 		// whether standing still makes THAT shot viable. Stopping only
 		// shrinks the spread cone (the predicted eye shift is a few units
@@ -692,7 +697,7 @@ namespace features::combat {
 		void auto_revolver( systems::input::usercmd* cmd, const aim_context& ctx, const systems::local::snapshot& local );
 
 		[[nodiscard]] std::vector<scan_hit> scan_players( const math::vector3& eye, float inaccuracy, const aim_context& ctx, std::vector<candidate>& candidates, const systems::local::snapshot& local, int max_traces = k_max_scan_traces ) const;
-		[[nodiscard]] std::vector<scan_hit> scan_player( const math::vector3& eye, float inaccuracy, const aim_context& ctx, candidate& cand, shared::lagcomp::record* record, const systems::local::snapshot& local, std::atomic<int>& trace_budget, int& local_budget ) const;
+		[[nodiscard]] std::vector<scan_hit> scan_player( const math::vector3& eye, float inaccuracy, const aim_context& ctx, candidate& cand, shared::lagcomp::record* record, const systems::local::snapshot& local, std::atomic<int>& trace_budget, std::atomic<int>& local_budget, bool inner_parallel ) const;
 		[[nodiscard]] target select_best( const aim_context& aim_ctx, const std::vector<scan_hit>& hits, float eval_inaccuracy ) const;
 		[[nodiscard]] float evaluate_hitchance( const scan_hit& hit, const aim_context& ctx, float inaccuracy ) const;
 		[[nodiscard]] float get_standing_inaccuracy( const systems::local::snapshot& local, const aim_context& ctx ) const;

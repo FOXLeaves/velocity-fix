@@ -53,7 +53,12 @@ namespace features::combat {
 		const auto& config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
 		auto& shared_ctx = g_shared.ctx( );
 
-		shared_ctx.inaccuracy = g_shared.get_inaccuracy( false );
+		// build_context already sampled the post-command (predicted)
+		// accuracy state - re-reading the live getter here costs a second
+		// engine accuracy call per tick. The predicted value is what the
+		// server sees when it consumes the shot, so reusing it keeps every
+		// scan/seed verdict intact while removing that redundant call.
+		shared_ctx.inaccuracy = ctx.predicted_inaccuracy;
 		auto all_hits = this->scan_from_eye_candidates( eye_candidates, candidates, {}, shared_ctx.inaccuracy, k_max_scan_traces, ctx, local );
 
 		if ( all_hits.empty( ) )
